@@ -58,8 +58,14 @@ export class PiServer {
     wss.on("connection", (ws: WebSocket) => {
       const subscriber: Subscriber = {
         send: (data: string) => {
+          // Check state immediately before send; if closed, silently skip
+          // This is inherently racy but the race window is acceptable
           if (ws.readyState === WebSocket.OPEN) {
-            ws.send(data);
+            try {
+              ws.send(data);
+            } catch {
+              // Send failed, subscriber will be cleaned up by close handler
+            }
           }
         },
         subscribedSessions: new Set(),
@@ -72,7 +78,11 @@ export class PiServer {
           const command: RpcCommand = JSON.parse(data.toString());
           await this.handleCommand(command, subscriber, (response: RpcResponse) => {
             if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify(response));
+              try {
+                ws.send(JSON.stringify(response));
+              } catch {
+                // Response send failed
+              }
             }
           });
         } catch (error) {
@@ -82,7 +92,11 @@ export class PiServer {
             success: false,
             error: error instanceof Error ? error.message : "Invalid JSON",
           };
-          ws.send(JSON.stringify(errorResponse));
+          try {
+            ws.send(JSON.stringify(errorResponse));
+          } catch {
+            // Error response send failed
+          }
         }
       });
 
@@ -90,7 +104,8 @@ export class PiServer {
         this.sessionManager.removeSubscriber(subscriber);
       });
 
-      ws.on("error", () => {
+      ws.on("error", (error) => {
+        console.error(`[WebSocket] Connection error:`, error);
         this.sessionManager.removeSubscriber(subscriber);
       });
     });
@@ -109,7 +124,11 @@ export class PiServer {
 
     const subscriber: Subscriber = {
       send: (data: string) => {
-        process.stdout.write(data + "\n");
+        try {
+          process.stdout.write(data + "\n");
+        } catch (error) {
+          console.error(`[stdio] Failed to write to stdout:`, error);
+        }
       },
       subscribedSessions: new Set(),
     };
@@ -121,7 +140,11 @@ export class PiServer {
       try {
         const command: RpcCommand = JSON.parse(line);
         await this.handleCommand(command, subscriber, (response: RpcResponse) => {
-          process.stdout.write(JSON.stringify(response) + "\n");
+          try {
+            process.stdout.write(JSON.stringify(response) + "\n");
+          } catch (error) {
+            console.error(`[stdio] Failed to write response:`, error);
+          }
         });
       } catch (error) {
         const errorResponse: RpcResponse = {
@@ -130,7 +153,11 @@ export class PiServer {
           success: false,
           error: error instanceof Error ? error.message : "Invalid JSON",
         };
-        process.stdout.write(JSON.stringify(errorResponse) + "\n");
+        try {
+          process.stdout.write(JSON.stringify(errorResponse) + "\n");
+        } catch {
+          // Stdout broken, nothing we can do
+        }
       }
     });
 

@@ -31,9 +31,23 @@ src/
 └── test.ts              (340 lines) — basic test suite
 
 Total: ~2132 lines, 8 files
-Commits: 5 (seed → implementation → docs → credits → extension-ui)
+Commits: 6
 Repo: https://github.com/tryingET/pi-server
 ```
+
+**Toolchain:**
+- **tsgo** — fast type checking (Go-based, instant)
+- **esbuild** — JS compilation (7ms vs tsc's 2s)
+- **tsc** — only for .d.ts generation
+- **biome** — linting and formatting (LLM-friendly config)
+
+**Scripts:**
+- `npm run build` — esbuild + tsc types
+- `npm run typecheck` — tsgo (fast)
+- `npm run lint` / `npm run format` — biome
+- `npm run check` — typecheck + lint
+- `npm run ci` — full CI pipeline
+- `npm test` — run 22 tests
 
 **Completed This Session:**
 - ✅ Phase 1.1: Extract command handlers to map (`command-router.ts`)

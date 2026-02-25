@@ -52,7 +52,16 @@ const handleAbort: CommandHandler = async (session, command) => {
 };
 
 const handleGetState: CommandHandler = (_session, command, getSessionInfo) => {
-  const info = getSessionInfo(command.sessionId)!;
+  const info = getSessionInfo(command.sessionId);
+  if (!info) {
+    return {
+      id: command.id,
+      type: "response",
+      command: "get_state",
+      success: false,
+      error: `Session ${command.sessionId} not found`,
+    };
+  }
   return { id: command.id, type: "response", command: "get_state", success: true, data: info };
 };
 

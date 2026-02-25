@@ -110,18 +110,27 @@ export class PiSessionManager {
     // Cancel any pending extension UI requests for this session
     this.extensionUI.cancelSessionRequests(sessionId);
 
+    // Remove from maps first to prevent new operations
+    this.sessions.delete(sessionId);
+    this.sessionCreatedAt.delete(sessionId);
+
     // Unsubscribe from events
     const unsubscribe = this.unsubscribers.get(sessionId);
     if (unsubscribe) {
-      unsubscribe();
       this.unsubscribers.delete(sessionId);
+      try {
+        unsubscribe();
+      } catch (error) {
+        console.error(`[deleteSession] Failed to unsubscribe:`, error);
+      }
     }
 
     // Dispose the session
-    session.dispose();
-
-    this.sessions.delete(sessionId);
-    this.sessionCreatedAt.delete(sessionId);
+    try {
+      session.dispose();
+    } catch (error) {
+      console.error(`[deleteSession] Failed to dispose session:`, error);
+    }
 
     // Remove this session from all subscriber subscriptions
     for (const subscriber of this.subscribers) {
@@ -198,25 +207,39 @@ export class PiSessionManager {
       event,
     };
 
-    const data = JSON.stringify(rpcEvent);
+    let data: string;
+    try {
+      data = JSON.stringify(rpcEvent);
+    } catch (error) {
+      // Log serialization errors but don't crash
+      console.error(`[broadcastEvent] JSON serialization failed:`, error);
+      return;
+    }
 
-    for (const subscriber of this.subscribers) {
+    // Snapshot subscribers to prevent mutation during iteration
+    const snapshot = [...this.subscribers];
+    for (const subscriber of snapshot) {
       if (subscriber.subscribedSessions.has(sessionId)) {
         try {
           subscriber.send(data);
-        } catch {
-          // Subscriber may have disconnected, will be cleaned up later
+        } catch (error) {
+          // Log failed sends for observability
+          console.error(`[broadcastEvent] Failed to send to subscriber:`, error);
+          // Subscriber will be cleaned up by close handler
         }
       }
     }
   }
 
   broadcast(data: string): void {
-    for (const subscriber of this.subscribers) {
+    // Snapshot subscribers to prevent mutation during iteration
+    const snapshot = [...this.subscribers];
+    for (const subscriber of snapshot) {
       try {
         subscriber.send(data);
-      } catch {
-        // Subscriber may have disconnected
+      } catch (error) {
+        // Log failed sends for observability
+        console.error(`[broadcast] Failed to send to subscriber:`, error);
       }
     }
   }
