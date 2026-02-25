@@ -7,7 +7,6 @@
  * - Malformed requests
  */
 
-import type { RpcCommand } from "./types.js";
 
 export interface ValidationError {
   field: string;
@@ -72,7 +71,10 @@ export function validateCommand(command: unknown): ValidationError[] {
   // If it's a session command, sessionId is required
   if (typeof cmd.type === "string" && SESSION_COMMANDS.has(cmd.type)) {
     if (!("sessionId" in cmd) || typeof cmd.sessionId !== "string" || !cmd.sessionId) {
-      errors.push({ field: "sessionId", message: "Session commands must have a non-empty string 'sessionId'" });
+      errors.push({
+        field: "sessionId",
+        message: "Session commands must have a non-empty string 'sessionId'",
+      });
     }
   }
 
@@ -201,5 +203,5 @@ function validateCommandByType(type: string, cmd: Record<string, unknown>): Vali
  * Format validation errors as a human-readable string.
  */
 export function formatValidationErrors(errors: ValidationError[]): string {
-  return errors.map(e => `${e.field}: ${e.message}`).join("; ");
+  return errors.map((e) => `${e.field}: ${e.message}`).join("; ");
 }

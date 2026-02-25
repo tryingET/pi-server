@@ -9,20 +9,31 @@
     "pi-server": "dist/server.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "npm run build:js && npm run build:types",
+    "build:js": "esbuild src/server.ts src/session-manager.ts src/command-router.ts src/extension-ui.ts src/server-ui-context.ts src/validation.ts src/types.ts src/test.ts --outdir=dist --format=esm --platform=node --target=node20 --sourcemap",
+    "build:types": "tsc --emitDeclarationOnly --declaration --declarationMap",
+    "typecheck": "tsgo -config tsconfig.json",
+    "lint": "biome lint src",
+    "format": "biome format src --write",
+    "format:check": "biome format src",
+    "check": "npm run typecheck && npm run lint",
+    "ci": "npm run typecheck && npm run lint && npm run format:check && npm run build && npm test",
     "start": "node dist/server.js",
-    "dev": "tsc --watch",
+    "dev": "esbuild src/server.ts --outdir=dist --format=esm --platform=node --target=node20 --sourcemap=inline --watch",
     "test": "node --experimental-vm-modules dist/test.js"
   },
   "dependencies": {
-    "@mariozechner/pi-coding-agent": "^0.54.0",
     "@mariozechner/pi-agent-core": "^0.54.0",
     "@mariozechner/pi-ai": "^0.54.0",
+    "@mariozechner/pi-coding-agent": "^0.54.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.4.4",
+    "@rslint/tsgo": "^0.2.1",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.0",
+    "esbuild": "^0.27.3",
     "typescript": "^5.7.0"
   },
   "engines": {

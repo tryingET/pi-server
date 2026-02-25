@@ -5,14 +5,12 @@
  * Extension UI requests tracked by ExtensionUIManager.
  */
 
-import { AgentSession, createAgentSession, type AgentSessionEvent } from "@mariozechner/pi-coding-agent";
-import type {
-  SessionInfo,
-  RpcCommand,
-  RpcResponse,
-  RpcEvent,
-  Subscriber,
-} from "./types.js";
+import {
+  type AgentSession,
+  createAgentSession,
+  type AgentSessionEvent,
+} from "@mariozechner/pi-coding-agent";
+import type { SessionInfo, RpcCommand, RpcResponse, RpcEvent, Subscriber } from "./types.js";
 import { routeSessionCommand } from "./command-router.js";
 import { ExtensionUIManager } from "./extension-ui.js";
 import { createServerUIContext } from "./server-ui-context.js";
@@ -66,8 +64,8 @@ export class PiSessionManager {
   private unsubscribers = new Map<string, () => void>();
 
   // Extension UI request tracking
-  private extensionUI = new ExtensionUIManager(
-    (sessionId: string, event: AgentSessionEvent) => this.broadcastEvent(sessionId, event)
+  private extensionUI = new ExtensionUIManager((sessionId: string, event: AgentSessionEvent) =>
+    this.broadcastEvent(sessionId, event)
   );
 
   // ==========================================================================
@@ -193,7 +191,7 @@ export class PiSessionManager {
     // Note: extension_ui_request events are NOT AgentSessionEvents.
     // They come through ExtensionUIContext (wired via bindExtensions)
     // and are broadcast via createServerUIContext -> ExtensionUIManager.broadcastUIRequest.
-    
+
     const rpcEvent: RpcEvent = {
       type: "event",
       sessionId,

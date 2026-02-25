@@ -40,7 +40,19 @@ export type ServerCommand =
 
 export type SessionCommand =
   // Extension UI response (client → server to complete pending UI request)
-  | { id?: string; sessionId: string; type: "extension_ui_response"; requestId: string; response: { method: "select"; value: string } | { method: "confirm"; confirmed: boolean } | { method: "input"; value: string } | { method: "editor"; value: string } | { method: "interview"; responses: Record<string, any> } | { method: "cancelled" } }
+  | {
+      id?: string;
+      sessionId: string;
+      type: "extension_ui_response";
+      requestId: string;
+      response:
+        | { method: "select"; value: string }
+        | { method: "confirm"; confirmed: boolean }
+        | { method: "input"; value: string }
+        | { method: "editor"; value: string }
+        | { method: "interview"; responses: Record<string, any> }
+        | { method: "cancelled" };
+    }
   // Discovery commands
   | { id?: string; sessionId: string; type: "get_available_models" }
   | { id?: string; sessionId: string; type: "get_commands" }
@@ -48,7 +60,14 @@ export type SessionCommand =
   | { id?: string; sessionId: string; type: "get_tools" }
   | { id?: string; sessionId: string; type: "list_session_files" }
   // Session commands
-  | { id?: string; sessionId: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
+  | {
+      id?: string;
+      sessionId: string;
+      type: "prompt";
+      message: string;
+      images?: ImageContent[];
+      streamingBehavior?: "steer" | "followUp";
+    }
   | { id?: string; sessionId: string; type: "steer"; message: string; images?: ImageContent[] }
   | { id?: string; sessionId: string; type: "follow_up"; message: string; images?: ImageContent[] }
   | { id?: string; sessionId: string; type: "abort" }
@@ -95,47 +114,125 @@ export interface RpcResponseBase {
 
 // Server command responses
 export type ServerResponse =
-  | RpcResponseBase & { command: "list_sessions"; success: true; data: { sessions: SessionInfo[] } }
-  | RpcResponseBase & { command: "create_session"; success: true; data: { sessionId: string; sessionInfo: SessionInfo } }
-  | RpcResponseBase & { command: "delete_session"; success: true; data: { deleted: true } }
-  | RpcResponseBase & { command: "switch_session"; success: true; data: { sessionInfo: SessionInfo } };
+  | (RpcResponseBase & {
+      command: "list_sessions";
+      success: true;
+      data: { sessions: SessionInfo[] };
+    })
+  | (RpcResponseBase & {
+      command: "create_session";
+      success: true;
+      data: { sessionId: string; sessionInfo: SessionInfo };
+    })
+  | (RpcResponseBase & { command: "delete_session"; success: true; data: { deleted: true } })
+  | (RpcResponseBase & {
+      command: "switch_session";
+      success: true;
+      data: { sessionInfo: SessionInfo };
+    });
 
 // Session command responses (mirrors RpcCommand types)
 export type SessionResponse =
-  | RpcResponseBase & { command: "extension_ui_response"; success: true }
+  | (RpcResponseBase & { command: "extension_ui_response"; success: true })
   // Discovery command responses
-  | RpcResponseBase & { command: "get_available_models"; success: true; data: { models: Model<any>[] } }
-  | RpcResponseBase & { command: "get_commands"; success: true; data: { commands: Array<{ name: string; description?: string; source: string; location?: string; path?: string }> } }
-  | RpcResponseBase & { command: "get_skills"; success: true; data: { skills: Array<{ name: string; description: string; filePath: string; source: string }> } }
-  | RpcResponseBase & { command: "get_tools"; success: true; data: { tools: Array<{ name: string; description: string }> } }
-  | RpcResponseBase & { command: "list_session_files"; success: true; data: { files: Array<{ path: string; name: string; modifiedAt?: string }> } }
+  | (RpcResponseBase & {
+      command: "get_available_models";
+      success: true;
+      data: { models: Model<any>[] };
+    })
+  | (RpcResponseBase & {
+      command: "get_commands";
+      success: true;
+      data: {
+        commands: Array<{
+          name: string;
+          description?: string;
+          source: string;
+          location?: string;
+          path?: string;
+        }>;
+      };
+    })
+  | (RpcResponseBase & {
+      command: "get_skills";
+      success: true;
+      data: {
+        skills: Array<{ name: string; description: string; filePath: string; source: string }>;
+      };
+    })
+  | (RpcResponseBase & {
+      command: "get_tools";
+      success: true;
+      data: { tools: Array<{ name: string; description: string }> };
+    })
+  | (RpcResponseBase & {
+      command: "list_session_files";
+      success: true;
+      data: { files: Array<{ path: string; name: string; modifiedAt?: string }> };
+    })
   // Session commands
-  | RpcResponseBase & { command: "prompt"; success: true }
-  | RpcResponseBase & { command: "steer"; success: true }
-  | RpcResponseBase & { command: "follow_up"; success: true }
-  | RpcResponseBase & { command: "abort"; success: true }
-  | RpcResponseBase & { command: "get_state"; success: true; data: SessionInfo }
-  | RpcResponseBase & { command: "get_messages"; success: true; data: { messages: AgentMessage[] } }
-  | RpcResponseBase & { command: "set_model"; success: true; data: { model: Model<any> } }
-  | RpcResponseBase & { command: "cycle_model"; success: true; data: { model: Model<any>; thinkingLevel: ThinkingLevel; isScoped: boolean } | null }
-  | RpcResponseBase & { command: "set_thinking_level"; success: true }
-  | RpcResponseBase & { command: "cycle_thinking_level"; success: true; data: { level: ThinkingLevel } | null }
-  | RpcResponseBase & { command: "compact"; success: true; data: CompactionResult }
-  | RpcResponseBase & { command: "abort_compaction"; success: true }
-  | RpcResponseBase & { command: "set_auto_compaction"; success: true }
-  | RpcResponseBase & { command: "set_auto_retry"; success: true }
-  | RpcResponseBase & { command: "abort_retry"; success: true }
-  | RpcResponseBase & { command: "bash"; success: true; data: { exitCode: number; output: string; cancelled: boolean } }
-  | RpcResponseBase & { command: "abort_bash"; success: true }
-  | RpcResponseBase & { command: "get_session_stats"; success: true; data: SessionStats }
-  | RpcResponseBase & { command: "set_session_name"; success: true }
-  | RpcResponseBase & { command: "export_html"; success: true; data: { path: string } }
-  | RpcResponseBase & { command: "new_session"; success: true; data: { cancelled: boolean } }
-  | RpcResponseBase & { command: "switch_session_file"; success: true; data: { cancelled: boolean } }
-  | RpcResponseBase & { command: "fork"; success: true; data: { text: string; cancelled: boolean } }
-  | RpcResponseBase & { command: "get_fork_messages"; success: true; data: { messages: Array<{ entryId: string; text: string }> } }
-  | RpcResponseBase & { command: "get_last_assistant_text"; success: true; data: { text: string | null } }
-  | RpcResponseBase & { command: "get_context_usage"; success: true; data: { tokens: number | null; contextWindow: number; percent: number | null } | null };
+  | (RpcResponseBase & { command: "prompt"; success: true })
+  | (RpcResponseBase & { command: "steer"; success: true })
+  | (RpcResponseBase & { command: "follow_up"; success: true })
+  | (RpcResponseBase & { command: "abort"; success: true })
+  | (RpcResponseBase & { command: "get_state"; success: true; data: SessionInfo })
+  | (RpcResponseBase & {
+      command: "get_messages";
+      success: true;
+      data: { messages: AgentMessage[] };
+    })
+  | (RpcResponseBase & { command: "set_model"; success: true; data: { model: Model<any> } })
+  | (RpcResponseBase & {
+      command: "cycle_model";
+      success: true;
+      data: { model: Model<any>; thinkingLevel: ThinkingLevel; isScoped: boolean } | null;
+    })
+  | (RpcResponseBase & { command: "set_thinking_level"; success: true })
+  | (RpcResponseBase & {
+      command: "cycle_thinking_level";
+      success: true;
+      data: { level: ThinkingLevel } | null;
+    })
+  | (RpcResponseBase & { command: "compact"; success: true; data: CompactionResult })
+  | (RpcResponseBase & { command: "abort_compaction"; success: true })
+  | (RpcResponseBase & { command: "set_auto_compaction"; success: true })
+  | (RpcResponseBase & { command: "set_auto_retry"; success: true })
+  | (RpcResponseBase & { command: "abort_retry"; success: true })
+  | (RpcResponseBase & {
+      command: "bash";
+      success: true;
+      data: { exitCode: number; output: string; cancelled: boolean };
+    })
+  | (RpcResponseBase & { command: "abort_bash"; success: true })
+  | (RpcResponseBase & { command: "get_session_stats"; success: true; data: SessionStats })
+  | (RpcResponseBase & { command: "set_session_name"; success: true })
+  | (RpcResponseBase & { command: "export_html"; success: true; data: { path: string } })
+  | (RpcResponseBase & { command: "new_session"; success: true; data: { cancelled: boolean } })
+  | (RpcResponseBase & {
+      command: "switch_session_file";
+      success: true;
+      data: { cancelled: boolean };
+    })
+  | (RpcResponseBase & {
+      command: "fork";
+      success: true;
+      data: { text: string; cancelled: boolean };
+    })
+  | (RpcResponseBase & {
+      command: "get_fork_messages";
+      success: true;
+      data: { messages: Array<{ entryId: string; text: string }> };
+    })
+  | (RpcResponseBase & {
+      command: "get_last_assistant_text";
+      success: true;
+      data: { text: string | null };
+    })
+  | (RpcResponseBase & {
+      command: "get_context_usage";
+      success: true;
+      data: { tokens: number | null; contextWindow: number; percent: number | null } | null;
+    });
 
 // Error response
 export type ErrorResponse = RpcResponseBase & { success: false; error: string };

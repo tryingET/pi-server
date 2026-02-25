@@ -45,19 +45,27 @@ export type ExtensionUIResponseValue =
   | { method: "cancelled" };
 
 // Type guards for response types
-export function isSelectResponse(r: ExtensionUIResponseValue): r is { method: "select"; value: string } {
+export function isSelectResponse(
+  r: ExtensionUIResponseValue
+): r is { method: "select"; value: string } {
   return r.method === "select";
 }
 
-export function isConfirmResponse(r: ExtensionUIResponseValue): r is { method: "confirm"; confirmed: boolean } {
+export function isConfirmResponse(
+  r: ExtensionUIResponseValue
+): r is { method: "confirm"; confirmed: boolean } {
   return r.method === "confirm";
 }
 
-export function isInputResponse(r: ExtensionUIResponseValue): r is { method: "input"; value: string } {
+export function isInputResponse(
+  r: ExtensionUIResponseValue
+): r is { method: "input"; value: string } {
   return r.method === "input";
 }
 
-export function isEditorResponse(r: ExtensionUIResponseValue): r is { method: "editor"; value: string } {
+export function isEditorResponse(
+  r: ExtensionUIResponseValue
+): r is { method: "editor"; value: string } {
   return r.method === "editor";
 }
 
@@ -96,14 +104,16 @@ export class ExtensionUIManager {
   createPendingRequest(
     sessionId: string,
     method: ExtensionUIMethod,
-    requestData: Record<string, any>
+    _requestData: Record<string, any>
   ): { requestId: string; promise: Promise<ExtensionUIResponseValue> } {
     const requestId = this.generateRequestId(sessionId);
 
     const promise = new Promise<ExtensionUIResponseValue>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pendingRequests.delete(requestId);
-        reject(new Error(`Extension UI request ${requestId} timed out after ${this.defaultTimeoutMs}ms`));
+        reject(
+          new Error(`Extension UI request ${requestId} timed out after ${this.defaultTimeoutMs}ms`)
+        );
       }, this.defaultTimeoutMs);
 
       this.pendingRequests.set(requestId, {
@@ -123,7 +133,12 @@ export class ExtensionUIManager {
   /**
    * Broadcast a UI request to clients.
    */
-  broadcastUIRequest(sessionId: string, requestId: string, method: ExtensionUIMethod, data: Record<string, any>): void {
+  broadcastUIRequest(
+    sessionId: string,
+    requestId: string,
+    method: ExtensionUIMethod,
+    data: Record<string, any>
+  ): void {
     this.broadcast(sessionId, {
       type: "extension_ui_request",
       requestId,

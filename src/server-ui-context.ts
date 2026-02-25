@@ -11,13 +11,12 @@
  */
 
 import type { ExtensionUIContext, TerminalInputHandler } from "@mariozechner/pi-coding-agent";
-import type { ExtensionUIManager, ExtensionUIMethod } from "./extension-ui.js";
+import type { ExtensionUIManager, } from "./extension-ui.js";
 import {
   isSelectResponse,
   isConfirmResponse,
   isInputResponse,
   isEditorResponse,
-  type ExtensionUIResponseValue,
 } from "./extension-ui.js";
 
 /**
@@ -33,7 +32,11 @@ export function createServerUIContext(
   broadcast: (sessionId: string, event: any) => void
 ): ExtensionUIContext {
   return {
-    async select(title: string, options: string[], opts?: { signal?: AbortSignal; timeout?: number }): Promise<string | undefined> {
+    async select(
+      title: string,
+      options: string[],
+      opts?: { signal?: AbortSignal; timeout?: number }
+    ): Promise<string | undefined> {
       const { requestId, promise } = extensionUI.createPendingRequest(sessionId, "select", {
         title,
         options,
@@ -47,10 +50,8 @@ export function createServerUIContext(
       });
 
       try {
-        const response = await raceWithAbortAndSignal(
-          promise,
-          opts?.signal,
-          () => extensionUI.cancelRequest(requestId)
+        const response = await raceWithAbortAndSignal(promise, opts?.signal, () =>
+          extensionUI.cancelRequest(requestId)
         );
         if (response.method === "cancelled") return undefined;
         if (isSelectResponse(response)) return response.value;
@@ -61,7 +62,11 @@ export function createServerUIContext(
       }
     },
 
-    async confirm(title: string, message: string, opts?: { signal?: AbortSignal; timeout?: number }): Promise<boolean> {
+    async confirm(
+      title: string,
+      message: string,
+      opts?: { signal?: AbortSignal; timeout?: number }
+    ): Promise<boolean> {
       const { requestId, promise } = extensionUI.createPendingRequest(sessionId, "confirm", {
         title,
         message,
@@ -75,10 +80,8 @@ export function createServerUIContext(
       });
 
       try {
-        const response = await raceWithAbortAndSignal(
-          promise,
-          opts?.signal,
-          () => extensionUI.cancelRequest(requestId)
+        const response = await raceWithAbortAndSignal(promise, opts?.signal, () =>
+          extensionUI.cancelRequest(requestId)
         );
         if (response.method === "cancelled") return false;
         if (isConfirmResponse(response)) return response.confirmed;
@@ -89,7 +92,11 @@ export function createServerUIContext(
       }
     },
 
-    async input(title: string, placeholder?: string, opts?: { signal?: AbortSignal; timeout?: number }): Promise<string | undefined> {
+    async input(
+      title: string,
+      placeholder?: string,
+      opts?: { signal?: AbortSignal; timeout?: number }
+    ): Promise<string | undefined> {
       const { requestId, promise } = extensionUI.createPendingRequest(sessionId, "input", {
         title,
         placeholder,
@@ -103,10 +110,8 @@ export function createServerUIContext(
       });
 
       try {
-        const response = await raceWithAbortAndSignal(
-          promise,
-          opts?.signal,
-          () => extensionUI.cancelRequest(requestId)
+        const response = await raceWithAbortAndSignal(promise, opts?.signal, () =>
+          extensionUI.cancelRequest(requestId)
         );
         if (response.method === "cancelled") return undefined;
         if (isInputResponse(response)) return response.value;
@@ -181,7 +186,11 @@ export function createServerUIContext(
       });
     },
 
-    setWidget(key: string, content: any, options?: { placement?: "aboveEditor" | "belowEditor" }): void {
+    setWidget(
+      key: string,
+      content: any,
+      options?: { placement?: "aboveEditor" | "belowEditor" }
+    ): void {
       // Only support string[] content (not component factories)
       // Component factories can't be serialized for remote clients
       if (Array.isArray(content) || content === undefined) {

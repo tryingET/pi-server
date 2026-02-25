@@ -1,8 +1,8 @@
 /**
  * Basic tests for pi-server.
- * 
+ *
  * Run with: node --experimental-vm-modules dist/test.js
- * 
+ *
  * Tests:
  * - Validation module
  * - Command routing
@@ -44,21 +44,30 @@ async function testValidation() {
   await test("validation: rejects missing type", () => {
     const errors = validateCommand({});
     assert(errors.length > 0, "Should have errors");
-    assert(errors.some(e => e.field === "type"), "Should have type error");
+    assert(
+      errors.some((e) => e.field === "type"),
+      "Should have type error"
+    );
   });
 
   // Test: Missing sessionId for session commands
   await test("validation: rejects missing sessionId", () => {
     const errors = validateCommand({ type: "get_state" });
     assert(errors.length > 0, "Should have errors");
-    assert(errors.some(e => e.field === "sessionId"), "Should have sessionId error");
+    assert(
+      errors.some((e) => e.field === "sessionId"),
+      "Should have sessionId error"
+    );
   });
 
   // Test: Empty sessionId
   await test("validation: rejects empty sessionId", () => {
     const errors = validateCommand({ type: "get_state", sessionId: "" });
     assert(errors.length > 0, "Should have errors");
-    assert(errors.some(e => e.field === "sessionId"), "Should have sessionId error");
+    assert(
+      errors.some((e) => e.field === "sessionId"),
+      "Should have sessionId error"
+    );
   });
 
   // Test: Valid list_sessions command (no sessionId required)
@@ -77,7 +86,10 @@ async function testValidation() {
   await test("validation: rejects prompt without message", () => {
     const errors = validateCommand({ type: "prompt", sessionId: "test" });
     assert(errors.length > 0, "Should have errors");
-    assert(errors.some(e => e.field === "message"), "Should have message error");
+    assert(
+      errors.some((e) => e.field === "message"),
+      "Should have message error"
+    );
   });
 
   // Test: Valid prompt
@@ -89,39 +101,68 @@ async function testValidation() {
   // Test: set_model missing fields
   await test("validation: rejects set_model without provider/modelId", () => {
     const errors = validateCommand({ type: "set_model", sessionId: "test" });
-    assert(errors.some(e => e.field === "provider"), "Should have provider error");
-    assert(errors.some(e => e.field === "modelId"), "Should have modelId error");
+    assert(
+      errors.some((e) => e.field === "provider"),
+      "Should have provider error"
+    );
+    assert(
+      errors.some((e) => e.field === "modelId"),
+      "Should have modelId error"
+    );
   });
 
   // Test: Valid set_model
   await test("validation: accepts valid set_model", () => {
-    const errors = validateCommand({ type: "set_model", sessionId: "test", provider: "anthropic", modelId: "claude-3-opus" });
+    const errors = validateCommand({
+      type: "set_model",
+      sessionId: "test",
+      provider: "anthropic",
+      modelId: "claude-3-opus",
+    });
     assert.strictEqual(errors.length, 0, "Should have no errors");
   });
 
   // Test: Invalid thinking level
   await test("validation: rejects invalid thinking level", () => {
-    const errors = validateCommand({ type: "set_thinking_level", sessionId: "test", level: "invalid" });
-    assert(errors.some(e => e.field === "level"), "Should have level error");
+    const errors = validateCommand({
+      type: "set_thinking_level",
+      sessionId: "test",
+      level: "invalid",
+    });
+    assert(
+      errors.some((e) => e.field === "level"),
+      "Should have level error"
+    );
   });
 
   // Test: Valid thinking level
   await test("validation: accepts valid thinking level", () => {
-    const errors = validateCommand({ type: "set_thinking_level", sessionId: "test", level: "high" });
+    const errors = validateCommand({
+      type: "set_thinking_level",
+      sessionId: "test",
+      level: "high",
+    });
     assert.strictEqual(errors.length, 0, "Should have no errors");
   });
 
   // Test: extension_ui_response validation
   await test("validation: rejects extension_ui_response without requestId", () => {
-    const errors = validateCommand({ type: "extension_ui_response", sessionId: "test", response: { method: "cancelled" } });
-    assert(errors.some(e => e.field === "requestId"), "Should have requestId error");
+    const errors = validateCommand({
+      type: "extension_ui_response",
+      sessionId: "test",
+      response: { method: "cancelled" },
+    });
+    assert(
+      errors.some((e) => e.field === "requestId"),
+      "Should have requestId error"
+    );
   });
 
   // Test: Format validation errors
   await test("validation: formatValidationErrors works", () => {
     const formatted = formatValidationErrors([
       { field: "type", message: "Required" },
-      { field: "sessionId", message: "Must be a string" }
+      { field: "sessionId", message: "Must be a string" },
     ]);
     assert(formatted.includes("type:"), "Should include field name");
     assert(formatted.includes("sessionId:"), "Should include field name");
@@ -168,7 +209,10 @@ async function testSessionManager() {
 
   // Test: Unknown command returns error
   await test("session-manager: returns error for unknown command", async () => {
-    const response = await manager.executeCommand({ type: "unknown_command", sessionId: "test" } as any);
+    const response = await manager.executeCommand({
+      type: "unknown_command",
+      sessionId: "test",
+    } as any);
     assert.strictEqual(response.success, false, "Should fail");
     assert(response.error?.includes("Session test not found"), "Should mention session not found");
   });
@@ -208,17 +252,23 @@ async function testSessionManager() {
   // Test: Cannot create duplicate session
   await test("session-manager: rejects duplicate session", async () => {
     await manager.executeCommand({ type: "create_session", sessionId: "dup-test" });
-    const response = await manager.executeCommand({ type: "create_session", sessionId: "dup-test" });
+    const response = await manager.executeCommand({
+      type: "create_session",
+      sessionId: "dup-test",
+    });
     assert.strictEqual(response.success, false, "Should fail");
     assert(response.error?.includes("already exists"), "Should mention already exists");
-    
+
     // Cleanup
     await manager.executeCommand({ type: "delete_session", sessionId: "dup-test" });
   });
 
   // Test: Cannot delete non-existent session
   await test("session-manager: rejects deleting non-existent session", async () => {
-    const response = await manager.executeCommand({ type: "delete_session", sessionId: "nonexistent" });
+    const response = await manager.executeCommand({
+      type: "delete_session",
+      sessionId: "nonexistent",
+    });
     assert.strictEqual(response.success, false, "Should fail");
     assert(response.error?.includes("not found"), "Should mention not found");
   });
@@ -230,7 +280,7 @@ async function testSessionManager() {
     assert.strictEqual(response.success, true, "Should succeed");
     assert.strictEqual((response as any).data.sessionId, "state-test");
     assert.strictEqual(typeof (response as any).data.createdAt, "string");
-    
+
     // Cleanup
     await manager.executeCommand({ type: "delete_session", sessionId: "state-test" });
   });
@@ -238,10 +288,13 @@ async function testSessionManager() {
   // Test: Switch session
   await test("session-manager: switches session", async () => {
     await manager.executeCommand({ type: "create_session", sessionId: "switch-test" });
-    const response = await manager.executeCommand({ type: "switch_session", sessionId: "switch-test" });
+    const response = await manager.executeCommand({
+      type: "switch_session",
+      sessionId: "switch-test",
+    });
     assert.strictEqual(response.success, true, "Should succeed");
     assert.strictEqual((response as any).data.sessionInfo.sessionId, "switch-test");
-    
+
     // Cleanup
     await manager.executeCommand({ type: "delete_session", sessionId: "switch-test" });
   });
@@ -260,7 +313,7 @@ async function main() {
 
   console.log("\n" + "=".repeat(50));
   console.log(`Results: ${testsPassed} passed, ${testsFailed} failed`);
-  
+
   if (testsFailed > 0) {
     process.exit(1);
   }

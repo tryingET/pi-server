@@ -1,9 +1,9 @@
 /**
  * Command Router - extensible command dispatch via handler map.
- * 
+ *
  * Each handler is a self-contained function that takes a session and command,
  * executes against the session, and returns a response.
- * 
+ *
  * This replaces the giant switch statement, enabling:
  * - Easy addition of new commands
  * - Isolated testing of handlers
@@ -11,8 +11,8 @@
  */
 
 import path from "path";
-import { AgentSession, SessionManager } from "@mariozechner/pi-coding-agent";
-import type { RpcCommand, RpcResponse, SessionInfo } from "./types.js";
+import { type AgentSession, SessionManager } from "@mariozechner/pi-coding-agent";
+import type { RpcResponse, SessionInfo } from "./types.js";
 
 // =============================================================================
 // HANDLER TYPE
@@ -51,7 +51,7 @@ const handleAbort: CommandHandler = async (session, command) => {
   return { id: command.id, type: "response", command: "abort", success: true };
 };
 
-const handleGetState: CommandHandler = (session, command, getSessionInfo) => {
+const handleGetState: CommandHandler = (_session, command, getSessionInfo) => {
   const info = getSessionInfo(command.sessionId)!;
   return { id: command.id, type: "response", command: "get_state", success: true, data: info };
 };
@@ -95,7 +95,9 @@ const handleCycleModel: CommandHandler = async (session, command) => {
     type: "response",
     command: "cycle_model",
     success: true,
-    data: result ? { model: result.model, thinkingLevel: result.thinkingLevel, isScoped: result.isScoped } : null,
+    data: result
+      ? { model: result.model, thinkingLevel: result.thinkingLevel, isScoped: result.isScoped }
+      : null,
   };
 };
 
@@ -160,7 +162,13 @@ const handleAbortBash: CommandHandler = (session, command) => {
 
 const handleGetSessionStats: CommandHandler = (session, command) => {
   const stats = session.getSessionStats();
-  return { id: command.id, type: "response", command: "get_session_stats", success: true, data: stats };
+  return {
+    id: command.id,
+    type: "response",
+    command: "get_session_stats",
+    success: true,
+    data: stats,
+  };
 };
 
 const handleSetSessionName: CommandHandler = (session, command) => {
@@ -170,17 +178,35 @@ const handleSetSessionName: CommandHandler = (session, command) => {
 
 const handleExportHtml: CommandHandler = async (session, command) => {
   const path = await session.exportToHtml(command.outputPath);
-  return { id: command.id, type: "response", command: "export_html", success: true, data: { path } };
+  return {
+    id: command.id,
+    type: "response",
+    command: "export_html",
+    success: true,
+    data: { path },
+  };
 };
 
 const handleNewSession: CommandHandler = async (session, command) => {
   const cancelled = !(await session.newSession({ parentSession: command.parentSession }));
-  return { id: command.id, type: "response", command: "new_session", success: true, data: { cancelled } };
+  return {
+    id: command.id,
+    type: "response",
+    command: "new_session",
+    success: true,
+    data: { cancelled },
+  };
 };
 
 const handleSwitchSessionFile: CommandHandler = async (session, command) => {
   const cancelled = !(await session.switchSession(command.sessionPath));
-  return { id: command.id, type: "response", command: "switch_session_file", success: true, data: { cancelled } };
+  return {
+    id: command.id,
+    type: "response",
+    command: "switch_session_file",
+    success: true,
+    data: { cancelled },
+  };
 };
 
 const handleFork: CommandHandler = async (session, command) => {
@@ -223,7 +249,9 @@ const handleGetContextUsage: CommandHandler = (session, command) => {
     type: "response",
     command: "get_context_usage",
     success: true,
-    data: usage ? { tokens: usage.tokens, contextWindow: usage.contextWindow, percent: usage.percent } : null,
+    data: usage
+      ? { tokens: usage.tokens, contextWindow: usage.contextWindow, percent: usage.percent }
+      : null,
   };
 };
 
@@ -245,8 +273,14 @@ const handleGetAvailableModels: CommandHandler = (session, command) => {
 const handleGetCommands: CommandHandler = (session, command) => {
   // Get commands from resourceLoader's extensions
   const extensions = session.resourceLoader.getExtensions();
-  const commands: Array<{ name: string; description?: string; source: string; location?: string; path?: string }> = [];
-  
+  const commands: Array<{
+    name: string;
+    description?: string;
+    source: string;
+    location?: string;
+    path?: string;
+  }> = [];
+
   for (const ext of extensions.extensions) {
     for (const [name, cmd] of ext.commands) {
       commands.push({
@@ -257,7 +291,7 @@ const handleGetCommands: CommandHandler = (session, command) => {
       });
     }
   }
-  
+
   // Add skills as commands
   const skillsResult = session.resourceLoader.getSkills();
   for (const skill of skillsResult.skills) {
@@ -268,7 +302,7 @@ const handleGetCommands: CommandHandler = (session, command) => {
       path: skill.filePath,
     });
   }
-  
+
   // Add prompts as commands
   const promptsResult = session.resourceLoader.getPrompts();
   for (const prompt of promptsResult.prompts) {
@@ -279,7 +313,7 @@ const handleGetCommands: CommandHandler = (session, command) => {
       path: prompt.filePath,
     });
   }
-  
+
   return {
     id: command.id,
     type: "response",
@@ -291,13 +325,13 @@ const handleGetCommands: CommandHandler = (session, command) => {
 
 const handleGetSkills: CommandHandler = (session, command) => {
   const skillsResult = session.resourceLoader.getSkills();
-  const skills = skillsResult.skills.map(skill => ({
+  const skills = skillsResult.skills.map((skill) => ({
     name: skill.name,
     description: skill.description,
     filePath: skill.filePath,
     source: skill.source,
   }));
-  
+
   return {
     id: command.id,
     type: "response",
@@ -308,11 +342,11 @@ const handleGetSkills: CommandHandler = (session, command) => {
 };
 
 const handleGetTools: CommandHandler = (session, command) => {
-  const tools = session.getAllTools().map(tool => ({
+  const tools = session.getAllTools().map((tool) => ({
     name: tool.name,
     description: tool.description,
   }));
-  
+
   return {
     id: command.id,
     type: "response",
@@ -326,13 +360,13 @@ const handleListSessionFiles: CommandHandler = async (session, command) => {
   // Get session files from the session manager (static async method)
   const cwd = session.sessionManager.getCwd();
   const files = await SessionManager.list(cwd);
-  
-  const formattedFiles = files.map(file => ({
+
+  const formattedFiles = files.map((file) => ({
     path: file.path,
     name: path.basename(file.path), // Cross-platform basename extraction
     modifiedAt: file.modified.toISOString(),
   }));
-  
+
   return {
     id: command.id,
     type: "response",
