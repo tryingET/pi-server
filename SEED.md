@@ -18,21 +18,6 @@ Execution Confidence: Deterministic
 
 ---
 
-## What Grows From This
-
-```
-pi-app-server/
-├── src/
-│   ├── server.ts         # Transports, routing, broadcast
-│   ├── session-manager.ts # Lifecycle, execution, subscribers
-│   ├── types.ts          # Protocol: Command | Response | Event
-│   ├── client.ts         # Optional: TypeScript client
-│   ├── cli.ts            # Optional: CLI entry point
-│   └── index.ts          # Optional: Public exports
-├── package.json          # ws + @mariozechner/pi-coding-agent
-└── tsconfig.json         # ES2022, NodeNext
-```
-
 ## The Invariants
 
 ```
@@ -42,7 +27,51 @@ pi-app-server/
 ∀ connection → subscribedSessions ⊆ sessions
 ```
 
-## The Protocol Surface
+---
+
+## Explicit Non-Goals
+
+These are not missing features. They are **out of scope by design**.
+
+| Non-Goal | Why Not Here | Who Adds It |
+|----------|--------------|-------------|
+| **Authentication** | Security is orthogonal to multiplexing. Add as middleware. | Ops/Security team |
+| **Authorization** | Session ownership is a policy decision. Add as layer. | Ops/Security team |
+| **Rate Limiting** | Throttling is a deployment concern. Add at reverse proxy. | Ops team |
+| **Metrics** | Observability is external. Add Prometheus endpoint separately. | Ops team |
+| **Health Checks** | Orchestration concern. Add `/health` route separately. | Ops team |
+| **TLS/SSL** | Transport security is a proxy concern. Terminate at nginx. | Ops team |
+| **Clustering** | Horizontal scaling requires session affinity. Add later. | When needed |
+| **Session Encryption** | Data at rest encryption is a compliance layer. | When required |
+| **Audit Logging** | Compliance concern. Add as event sink. | When required |
+| **HTTP Transport** | One transport is minimal. Two is complete. Three is scope creep. | Never |
+| **Protocol Versioning** | YAGNI. Version when you have version problems. | When needed |
+| **Reconnection Logic** | Client responsibility. Server is stateless per connection. | Client author |
+| **Message Buffering** | Client responsibility. Events are fire-and-forget. | Client author |
+| **Session Compaction** | AgentSession handles this. Not server's concern. | AgentSession |
+| **Load Balancing** | Deployment concern. Add at infrastructure layer. | Ops team |
+
+**The principle:** The server does ONE thing—multiplex sessions over transports. Everything else is someone else's job.
+
+---
+
+## What Grows From This
+
+```
+src/
+├── server.ts         # Transports, routing, broadcast
+├── session-manager.ts # Lifecycle, execution, subscribers
+└── types.ts          # Protocol: Command | Response | Event
+```
+
+Optional additions (not required for core function):
+- `client.ts` — TypeScript client library
+- `cli.ts` — Command-line entry point
+- `index.ts` — Public exports
+
+---
+
+## Protocol Surface
 
 ```
 COMMAND                    RESPONSE
@@ -63,16 +92,6 @@ message_update        →   { sessionId, delta, ... }
 agent_end             →   { sessionId, messages }
 extension_ui_request  →   { sessionId, method, ... }
 ```
-
-## What's NOT Here (By Design)
-
-- Authentication → add middleware layer
-- Rate limiting → add middleware layer
-- Metrics → add /metrics endpoint
-- Authorization → add session ownership
-- Clustering → add session affinity
-
-The seed grows the core. The rest is decoration.
 
 ---
 
