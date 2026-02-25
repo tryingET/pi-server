@@ -4,6 +4,10 @@ A session multiplexer for [@mariozechner/pi-coding-agent](https://github.com/bad
 
 **The protocol IS the architecture.**
 
+## Acknowledgments
+
+Born from a conversation between [@SIGKITTEN](https://x.com/SIGKITTEN) and [@badlogicgames](https://x.com/badlogicgames) on [X/Twitter](https://x.com/SIGKITTEN/status/2026755645592961160).
+
 ## Installation
 
 ```bash
