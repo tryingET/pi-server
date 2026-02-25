@@ -11,7 +11,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "test": "node --experimental-vm-modules dist/test.js"
   },
   "dependencies": {
     "@mariozechner/pi-coding-agent": "^0.54.0",

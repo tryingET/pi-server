@@ -10,6 +10,7 @@
  * - Clear separation of concerns
  */
 
+import path from "path";
 import { AgentSession, SessionManager } from "@mariozechner/pi-coding-agent";
 import type { RpcCommand, RpcResponse, SessionInfo } from "./types.js";
 
@@ -66,8 +67,18 @@ const handleGetMessages: CommandHandler = (session, command) => {
 };
 
 const handleSetModel: CommandHandler = async (session, command) => {
-  // Note: This uses internal API - may need adjustment based on pi's public API
-  await session.setModel((session.modelRegistry as any).getModel(command.provider, command.modelId));
+  // Use public API: modelRegistry.find() instead of internal getModel()
+  const model = session.modelRegistry.find(command.provider, command.modelId);
+  if (!model) {
+    return {
+      id: command.id,
+      type: "response",
+      command: "set_model",
+      success: false,
+      error: `Model not found: ${command.provider}/${command.modelId}`,
+    };
+  }
+  await session.setModel(model);
   return {
     id: command.id,
     type: "response",
@@ -318,7 +329,7 @@ const handleListSessionFiles: CommandHandler = async (session, command) => {
   
   const formattedFiles = files.map(file => ({
     path: file.path,
-    name: file.path.split('/').pop() ?? file.path,
+    name: path.basename(file.path), // Cross-platform basename extraction
     modifiedAt: file.modified.toISOString(),
   }));
   

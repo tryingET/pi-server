@@ -22,14 +22,16 @@ The server does ONE thing. Everything else is someone else's job.
 ```
 src/
 ├── server.ts            (208 lines) — transports, routing, broadcast
-├── session-manager.ts   (320 lines) — lifecycle, command execution, subscribers
-├── command-router.ts    (399 lines) — session command handlers (extensible map)
-├── extension-ui.ts      (220 lines) — pending UI request tracking + type guards
-├── server-ui-context.ts (250 lines) — ExtensionUIContext implementation for remote clients
-└── types.ts             (174 lines) — protocol types
+├── session-manager.ts   (340 lines) — lifecycle, command execution, subscribers, timeout
+├── command-router.ts    (410 lines) — session command handlers (extensible map)
+├── extension-ui.ts      (230 lines) — pending UI request tracking + type guards
+├── server-ui-context.ts (260 lines) — ExtensionUIContext implementation for remote clients
+├── validation.ts        (170 lines) — input validation for commands
+├── types.ts             (174 lines) — protocol types
+└── test.ts              (340 lines) — basic test suite
 
-Total: ~1570 lines, 6 files
-Commits: 4 (seed → implementation → docs → credits)
+Total: ~2132 lines, 8 files
+Commits: 5 (seed → implementation → docs → credits → extension-ui)
 Repo: https://github.com/tryingET/pi-server
 ```
 
@@ -38,6 +40,7 @@ Repo: https://github.com/tryingET/pi-server
 - ✅ Phase 1.2: Separate concerns (ExtensionUIManager)
 - ✅ Phase 2: Discovery commands (get_available_models, get_commands, get_skills, get_tools, list_session_files)
 - ✅ Phase 3: Extension UI wiring via `bindExtensions` with `createServerUIContext()`
+- ✅ Phase 3.5: Critical fixes (validation, timeout, set_model fix, tests)
 
 **Working:**
 - create/delete/list sessions
@@ -47,13 +50,15 @@ Repo: https://github.com/tryingET/pi-server
 - Session persistence (handled by AgentSession internally)
 - Discovery commands: models, commands, skills, tools, session files
 - Handler map for 31 session commands
-- **Extension UI round-trip** (select, confirm, input, editor, notify, setStatus, setWidget, setTitle)
+- Extension UI round-trip (select, confirm, input, editor, notify, setStatus, setWidget, setTitle)
+- Input validation for all commands
+- Command timeout (30s for quick commands, 5min for LLM operations)
+- 22 basic tests
 
 **Broken/Incomplete:**
-- ❌ No tests
-- ❌ No input validation
-- ❌ No command timeout
 - ❌ No observability/logging
+- ❌ No session limit
+- ❌ Silent message loss on broadcast
 
 ---
 
@@ -117,15 +122,15 @@ function createServerUIContext(
 | Rank | Issue | Severity | Status |
 |------|-------|----------|--------|
 | 1 | **Extension UI not wired** | ~~CRITICAL~~ | ✅ FIXED (Phase 3) |
-| 2 | **No tests** | CRITICAL | Pending |
-| 3 | **`set_model` uses internal API** | HIGH | Pending |
-| 4 | **No input validation** | HIGH | Pending |
-| 5 | **No command timeout** | HIGH | Pending |
+| 2 | **No tests** | ~~CRITICAL~~ | ✅ FIXED (Phase 3.5) |
+| 3 | **`set_model` uses internal API** | ~~HIGH~~ | ✅ FIXED (use `modelRegistry.find()`) |
+| 4 | **No input validation** | ~~HIGH~~ | ✅ FIXED (validation.ts) |
+| 5 | **No command timeout** | ~~HIGH~~ | ✅ FIXED (withTimeout wrapper) |
 | 6 | **`(command as any).sessionId`** | MEDIUM | Pending |
 | 7 | **No observability** | HIGH | Pending |
 | 8 | **Silent message loss** | MEDIUM | Pending |
 | 9 | **No session limit** | MEDIUM | Pending |
-| 10 | **Windows path handling** | LOW | Pending |
+| 10 | **Windows path handling** | ~~LOW~~ | ✅ FIXED (path.basename) |
 
 ---
 
@@ -133,12 +138,12 @@ function createServerUIContext(
 
 ### Active Bugs
 
-| Bug | File:Line | Repro |
-|-----|-----------|-------|
-| `set_model` uses internal API | `command-router.ts:67-72` | Call with invalid provider/model → crash or undefined behavior |
-| `handleGetState` non-null assertion | `command-router.ts:48` | Call handler directly (not via executeCommand) → crash |
-| Windows path handling | `command-router.ts:175` | `file.path.split('/').pop()` fails on Windows |
-| No command.id validation | Everywhere | Send command without `id` → client can't correlate |
+| Bug | File:Line | Status |
+|-----|-----------|--------|
+| `set_model` uses internal API | `command-router.ts:67-72` | ✅ FIXED |
+| handleGetState non-null assertion | `command-router.ts:48` | Pending (works via executeCommand) |
+| Windows path handling | `command-router.ts:175` | ✅ FIXED |
+| No command.id validation | Everywhere | Pending (id is optional in protocol) |
 
 ### Silent Failures
 
@@ -222,10 +227,14 @@ function createServerUIContext(
 | ExtensionUIManager skeleton | ✅ PAID | Phase 1.2 complete |
 | Discovery commands | ✅ PAID | Phase 2 complete |
 | Extension UI wiring | ✅ PAID | Phase 3 complete (server-ui-context.ts) |
+| No tests | ✅ PAID | Phase 3.5 complete (22 tests) |
+| No validation | ✅ PAID | Phase 3.5 complete (validation.ts) |
+| No timeout | ✅ PAID | Phase 3.5 complete (withTimeout) |
+| `set_model` internal API | ✅ PAID | Phase 3.5 complete (use find()) |
+| Windows path handling | ✅ PAID | Phase 3.5 complete (path.basename) |
 | `(command as any).sessionId` | Medium touch | Pending |
-| `set_model` internal API | High risk | Pending |
-| No tests | Blocks confidence | Pending |
-| No validation | Security risk | Pending |
+| No observability | Medium | Pending |
+| Silent broadcast failures | Low | Pending |
 
 ---
 
@@ -234,35 +243,36 @@ function createServerUIContext(
 | Gap | Priority | Status |
 |-----|----------|--------|
 | ~~Extension UI wiring~~ | ~~CRITICAL~~ | ✅ COMPLETE |
-| Tests | CRITICAL | Next up |
-| Input validation | HIGH | Security |
-| Command timeout | HIGH | Reliability |
-| Observability | HIGH | Debugging |
-| Session limit | MEDIUM | Resource safety |
+| ~~Tests~~ | ~~CRITICAL~~ | ✅ COMPLETE (22 tests) |
+| ~~Input validation~~ | ~~HIGH~~ | ✅ COMPLETE |
+| ~~Command timeout~~ | ~~HIGH~~ | ✅ COMPLETE |
+| Observability | HIGH | Pending |
+| Session limit | MEDIUM | Pending |
+| Silent message loss | MEDIUM | Pending |
 
 ---
 
 ## IMPLEMENTATION ORDER (Next Session)
 
-### Phase 3.5: Critical Fixes
+### Phase 4: Observability
 
-1. Add basic test harness
-2. Fix `set_model` to use public API
-3. Add input validation layer
-4. Add command timeout wrapper
+1. Add structured logging (pino or custom)
+2. Log command execution (start/end/error)
+3. Log failed broadcast sends
+4. Add session metrics (count, message throughput)
 
-### Phase 4: Protocol Versioning
+### Phase 5: Resource Safety
+
+1. Add configurable session limit
+2. Add message size limit
+3. Add graceful shutdown (drain sessions)
+
+### Phase 6: Protocol Versioning
 
 Add to server_ready event:
 ```json
 { "type": "server_ready", "data": { "version": "0.1.0", "protocolVersion": "1", "transports": [...] } }
 ```
-
-### Phase 5: Observability
-
-1. Add structured logging
-2. Log failed sends
-3. Add session metrics
 
 ---
 
@@ -312,4 +322,4 @@ git clean -fd
 
 ---
 
-**Start here:** Phase 3.5 — Add tests, fix `set_model`, add validation and timeout wrappers.
+**Start here:** Phase 4 — Add structured logging, observability, and session metrics.

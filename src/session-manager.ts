@@ -16,6 +16,48 @@ import type {
 import { routeSessionCommand } from "./command-router.js";
 import { ExtensionUIManager } from "./extension-ui.js";
 import { createServerUIContext } from "./server-ui-context.js";
+import { validateCommand, formatValidationErrors } from "./validation.js";
+
+/** Default timeout for session commands (5 minutes for LLM operations) */
+const DEFAULT_COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** Commands that should have shorter timeout (30 seconds) */
+const SHORT_TIMEOUT_COMMANDS = new Set([
+  "get_state",
+  "get_messages",
+  "get_available_models",
+  "get_commands",
+  "get_skills",
+  "get_tools",
+  "list_session_files",
+  "get_session_stats",
+  "get_fork_messages",
+  "get_last_assistant_text",
+  "get_context_usage",
+  "set_session_name",
+]);
+
+/**
+ * Wrap a promise with a timeout.
+ * Returns the promise result or throws on timeout.
+ */
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, commandType: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`Command '${commandType}' timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    promise
+      .then((result) => {
+        clearTimeout(timer);
+        resolve(result);
+      })
+      .catch((error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+  });
+}
 
 export class PiSessionManager {
   private sessions = new Map<string, AgentSession>();
@@ -186,11 +228,29 @@ export class PiSessionManager {
   // ==========================================================================
 
   async executeCommand(command: RpcCommand): Promise<RpcResponse> {
-    const id = command.id;
+    const id = (command as any).id;
+
+    // Input validation
+    const validationErrors = validateCommand(command);
+    if (validationErrors.length > 0) {
+      return {
+        id,
+        type: "response",
+        command: (command as any).type ?? "unknown",
+        success: false,
+        error: `Validation failed: ${formatValidationErrors(validationErrors)}`,
+      };
+    }
 
     try {
+      // Determine timeout for this command type
+      const commandType = (command as any).type as string;
+      const timeoutMs = SHORT_TIMEOUT_COMMANDS.has(commandType)
+        ? 30 * 1000
+        : DEFAULT_COMMAND_TIMEOUT_MS;
+
       // Server commands (lifecycle management)
-      switch (command.type) {
+      switch (commandType) {
         case "list_sessions":
           return {
             id,
@@ -201,8 +261,13 @@ export class PiSessionManager {
           };
 
         case "create_session": {
-          const sessionId = command.sessionId ?? this.generateSessionId();
-          const sessionInfo = await this.createSession(sessionId, command.cwd);
+          const cmd = command as { sessionId?: string; cwd?: string };
+          const sessionId = cmd.sessionId ?? this.generateSessionId();
+          const sessionInfo = await withTimeout(
+            this.createSession(sessionId, cmd.cwd),
+            timeoutMs,
+            "create_session"
+          );
           return {
             id,
             type: "response",
@@ -213,7 +278,8 @@ export class PiSessionManager {
         }
 
         case "delete_session": {
-          await this.deleteSession(command.sessionId);
+          const cmd = command as { sessionId: string };
+          await this.deleteSession(cmd.sessionId);
           return {
             id,
             type: "response",
@@ -224,14 +290,15 @@ export class PiSessionManager {
         }
 
         case "switch_session": {
-          const sessionInfo = this.getSessionInfo(command.sessionId);
+          const cmd = command as { sessionId: string };
+          const sessionInfo = this.getSessionInfo(cmd.sessionId);
           if (!sessionInfo) {
             return {
               id,
               type: "response",
               command: "switch_session",
               success: false,
-              error: `Session ${command.sessionId} not found`,
+              error: `Session ${cmd.sessionId} not found`,
             };
           }
           return {
@@ -251,20 +318,21 @@ export class PiSessionManager {
         return {
           id,
           type: "response",
-          command: command.type,
+          command: commandType,
           success: false,
           error: `Session ${sessionId} not found`,
         };
       }
 
       // Special handling for extension_ui_response (doesn't operate on session directly)
-      if (command.type === "extension_ui_response") {
+      if (commandType === "extension_ui_response") {
+        const cmd = command as { sessionId: string; requestId: string; response: any };
         const result = this.extensionUI.handleUIResponse({
           id,
-          sessionId: command.sessionId,
+          sessionId: cmd.sessionId,
           type: "extension_ui_response",
-          requestId: command.requestId,
-          response: command.response,
+          requestId: cmd.requestId,
+          response: cmd.response,
         });
         if (result.success) {
           return {
@@ -290,17 +358,22 @@ export class PiSessionManager {
         return {
           id,
           type: "response",
-          command: command.type,
+          command: commandType,
           success: false,
-          error: `Unknown command type: ${command.type}`,
+          error: `Unknown command type: ${commandType}`,
         };
+      }
+
+      // Wrap async handlers with timeout
+      if (result instanceof Promise) {
+        return withTimeout(result, timeoutMs, commandType);
       }
       return result;
     } catch (error) {
       return {
         id,
         type: "response",
-        command: command.type,
+        command: (command as any).type ?? "unknown",
         success: false,
         error: error instanceof Error ? error.message : String(error),
       };
