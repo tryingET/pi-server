@@ -1,0 +1,30 @@
+{
+  "name": "pi-app-server",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Session multiplexer for pi-coding-agent",
+  "main": "dist/server.js",
+  "types": "dist/server.d.ts",
+  "bin": {
+    "pi-server": "dist/server.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "@mariozechner/pi-coding-agent": "^0.54.0",
+    "@mariozechner/pi-agent-core": "^0.54.0",
+    "@mariozechner/pi-ai": "^0.54.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
