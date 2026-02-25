@@ -611,7 +611,6 @@ async function testSessionManager() {
   // Test: Session limit enforcement through manager
   await test("session-manager: enforces session limit via governor", async () => {
     // Create a manager with a low session limit
-    const { ResourceGovernor, DEFAULT_CONFIG } = await import("./resource-governor.js");
     const governor = new ResourceGovernor({
       ...DEFAULT_CONFIG,
       maxSessions: 2,
