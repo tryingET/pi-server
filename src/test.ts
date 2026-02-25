@@ -397,6 +397,105 @@ async function testResourceGovernor() {
     // s2's data should be cleaned
     assert.strictEqual(governor.getLastHeartbeat("s2"), undefined, "s2 heartbeat should be cleaned");
   });
+
+  // Test: Session ID validation
+  await test("governor: validates session IDs", () => {
+    const governor = new ResourceGovernor();
+    
+    // Valid IDs
+    assert.strictEqual(governor.validateSessionId("test-1"), null);
+    assert.strictEqual(governor.validateSessionId("my_session"), null);
+    assert.strictEqual(governor.validateSessionId("session.1"), null);
+    assert.strictEqual(governor.validateSessionId("a"), null);
+    
+    // Invalid IDs
+    assert(governor.validateSessionId("")?.includes("non-empty"));
+    assert(governor.validateSessionId("test session")?.includes("alphanumeric"));
+    assert(governor.validateSessionId("test@session")?.includes("alphanumeric"));
+    assert(governor.validateSessionId("../../../etc/passwd")?.includes("alphanumeric"));
+    assert(governor.validateSessionId(null as any)?.includes("non-empty"));
+  });
+
+  // Test: CWD validation
+  await test("governor: validates CWD paths", () => {
+    const governor = new ResourceGovernor();
+    
+    // Valid paths (relative, no traversal)
+    // Note: CWD validation is strict - only blocks dangerous patterns
+    assert(governor.validateCwd("/absolute/path")?.includes("dangerous")); // starts with /
+    
+    // Invalid paths
+    assert(governor.validateCwd("../../../etc")?.includes("dangerous"));
+    assert(governor.validateCwd("~/home")?.includes("dangerous"));
+    assert(governor.validateCwd("")?.includes("non-empty"));
+    assert(governor.validateCwd(null as any)?.includes("non-empty"));
+  });
+
+  // Test: Connection limits
+  await test("governor: enforces connection limit", () => {
+    const governor = new ResourceGovernor({ ...DEFAULT_CONFIG, maxConnections: 2 });
+    
+    assert.strictEqual(governor.canAcceptConnection().allowed, true);
+    governor.registerConnection();
+    assert.strictEqual(governor.getConnectionCount(), 1);
+    
+    assert.strictEqual(governor.canAcceptConnection().allowed, true);
+    governor.registerConnection();
+    assert.strictEqual(governor.getConnectionCount(), 2);
+    
+    const result = governor.canAcceptConnection();
+    assert.strictEqual(result.allowed, false);
+    assert(result.reason?.includes("Connection limit"));
+    
+    // Unregister
+    governor.unregisterConnection();
+    assert.strictEqual(governor.getConnectionCount(), 1);
+  });
+
+  // Test: Health check
+  await test("governor: health check works", () => {
+    const governor = new ResourceGovernor();
+    
+    const healthy = governor.isHealthy();
+    assert.strictEqual(healthy.healthy, true);
+    assert.deepStrictEqual(healthy.issues, []);
+  });
+
+  // Test: Zombie cleanup
+  await test("governor: cleanupZombieSessions removes zombies", async () => {
+    const governor = new ResourceGovernor({
+      ...DEFAULT_CONFIG,
+      zombieTimeoutMs: 100,
+    });
+    
+    governor.registerSession("zombie1");
+    governor.registerSession("zombie2");
+    
+    // Wait for timeout
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    
+    // Cleanup
+    const cleaned = governor.cleanupZombieSessions();
+    assert.strictEqual(cleaned.length, 2, "Should clean 2 zombies");
+    assert(cleaned.includes("zombie1"));
+    assert(cleaned.includes("zombie2"));
+    
+    // Verify cleaned
+    assert.strictEqual(governor.getLastHeartbeat("zombie1"), undefined);
+    assert.strictEqual(governor.getLastHeartbeat("zombie2"), undefined);
+  });
+
+  // Test: Metrics include connection count
+  await test("governor: metrics include connection info", () => {
+    const governor = new ResourceGovernor();
+    governor.registerConnection();
+    governor.registerConnection();
+    
+    const metrics = governor.getMetrics();
+    assert.strictEqual(metrics.connectionCount, 2);
+    assert.strictEqual(typeof metrics.commandsRejected.connectionLimit, "number");
+    assert.strictEqual(typeof metrics.zombieSessionsCleaned, "number");
+  });
 }
 
 // =============================================================================
@@ -512,14 +611,10 @@ async function testSessionManager() {
   // Test: Session limit enforcement through manager
   await test("session-manager: enforces session limit via governor", async () => {
     // Create a manager with a low session limit
-    const { ResourceGovernor } = await import("./resource-governor.js");
+    const { ResourceGovernor, DEFAULT_CONFIG } = await import("./resource-governor.js");
     const governor = new ResourceGovernor({
+      ...DEFAULT_CONFIG,
       maxSessions: 2,
-      maxMessageSizeBytes: 10 * 1024 * 1024,
-      maxCommandsPerMinute: 100,
-      maxGlobalCommandsPerMinute: 1000,
-      heartbeatIntervalMs: 30000,
-      zombieTimeoutMs: 5 * 60 * 1000,
     });
     const limitedManager = new PiSessionManager(governor);
 
