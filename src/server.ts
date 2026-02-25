@@ -14,8 +14,15 @@ import { WebSocketServer, WebSocket } from "ws";
 import { PiSessionManager } from "./session-manager.js";
 import type { RpcCommand, RpcResponse, Subscriber, RpcBroadcast } from "./types.js";
 
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
 const VERSION = "0.1.0";
 const DEFAULT_PORT = 3141;
+
+/** Default graceful shutdown timeout (30 seconds) */
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 30000;
 
 // ============================================================================
 // SERVER
@@ -24,7 +31,7 @@ const DEFAULT_PORT = 3141;
 export class PiServer {
   private sessionManager = new PiSessionManager();
   private wss: WebSocketServer | null = null;
-  private stdinSubscribers = new Set<Subscriber>();
+  private stdinInterface: readline.Interface | null = null;
 
   async start(port: number = DEFAULT_PORT): Promise<void> {
     // Start WebSocket server
@@ -32,7 +39,7 @@ export class PiServer {
     this.setupWebSocket(this.wss);
 
     // Setup stdio transport
-    this.setupStdio();
+    this.stdinInterface = this.setupStdio();
 
     // Broadcast server_ready
     const readyEvent: RpcBroadcast = {
@@ -44,10 +51,78 @@ export class PiServer {
     console.error(`pi-app-server v${VERSION} listening on port ${port} and stdio`);
   }
 
-  async stop(): Promise<void> {
-    if (this.wss) {
-      this.wss.close();
+  /**
+   * Check if server is shutting down.
+   */
+  isInShutdown(): boolean {
+    return this.sessionManager.isInShutdown();
+  }
+
+  /**
+   * Get session manager for external access.
+   */
+  getSessionManager(): PiSessionManager {
+    return this.sessionManager;
+  }
+
+  /**
+   * Graceful shutdown.
+   * 1. Stop accepting new connections
+   * 2. Broadcast shutdown notification
+   * 3. Drain in-flight commands
+   * 4. Close all WebSocket connections
+   * 5. Close stdin
+   * 6. Dispose all sessions
+   */
+  async stop(timeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<void> {
+    // Check via session manager (single source of truth)
+    if (this.sessionManager.isInShutdown()) {
+      return; // Already shutting down
     }
+
+    console.error("[shutdown] Initiating graceful shutdown...");
+
+    // Stop accepting new WebSocket connections
+    if (this.wss) {
+      this.wss.close(() => {
+        console.error("[shutdown] WebSocket server closed (no new connections)");
+      });
+    }
+
+    // Close stdin to stop accepting new commands
+    if (this.stdinInterface) {
+      this.stdinInterface.close();
+      this.stdinInterface = null;
+      console.error("[shutdown] Stdin closed");
+    }
+
+    // Initiate session manager shutdown (broadcasts notification, drains commands)
+    const result = await this.sessionManager.initiateShutdown(timeoutMs);
+    
+    if (result.timedOut) {
+      console.error(`[shutdown] Timed out after ${timeoutMs}ms, ${result.drained} commands drained, ${this.sessionManager.getInFlightCount()} still pending`);
+    } else {
+      console.error(`[shutdown] All ${result.drained} in-flight commands completed`);
+    }
+
+    // Close all remaining WebSocket connections
+    if (this.wss) {
+      const clients = [...this.wss.clients];
+      console.error(`[shutdown] Closing ${clients.length} WebSocket connections...`);
+      for (const ws of clients) {
+        try {
+          ws.close(1001, "Server shutting down");
+        } catch {
+          // Ignore close errors
+        }
+      }
+    }
+
+    // Dispose all sessions
+    const disposeResult = this.sessionManager.disposeAllSessions();
+    console.error(`[shutdown] Disposed ${disposeResult.disposed} sessions (${disposeResult.failed} failed)`);
+
+    console.error("[shutdown] Complete");
   }
 
   // ==========================================================================
@@ -74,6 +149,23 @@ export class PiServer {
       this.sessionManager.addSubscriber(subscriber);
 
       ws.on("message", async (data: Buffer) => {
+        // Check message size limit
+        const sizeResult = this.sessionManager.getGovernor().canAcceptMessage(data.length);
+        if (!sizeResult.allowed) {
+          const errorResponse: RpcResponse = {
+            type: "response",
+            command: "unknown",
+            success: false,
+            error: sizeResult.reason,
+          };
+          try {
+            ws.send(JSON.stringify(errorResponse));
+          } catch {
+            // Error response send failed
+          }
+          return;
+        }
+
         try {
           const command: RpcCommand = JSON.parse(data.toString());
           await this.handleCommand(command, subscriber, (response: RpcResponse) => {
@@ -115,7 +207,7 @@ export class PiServer {
   // STDIO TRANSPORT
   // ==========================================================================
 
-  private setupStdio(): void {
+  private setupStdio(): readline.Interface {
     const rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
@@ -134,9 +226,25 @@ export class PiServer {
     };
 
     this.sessionManager.addSubscriber(subscriber);
-    this.stdinSubscribers.add(subscriber);
 
     rl.on("line", async (line: string) => {
+      // Check message size limit
+      const sizeResult = this.sessionManager.getGovernor().canAcceptMessage(line.length);
+      if (!sizeResult.allowed) {
+        const errorResponse: RpcResponse = {
+          type: "response",
+          command: "unknown",
+          success: false,
+          error: sizeResult.reason,
+        };
+        try {
+          process.stdout.write(JSON.stringify(errorResponse) + "\n");
+        } catch {
+          // Stdout broken
+        }
+        return;
+      }
+
       try {
         const command: RpcCommand = JSON.parse(line);
         await this.handleCommand(command, subscriber, (response: RpcResponse) => {
@@ -163,8 +271,9 @@ export class PiServer {
 
     rl.on("close", () => {
       this.sessionManager.removeSubscriber(subscriber);
-      this.stdinSubscribers.delete(subscriber);
     });
+
+    return rl;
   }
 
   // ==========================================================================
@@ -213,20 +322,28 @@ export class PiServer {
 // ============================================================================
 
 async function main(): Promise<void> {
-  const port = parseInt(process.env.PI_SERVER_PORT ?? String(DEFAULT_PORT), 10);
+  // Parse port with validation
+  const portEnv = process.env.PI_SERVER_PORT;
+  const port = portEnv ? parseInt(portEnv, 10) : DEFAULT_PORT;
+  
+  if (isNaN(port) || port < 1 || port > 65535) {
+    console.error(`Invalid PI_SERVER_PORT: "${portEnv}". Must be 1-65535.`);
+    process.exit(1);
+    return; // TypeScript needs this
+  }
+
   const server = new PiServer();
   await server.start(port);
 
-  // Graceful shutdown
-  process.on("SIGINT", async () => {
-    await server.stop();
+  // Graceful shutdown handlers
+  const handleShutdown = async (signal: string) => {
+    console.error(`\n[${signal}] Received, initiating shutdown...`);
+    await server.stop(DEFAULT_SHUTDOWN_TIMEOUT_MS);
     process.exit(0);
-  });
+  };
 
-  process.on("SIGTERM", async () => {
-    await server.stop();
-    process.exit(0);
-  });
+  process.on("SIGINT", () => handleShutdown("SIGINT"));
+  process.on("SIGTERM", () => handleShutdown("SIGTERM"));
 }
 
 main().catch((error) => {

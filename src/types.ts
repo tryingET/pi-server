@@ -254,12 +254,17 @@ export interface ServerEvent {
   data: { version: string; transports: string[] };
 }
 
+export interface ServerShutdownEvent {
+  type: "server_shutdown";
+  data: { reason: string; timeoutMs?: number };
+}
+
 export interface SessionLifecycleEvent {
   type: "session_created" | "session_deleted";
   data: { sessionId: string; sessionInfo?: SessionInfo };
 }
 
-export type RpcBroadcast = RpcEvent | ServerEvent | SessionLifecycleEvent;
+export type RpcBroadcast = RpcEvent | ServerEvent | ServerShutdownEvent | SessionLifecycleEvent;
 
 // ============================================================================
 // SUBSCRIBER

@@ -15,11 +15,18 @@ import { routeSessionCommand } from "./command-router.js";
 import { ExtensionUIManager } from "./extension-ui.js";
 import { createServerUIContext } from "./server-ui-context.js";
 import { validateCommand, formatValidationErrors } from "./validation.js";
+import { ResourceGovernor, DEFAULT_CONFIG } from "./resource-governor.js";
 
 /** Default timeout for session commands (5 minutes for LLM operations) */
 const DEFAULT_COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
 
-/** Commands that should have shorter timeout (30 seconds) */
+/** Default graceful shutdown timeout (30 seconds) */
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 30 * 1000;
+
+/** Short command timeout (30 seconds) */
+const SHORT_COMMAND_TIMEOUT_MS = 30 * 1000;
+
+/** Commands that should have shorter timeout */
 const SHORT_TIMEOUT_COMMANDS = new Set([
   "get_state",
   "get_messages",
@@ -62,11 +69,168 @@ export class PiSessionManager {
   private sessionCreatedAt = new Map<string, Date>();
   private subscribers = new Set<Subscriber>();
   private unsubscribers = new Map<string, () => void>();
+  private governor: ResourceGovernor;
+
+  // Shutdown state (single source of truth - server.ts delegates to this)
+  private isShuttingDown = false;
+  private inFlightCommands = new Set<Promise<unknown>>();
 
   // Extension UI request tracking
   private extensionUI = new ExtensionUIManager((sessionId: string, event: AgentSessionEvent) =>
     this.broadcastEvent(sessionId, event)
   );
+
+  constructor(governor?: ResourceGovernor) {
+    this.governor = governor ?? new ResourceGovernor(DEFAULT_CONFIG);
+  }
+
+  /**
+   * Get the resource governor for external checks (e.g., message size).
+   */
+  getGovernor(): ResourceGovernor {
+    return this.governor;
+  }
+
+  // ==========================================================================
+  // SHUTDOWN MANAGEMENT
+  // ==========================================================================
+
+  /**
+   * Check if the server is shutting down.
+   */
+  isInShutdown(): boolean {
+    return this.isShuttingDown;
+  }
+
+  /**
+   * Initiate graceful shutdown.
+   * - Stops accepting new commands
+   * - Broadcasts shutdown notification to all clients
+   * - Returns promise that resolves when all in-flight commands complete or timeout
+   * 
+   * Idempotent: calling multiple times returns the same result.
+   */
+  async initiateShutdown(timeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<{ drained: number; timedOut: boolean }> {
+    // Idempotent check - only initiate once
+    if (this.isShuttingDown) {
+      // Return current state - how many commands are still in flight
+      const remaining = this.inFlightCommands.size;
+      return { drained: 0, timedOut: remaining > 0 };
+    }
+    
+    this.isShuttingDown = true;
+
+    // Broadcast shutdown notification
+    const shutdownEvent = {
+      type: "server_shutdown",
+      data: { reason: "graceful_shutdown", timeoutMs },
+    };
+    this.broadcast(JSON.stringify(shutdownEvent));
+
+    // Wait for in-flight commands with timeout
+    const inFlightCount = this.inFlightCommands.size;
+    
+    if (inFlightCount === 0) {
+      return { drained: 0, timedOut: false };
+    }
+
+    // Snapshot the current in-flight commands
+    const snapshot = [...this.inFlightCommands];
+    
+    const drainPromise = Promise.allSettled(snapshot);
+    
+    const timeoutPromise = new Promise<{ drained: number; timedOut: boolean }>((resolve) => {
+      setTimeout(() => {
+        // Count how many from the original snapshot are still pending
+        const stillPending = snapshot.filter((p) => this.inFlightCommands.has(p)).length;
+        const drained = inFlightCount - stillPending;
+        resolve({ drained, timedOut: true });
+      }, timeoutMs);
+    });
+
+    const drainResult = new Promise<{ drained: number; timedOut: boolean }>((resolve) => {
+      drainPromise.then(() => {
+        resolve({ drained: inFlightCount, timedOut: false });
+      });
+    });
+
+    return Promise.race([drainResult, timeoutPromise]);
+  }
+
+  /**
+   * Dispose all sessions. Call after shutdown drain completes.
+   */
+  disposeAllSessions(): { disposed: number; failed: number } {
+    let disposed = 0;
+    let failed = 0;
+    
+    // Snapshot session IDs
+    const sessionIds = [...this.sessions.keys()];
+    
+    for (const sessionId of sessionIds) {
+      try {
+        // Get session before removing
+        const session = this.sessions.get(sessionId);
+        
+        // Remove from maps first
+        this.sessions.delete(sessionId);
+        this.sessionCreatedAt.delete(sessionId);
+        
+        // Unsubscribe
+        const unsubscribe = this.unsubscribers.get(sessionId);
+        if (unsubscribe) {
+          this.unsubscribers.delete(sessionId);
+          try {
+            unsubscribe();
+          } catch {
+            // Ignore unsubscribe errors during disposal
+          }
+        }
+        
+        // Dispose session
+        if (session) {
+          try {
+            session.dispose();
+            disposed++;
+          } catch {
+            failed++;
+          }
+        }
+      } catch {
+        failed++;
+      }
+    }
+    
+    // Clear governor state
+    this.governor.cleanupStaleData(new Set());
+    
+    return { disposed, failed };
+  }
+
+  /**
+   * Get count of in-flight commands.
+   */
+  getInFlightCount(): number {
+    return this.inFlightCommands.size;
+  }
+
+  /**
+   * Track an in-flight command.
+   * Uses unknown type to avoid unsafe casts.
+   */
+  private trackCommand<T>(promise: Promise<T>): Promise<T> {
+    // Add to tracking set
+    this.inFlightCommands.add(promise);
+    
+    // Remove from tracking when settled (success or failure)
+    const cleanup = () => {
+      this.inFlightCommands.delete(promise);
+    };
+    
+    promise.then(cleanup, cleanup);
+    
+    return promise;
+  }
 
   // ==========================================================================
   // SESSION LIFECYCLE
@@ -77,28 +241,41 @@ export class PiSessionManager {
       throw new Error(`Session ${sessionId} already exists`);
     }
 
-    const { session } = await createAgentSession({
-      cwd: cwd ?? process.cwd(),
-    });
+    // Atomically reserve a session slot (prevents race conditions)
+    if (!this.governor.tryReserveSessionSlot()) {
+      throw new Error(`Session limit reached (${this.governor.getConfig().maxSessions} sessions)`);
+    }
 
-    // Wire extension UI - this is the nexus intervention!
-    // Without this, extension UI requests (select, confirm, input, etc.) hang.
-    await session.bindExtensions({
-      uiContext: createServerUIContext(sessionId, this.extensionUI, (sid, event) =>
-        this.broadcastEvent(sid, event)
-      ),
-    });
+    try {
+      const { session } = await createAgentSession({
+        cwd: cwd ?? process.cwd(),
+      });
 
-    this.sessions.set(sessionId, session);
-    this.sessionCreatedAt.set(sessionId, new Date());
+      // Wire extension UI - this is the nexus intervention!
+      // Without this, extension UI requests (select, confirm, input, etc.) hang.
+      await session.bindExtensions({
+        uiContext: createServerUIContext(sessionId, this.extensionUI, (sid, event) =>
+          this.broadcastEvent(sid, event)
+        ),
+      });
 
-    // Subscribe to all events from this session
-    const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
-      this.broadcastEvent(sessionId, event);
-    });
-    this.unsubscribers.set(sessionId, unsubscribe);
+      this.sessions.set(sessionId, session);
+      this.sessionCreatedAt.set(sessionId, new Date());
+      // Record heartbeat (session count already incremented by tryReserveSessionSlot)
+      this.governor.recordHeartbeat(sessionId);
 
-    return this.getSessionInfo(sessionId)!;
+      // Subscribe to all events from this session
+      const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+        this.broadcastEvent(sessionId, event);
+      });
+      this.unsubscribers.set(sessionId, unsubscribe);
+
+      return this.getSessionInfo(sessionId)!;
+    } catch (error) {
+      // Release the slot if session creation failed
+      this.governor.releaseSessionSlot();
+      throw error;
+    }
   }
 
   async deleteSession(sessionId: string): Promise<void> {
@@ -113,6 +290,10 @@ export class PiSessionManager {
     // Remove from maps first to prevent new operations
     this.sessions.delete(sessionId);
     this.sessionCreatedAt.delete(sessionId);
+    this.governor.unregisterSession(sessionId);
+
+    // Clean up stale governor data for this session
+    this.governor.cleanupStaleData(new Set(this.sessions.keys()));
 
     // Unsubscribe from events
     const unsubscribe = this.unsubscribers.get(sessionId);
@@ -250,25 +431,67 @@ export class PiSessionManager {
 
   async executeCommand(command: RpcCommand): Promise<RpcResponse> {
     const id = (command as any).id;
+    const commandType = (command as any).type as string;
 
-    // Input validation
+    // Check for shutdown - reject new commands during shutdown
+    if (this.isShuttingDown) {
+      return {
+        id,
+        type: "response",
+        command: commandType ?? "unknown",
+        success: false,
+        error: "Server is shutting down",
+      };
+    }
+
+    // Input validation FIRST (don't rate-limit invalid commands)
     const validationErrors = validateCommand(command);
     if (validationErrors.length > 0) {
       return {
         id,
         type: "response",
-        command: (command as any).type ?? "unknown",
+        command: commandType ?? "unknown",
         success: false,
         error: `Validation failed: ${formatValidationErrors(validationErrors)}`,
       };
     }
 
+    // Track this command as in-flight
+    return this.trackCommand(this.executeCommandInternal(command, id, commandType));
+  }
+
+  /**
+   * Internal command execution (called after tracking).
+   */
+  private async executeCommandInternal(
+    command: RpcCommand,
+    id: string | undefined,
+    commandType: string
+  ): Promise<RpcResponse> {
     try {
       // Determine timeout for this command type
-      const commandType = (command as any).type as string;
       const timeoutMs = SHORT_TIMEOUT_COMMANDS.has(commandType)
-        ? 30 * 1000
+        ? SHORT_COMMAND_TIMEOUT_MS
         : DEFAULT_COMMAND_TIMEOUT_MS;
+
+      // Rate limiting AFTER validation - use sessionId for session commands, "_server_" for server commands
+      const rateLimitKey = (command as any).sessionId ?? "_server_";
+      const rateLimitResult = this.governor.canExecuteCommand(rateLimitKey);
+      if (!rateLimitResult.allowed) {
+        return {
+          id,
+          type: "response",
+          command: commandType,
+          success: false,
+          error: rateLimitResult.reason,
+        };
+      }
+
+      // Record heartbeat for session activity
+      const sessionId = (command as any).sessionId;
+      if (sessionId) {
+        this.governor.recordHeartbeat(sessionId);
+      }
 
       // Server commands (lifecycle management)
       switch (commandType) {
@@ -283,9 +506,9 @@ export class PiSessionManager {
 
         case "create_session": {
           const cmd = command as { sessionId?: string; cwd?: string };
-          const sessionId = cmd.sessionId ?? this.generateSessionId();
+          const newSessionId = cmd.sessionId ?? this.generateSessionId();
           const sessionInfo = await withTimeout(
-            this.createSession(sessionId, cmd.cwd),
+            this.createSession(newSessionId, cmd.cwd),
             timeoutMs,
             "create_session"
           );
@@ -294,7 +517,7 @@ export class PiSessionManager {
             type: "response",
             command: "create_session",
             success: true,
-            data: { sessionId, sessionInfo },
+            data: { sessionId: newSessionId, sessionInfo },
           };
         }
 
@@ -333,7 +556,7 @@ export class PiSessionManager {
       }
 
       // Session commands - get the session first
-      const sessionId = (command as any).sessionId;
+      // sessionId is already defined above for heartbeat recording
       const session = this.sessions.get(sessionId);
       if (!session) {
         return {
@@ -394,7 +617,7 @@ export class PiSessionManager {
       return {
         id,
         type: "response",
-        command: (command as any).type ?? "unknown",
+        command: commandType,
         success: false,
         error: error instanceof Error ? error.message : String(error),
       };
