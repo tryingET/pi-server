@@ -21,14 +21,23 @@ The server does ONE thing. Everything else is someone else's job.
 
 ```
 src/
-├── server.ts         (208 lines) — transports, routing, broadcast
-├── session-manager.ts (440 lines) — lifecycle, command execution, subscribers
-└── types.ts          (157 lines) — protocol types
+├── server.ts            (208 lines) — transports, routing, broadcast
+├── session-manager.ts   (320 lines) — lifecycle, command execution, subscribers
+├── command-router.ts    (399 lines) — session command handlers (extensible map)
+├── extension-ui.ts      (220 lines) — pending UI request tracking + type guards
+├── server-ui-context.ts (250 lines) — ExtensionUIContext implementation for remote clients
+└── types.ts             (174 lines) — protocol types
 
-Total: 805 lines, 3 files
+Total: ~1570 lines, 6 files
 Commits: 4 (seed → implementation → docs → credits)
 Repo: https://github.com/tryingET/pi-server
 ```
+
+**Completed This Session:**
+- ✅ Phase 1.1: Extract command handlers to map (`command-router.ts`)
+- ✅ Phase 1.2: Separate concerns (ExtensionUIManager)
+- ✅ Phase 2: Discovery commands (get_available_models, get_commands, get_skills, get_tools, list_session_files)
+- ✅ Phase 3: Extension UI wiring via `bindExtensions` with `createServerUIContext()`
 
 **Working:**
 - create/delete/list sessions
@@ -36,12 +45,15 @@ Repo: https://github.com/tryingET/pi-server
 - event broadcast with sessionId
 - WebSocket + stdio transports
 - Session persistence (handled by AgentSession internally)
+- Discovery commands: models, commands, skills, tools, session files
+- Handler map for 31 session commands
+- **Extension UI round-trip** (select, confirm, input, editor, notify, setStatus, setWidget, setTitle)
 
 **Broken/Incomplete:**
-- Missing discovery commands (models, skills, commands, session files)
-- Extension UI events fire but no response path (extensions hang)
-- set_model crashes (wrong API usage)
-- Protocol drift from pi's RpcCommand
+- ❌ No tests
+- ❌ No input validation
+- ❌ No command timeout
+- ❌ No observability/logging
 
 ---
 
@@ -49,119 +61,195 @@ Repo: https://github.com/tryingET/pi-server
 
 **The ONE intervention that unlocks everything else:**
 
-### Extension UI Round-Trip
+### Wire Extension UI via bindExtensions
 
-Current state: Extension fires `extension_ui_request` event → client receives it → client cannot respond → extension hangs forever
+Current state: Sessions created without custom UI context → extension UI requests fire into void → extensions hang
 
 Required state:
-```
-1. Server emits: { type: "event", sessionId, event: { type: "extension_ui_request", id, method, ... } }
-2. Client sends: { type: "extension_ui_response", sessionId, id, value/confirmed/cancelled }
-3. Server routes response to waiting extension → extension continues
+```typescript
+// In session-manager.ts createSession():
+const { session } = await createAgentSession({ cwd });
+
+// THIS IS MISSING:
+await session.bindExtensions({
+  uiContext: createServerUIContext(sessionId, this.extensionUI, this.broadcast)
+});
 ```
 
 **Why this is the nexus:**
-- Unlocks all extension UI: select, confirm, input, editor, notify, setStatus, setWidget, setTitle
+- Unlocks all extension UI: select, confirm, input, editor, interview, notify, setStatus, setWidget, setTitle
 - Skills with user input work
 - Prompt templates with variables work
 - Custom tools that need confirmation work
 - Makes the server a true conversation, not a one-way pipe
+- Makes ExtensionUIManager useful (currently dead code)
 
 **Implementation:**
 ```typescript
-// In session-manager.ts or new extension-ui.ts
-private pendingUIRequests = new Map<string, {
-  sessionId: string;
-  resolve: (response: any) => void;
-  reject: (error: Error) => void;
-  timeout: NodeJS.Timeout;
-}>();
-
-// When extension_ui_request event fires:
-// 1. Generate unique requestId
-// 2. Store promise callbacks in map
-// 3. Broadcast event to subscribers
-// 4. Await promise (with timeout)
-
-// When extension_ui_response command arrives:
-// 1. Look up pending request by id
-// 2. Resolve/reject the promise
-// 3. Extension continues
-```
-
----
-
-## IMPLEMENTATION ORDER
-
-### Phase 1: Refactor (enables extension)
-
-**1.1 Extract command handlers to map**
-```typescript
-// command-router.ts
-type CommandHandler = (session: AgentSession, command: RpcCommand) => Promise<RpcResponse>;
-
-const handlers: Record<string, CommandHandler> = {
-  "prompt": handlePrompt,
-  "steer": handleSteer,
-  "abort": handleAbort,
-  // ... all 30+ commands
-};
-
-export async function routeCommand(session: AgentSession, command: RpcCommand): Promise<RpcResponse> {
-  const handler = handlers[command.type];
-  if (!handler) {
-    return { id: command.id, type: "response", command: command.type, success: false, error: `Unknown command: ${command.type}` };
-  }
-  return handler(session, command);
+// Create UI context factory
+function createServerUIContext(
+  sessionId: string,
+  extensionUI: ExtensionUIManager,
+  broadcast: (sessionId: string, event: any) => void
+): ExtensionUIContext {
+  return {
+    async select(title, options, opts) {
+      const { requestId, promise } = extensionUI.createPendingRequest(sessionId, "select", { title, options, timeout: opts?.timeout });
+      extensionUI.broadcastUIRequest(sessionId, requestId, "select", { title, options });
+      const response = await promise;
+      return response.method === "cancelled" ? undefined : response.value;
+    },
+    // ... confirm, input, editor, etc.
+  };
 }
 ```
 
-**Why:** Enables adding commands without touching giant switch. Each handler testable in isolation.
+**Cascade Effects:**
+1. Extension UI works end-to-end
+2. Clients can build interactive UIs
+3. Complex workflows (multi-step confirmations) become possible
+4. pi-server becomes a true remote control for pi
 
-**1.2 Separate concerns**
-- SessionManager: lifecycle + broadcast only
-- CommandRouter: command dispatch
-- ExtensionUI: pending request tracking
-- Server: transports only
+---
 
-### Phase 2: Discovery Commands (expose what pi knows)
+## RANKED ISSUES (from Deep Review)
 
-Add to types.ts:
-```typescript
-| { id?: string; sessionId: string; type: "get_available_models" }
-| { id?: string; sessionId: string; type: "get_commands" }
-| { id?: string; sessionId: string; type: "get_skills" }
-| { id?: string; type: "list_session_files"; cwd?: string }
-| { id?: string; sessionId: string; type: "get_tools" }
-```
+| Rank | Issue | Severity | Status |
+|------|-------|----------|--------|
+| 1 | **Extension UI not wired** | ~~CRITICAL~~ | ✅ FIXED (Phase 3) |
+| 2 | **No tests** | CRITICAL | Pending |
+| 3 | **`set_model` uses internal API** | HIGH | Pending |
+| 4 | **No input validation** | HIGH | Pending |
+| 5 | **No command timeout** | HIGH | Pending |
+| 6 | **`(command as any).sessionId`** | MEDIUM | Pending |
+| 7 | **No observability** | HIGH | Pending |
+| 8 | **Silent message loss** | MEDIUM | Pending |
+| 9 | **No session limit** | MEDIUM | Pending |
+| 10 | **Windows path handling** | LOW | Pending |
 
-Implementation calls existing AgentSession/SessionManager methods:
-- `session.modelRegistry.getAvailableModels()`
-- `session.resourceLoader.skills`
-- `session.resourceLoader.promptTemplates`
-- `SessionManager.list(cwd)`
+---
 
-### Phase 3: Extension UI Round-Trip
+## BUGS FOUND (Deep Review)
 
-Add to types.ts:
-```typescript
-// Command (client → server)
-| { id?: string; sessionId: string; type: "extension_ui_response"; requestId: string; response: ExtensionUIResponse }
+### Active Bugs
 
-// Response variants
-type ExtensionUIResponse =
-  | { method: "select"; value: string }
-  | { method: "confirm"; confirmed: boolean }
-  | { method: "input"; value: string }
-  | { method: "editor"; value: string }
-  | { method: "cancelled" };
-```
+| Bug | File:Line | Repro |
+|-----|-----------|-------|
+| `set_model` uses internal API | `command-router.ts:67-72` | Call with invalid provider/model → crash or undefined behavior |
+| `handleGetState` non-null assertion | `command-router.ts:48` | Call handler directly (not via executeCommand) → crash |
+| Windows path handling | `command-router.ts:175` | `file.path.split('/').pop()` fails on Windows |
+| No command.id validation | Everywhere | Send command without `id` → client can't correlate |
 
-Implementation in extension-ui.ts:
-- Track pending requests per session
-- Wire event emission to promise creation
-- Wire response command to promise resolution
-- Handle timeouts (default 60s, configurable)
+### Silent Failures
+
+| Bug | Location | Consequence |
+|-----|----------|-------------|
+| Subscriber send failures swallowed | `session-manager.ts:147-150` | Message lost, no logging |
+| WebSocket state race | `server.ts:72-75` | State changes between check and send |
+
+### Missing Safety
+
+| Missing | Consequence |
+|---------|-------------|
+| No maximum session count | Memory exhaustion |
+| No message size limit | OOM on large JSON |
+| No rate limiting | DoS vector |
+| No request timeout on session commands | Hung LLM API = hung server |
+| No heartbeat | Zombie connections |
+| No graceful session drain | In-flight requests die on shutdown |
+
+---
+
+## PATTERNS (use these)
+
+| Pattern | Description | Example |
+|---------|-------------|---------|
+| **Handler map** | `Record<string, CommandHandler>` for O(1) dispatch | `command-router.ts:228-258` |
+| **Pass-through** | Session commands thin wrappers around AgentSession | All handlers in command-router |
+| **Broadcast** | Events flow: session → subscribers with sessionId | `session-manager.ts:141-155` |
+| **Correlation** | Request id matches response id | All responses include `id` |
+| **Pending promise** | Extension UI requests create promises, responses resolve them | `extension-ui.ts:67-85` |
+
+---
+
+## ANTI-PATTERNS (avoid these)
+
+| Anti-pattern | Location | Fix |
+|--------------|----------|-----|
+| `(command as any).sessionId` | session-manager.ts:193, 247 | Create typed accessor |
+| `(session.modelRegistry as any).getModel()` | command-router.ts:68 | Use public API |
+| Silent catch in broadcast | session-manager.ts:149, 159 | Log failures |
+| Server knows switch_session semantics | server.ts:105-109 | Move to session-manager |
+
+---
+
+## SURPRISES (non-obvious findings)
+
+1. **`extension_ui_request` is NOT an AgentSessionEvent** — comes through ExtensionUIContext, not event stream
+2. **Session creation is async and slow** — loads extensions, skills, prompts; takes seconds
+3. **`bindExtensions` required for extension UI** — without it, extensions hang
+4. **pi's RPC already has extension UI** — but requires custom UIContext to be provided
+5. **`modelRegistry.getModel()` is internal API** — will break on pi changes
+
+---
+
+## HEURISTICS (rules of thumb)
+
+1. **If pi has it, expose it** — don't reimplement, just pass through
+2. **Server should be thin** — AgentSession does the work
+3. **Protocol = types.ts** — everything else is implementation
+4. **Extension UI requires round-trip** — not just broadcast, must await response
+5. **No auth in server** — pi handles via ModelRegistry
+6. **Test everything** — no tests = no confidence
+
+---
+
+## CAVEATS (doesn't generalize)
+
+1. **Extension UI requires bindExtensions** — not automatic, must provide UIContext
+2. **Some pi features require TUI** — themes can't be exposed remotely
+3. **Multiple clients, one response** — only one should respond to UI request
+4. **Session file paths are platform-specific** — returns absolute paths
+5. **pi API is not versioned** — internal API usage risks breakage
+
+---
+
+## DEBT INVENTORY
+
+| Debt | Interest | Status |
+|------|----------|--------|
+| Handler map | ✅ PAID | Phase 1.1 complete |
+| ExtensionUIManager skeleton | ✅ PAID | Phase 1.2 complete |
+| Discovery commands | ✅ PAID | Phase 2 complete |
+| Extension UI wiring | ✅ PAID | Phase 3 complete (server-ui-context.ts) |
+| `(command as any).sessionId` | Medium touch | Pending |
+| `set_model` internal API | High risk | Pending |
+| No tests | Blocks confidence | Pending |
+| No validation | Security risk | Pending |
+
+---
+
+## GAPS TO CLOSE
+
+| Gap | Priority | Status |
+|-----|----------|--------|
+| ~~Extension UI wiring~~ | ~~CRITICAL~~ | ✅ COMPLETE |
+| Tests | CRITICAL | Next up |
+| Input validation | HIGH | Security |
+| Command timeout | HIGH | Reliability |
+| Observability | HIGH | Debugging |
+| Session limit | MEDIUM | Resource safety |
+
+---
+
+## IMPLEMENTATION ORDER (Next Session)
+
+### Phase 3.5: Critical Fixes
+
+1. Add basic test harness
+2. Fix `set_model` to use public API
+3. Add input validation layer
+4. Add command timeout wrapper
 
 ### Phase 4: Protocol Versioning
 
@@ -170,124 +258,11 @@ Add to server_ready event:
 { "type": "server_ready", "data": { "version": "0.1.0", "protocolVersion": "1", "transports": [...] } }
 ```
 
-Enables clients to detect incompatible protocol changes.
+### Phase 5: Observability
 
----
-
-## PATTERNS (use these)
-
-| Pattern | Description |
-|---------|-------------|
-| **Pass-through** | Session commands are thin wrappers around AgentSession methods — don't reinvent |
-| **Broadcast** | Events flow one direction: session → all subscribers with matching sessionId |
-| **Correlation** | Request id matches response id — always |
-| **Handler map** | Extensible command dispatch without switch statement sprawl |
-| **Pending promise** | Extension UI requests create promises, responses resolve them |
-
----
-
-## ANTI-PATTERNS (avoid these)
-
-| Anti-pattern | Why bad | Fix |
-|--------------|---------|-----|
-| Giant switch | Hard to extend, hard to test | Handler map |
-| Mixed concerns | SessionManager does lifecycle + commands + subscribers | Separate classes |
-| Type casting | `(command as any).sessionId` loses safety | Discriminated unions |
-| Dual broadcast | Server AND SessionManager both broadcast lifecycle events | Single source of truth |
-| Protocol drift | Our types.ts diverges from pi's RpcCommand | Extend, don't duplicate |
-
----
-
-## SURPRISES (non-obvious findings)
-
-1. **pi's RPC already has `extension_ui_request` events** — but no response mechanism in our server
-2. **AgentSession handles persistence** — server doesn't need to, JSONL is automatic
-3. **Session creation is async and slow** — loads extensions, skills, prompts; can take seconds
-4. **set_model crashes** — we call `session.modelRegistry.getModel()` but that's not the public API
-5. **Codex has approvals, pi doesn't** — different model, don't copy Codex blindly
-
----
-
-## HEURISTICS (rules of thumb)
-
-1. **If pi has it, expose it** — don't reimplement, just pass through
-2. **Server should be thin** — AgentSession does the work
-3. **Protocol = types.ts** — everything else is implementation detail
-4. **One switch is the ONLY switch** — SEED.md invariant, refactor to handler map preserves this
-5. **No auth in server** — pi handles via ModelRegistry, not server's job
-6. **No approvals** — pi doesn't have them, unlike Codex
-
----
-
-## CAVEATS (doesn't generalize)
-
-1. **Extension UI requires round-trip** — not just broadcast, must await response
-2. **Some pi features require TUI** — themes can't be exposed remotely meaningfully
-3. **Dynamic tools would need client execution** — LLM calls tool, client runs code, returns result (future)
-4. **Multiple clients, one response** — if two clients subscribe to same session, only one should respond to UI request
-5. **Session file paths are platform-specific** — list_session_files returns absolute paths
-
----
-
-## BUGS TO FIX
-
-| Bug | Location | Fix |
-|-----|----------|-----|
-| set_model crashes | session-manager.ts L~250 | Use `session.modelRegistry` properly or get model from provider |
-| get_context_usage wrong shape | types.ts L~75 | Shape is `{ tokens, contextWindow, percent }` not `{ used, total, percentage }` |
-| Missing commands | types.ts | Add discovery commands from Phase 2 |
-| Extension UI dead-end | session-manager.ts | Add Phase 3 round-trip |
-
----
-
-## DEBT TO PAY
-
-| Debt | Interest | Pay by |
-|------|----------|--------|
-| Giant switch | Hard to add commands | Phase 1.1 handler map |
-| Protocol drift | Diverges from pi | Extend pi's RpcCommand types |
-| Mixed concerns | SessionManager too big | Phase 1.2 separation |
-| Hardcoded version | Must update two places | Read from package.json |
-
----
-
-## GAPS TO CLOSE
-
-| Gap | Priority | Phase |
-|-----|----------|-------|
-| Extension UI response | Critical | 3 |
-| Discovery commands | High | 2 |
-| Session file listing | High | 2 |
-| Protocol versioning | Medium | 4 |
-| Error recovery | Low | Future |
-| Connection lifecycle events | Low | Future |
-
----
-
-## WHAT WAS REMOVED (from consideration)
-
-| Removed | Why |
-|---------|-----|
-| Auth | pi handles via ModelRegistry |
-| Approvals | pi doesn't have them |
-| Metrics | Observability is external |
-| Health checks | Orchestration concern |
-| TLS | Proxy concern |
-| Clustering | Requires session affinity, future |
-| HTTP transport | Two transports is complete |
-| Themes | TUI concern, not server |
-
----
-
-## RESIDUAL LIMITATIONS
-
-1. **No clustering** — single process, all sessions in memory
-2. **No persistence of subscriber state** — reconnect loses subscriptions
-3. **No message buffering** — events are fire-and-forget
-4. **No flow control** — fast producer, slow consumer = problems
-5. **No request timeout** — hung commands hang forever (except extension UI)
-
-These are acceptable per SEED.md non-goals. Add only if real need arises.
+1. Add structured logging
+2. Log failed sends
+3. Add session metrics
 
 ---
 
@@ -297,15 +272,9 @@ These are acceptable per SEED.md non-goals. Add only if real need arises.
 
 1. Add type to `types.ts` in `SessionCommand` union
 2. Add response type to `SessionResponse` union
-3. Add handler to `command-router.ts` handlers map
-4. Handler calls `session.someMethod()` and returns response
-5. Test via: `echo '{"type":"your_command","sessionId":"x",...}' | node dist/server.js`
-
-**To add extension UI method:**
-
-1. Add method to `ExtensionUIRequest` in types.ts
-2. Add response variant to `ExtensionUIResponse`
-3. Wire in extension-ui.ts (promise creation on event, resolution on response)
+3. Add handler function to `command-router.ts`
+4. Add to `sessionCommandHandlers` map
+5. Test: `echo '{"type":"your_command","sessionId":"x",...}' | node dist/server.js`
 
 **To debug:**
 
@@ -316,51 +285,18 @@ node dist/server.js 2>&1 | jq .
 # WebSocket with wscat
 wscat -c ws://localhost:3141
 
-# Check protocol
-echo '{"type":"list_sessions"}' | node dist/server.js | jq .
+# Test discovery commands
+echo '{"type":"create_session","sessionId":"t"}' > /tmp/cmds.jsonl
+echo '{"sessionId":"t","type":"get_available_models"}' >> /tmp/cmds.jsonl
+echo '{"sessionId":"t","type":"get_commands"}' >> /tmp/cmds.jsonl
+cat /tmp/cmds.jsonl | timeout 10 node dist/server.js | jq .
 ```
 
----
-
-## EVOLUTION NOTES
-
-**Short-term (this session):**
-- Phase 1: Refactor to handler map
-- Phase 2: Add discovery commands
-- Phase 3: Add extension UI round-trip
-
-**Medium-term:**
-- Phase 4: Protocol versioning
-- TypeScript client library
-- Python client library
-
-**Long-term:**
-- Dynamic tools (client-side execution)
-- Session clustering with affinity
-- Message buffering for reconnect
-
-**Never (per SEED.md):**
-- Auth, approvals, metrics, health checks, TLS, HTTP transport
-
----
-
-## VALIDATION
-
-After implementation, verify:
-
+**Rollback:**
 ```bash
-# 1. Discovery commands work
-echo '{"type":"create_session","sessionId":"test"}' > /tmp/cmds.jsonl
-echo '{"sessionId":"test","type":"get_available_models"}' >> /tmp/cmds.jsonl
-echo '{"sessionId":"test","type":"get_commands"}' >> /tmp/cmds.jsonl
-echo '{"sessionId":"test","type":"get_skills"}' >> /tmp/cmds.jsonl
-cat /tmp/cmds.jsonl | timeout 10 node dist/server.js | jq .
-
-# 2. Extension UI round-trip works
-# (requires client that responds to extension_ui_request)
-
-# 3. Protocol version in server_ready
-timeout 2 node dist/server.js 2>&1 | head -1 | jq '.data.protocolVersion'
+# Full rollback to last commit:
+git checkout -- .
+git clean -fd
 ```
 
 ---
@@ -370,11 +306,10 @@ timeout 2 node dist/server.js 2>&1 | head -1 | jq '.data.protocolVersion'
 - pi-coding-agent: `~/.npm-global/lib/node_modules/@mariozechner/pi-coding-agent/`
 - pi RPC types: `dist/modes/rpc/rpc-types.d.ts`
 - pi AgentSession: `dist/core/agent-session.d.ts`
-- Codex app-server (for comparison): `~/programming/upstream/codex/codex-rs/app-server/`
-- Litter client: `~/programming/upstream/litter/`
+- pi ExtensionUIContext: `dist/core/extensions/types.d.ts`
 - SEED.md: `/home/tryinget/programming/pi-server/SEED.md`
-- prompt-snippets: `~/steve/prompts/prompt-snippets.md`
+- AGENTS.md: `/home/tryinget/programming/pi-server/AGENTS.md`
 
 ---
 
-**Start here:** Phase 1.1 — Extract command handlers to map. This enables everything else.
+**Start here:** Phase 3.5 — Add tests, fix `set_model`, add validation and timeout wrappers.

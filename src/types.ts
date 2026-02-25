@@ -39,6 +39,15 @@ export type ServerCommand =
 // ============================================================================
 
 export type SessionCommand =
+  // Extension UI response (client → server to complete pending UI request)
+  | { id?: string; sessionId: string; type: "extension_ui_response"; requestId: string; response: { method: "select"; value: string } | { method: "confirm"; confirmed: boolean } | { method: "input"; value: string } | { method: "editor"; value: string } | { method: "interview"; responses: Record<string, any> } | { method: "cancelled" } }
+  // Discovery commands
+  | { id?: string; sessionId: string; type: "get_available_models" }
+  | { id?: string; sessionId: string; type: "get_commands" }
+  | { id?: string; sessionId: string; type: "get_skills" }
+  | { id?: string; sessionId: string; type: "get_tools" }
+  | { id?: string; sessionId: string; type: "list_session_files" }
+  // Session commands
   | { id?: string; sessionId: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
   | { id?: string; sessionId: string; type: "steer"; message: string; images?: ImageContent[] }
   | { id?: string; sessionId: string; type: "follow_up"; message: string; images?: ImageContent[] }
@@ -93,6 +102,14 @@ export type ServerResponse =
 
 // Session command responses (mirrors RpcCommand types)
 export type SessionResponse =
+  | RpcResponseBase & { command: "extension_ui_response"; success: true }
+  // Discovery command responses
+  | RpcResponseBase & { command: "get_available_models"; success: true; data: { models: Model<any>[] } }
+  | RpcResponseBase & { command: "get_commands"; success: true; data: { commands: Array<{ name: string; description?: string; source: string; location?: string; path?: string }> } }
+  | RpcResponseBase & { command: "get_skills"; success: true; data: { skills: Array<{ name: string; description: string; filePath: string; source: string }> } }
+  | RpcResponseBase & { command: "get_tools"; success: true; data: { tools: Array<{ name: string; description: string }> } }
+  | RpcResponseBase & { command: "list_session_files"; success: true; data: { files: Array<{ path: string; name: string; modifiedAt?: string }> } }
+  // Session commands
   | RpcResponseBase & { command: "prompt"; success: true }
   | RpcResponseBase & { command: "steer"; success: true }
   | RpcResponseBase & { command: "follow_up"; success: true }
