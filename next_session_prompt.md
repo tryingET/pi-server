@@ -55,6 +55,7 @@ Repo: https://github.com/tryingET/pi-server
 - ✅ Phase 2: Discovery commands (get_available_models, get_commands, get_skills, get_tools, list_session_files)
 - ✅ Phase 3: Extension UI wiring via `bindExtensions` with `createServerUIContext()`
 - ✅ Phase 3.5: Critical fixes (validation, timeout, set_model fix, tests)
+- ✅ Deep Review: Broadcast safety (snapshot, JSON errors), error handling (try/catch, logging)
 
 **Working:**
 - create/delete/list sessions
@@ -68,11 +69,15 @@ Repo: https://github.com/tryingET/pi-server
 - Input validation for all commands
 - Command timeout (30s for quick commands, 5min for LLM operations)
 - 22 basic tests
+- Error logging (console.error for broadcast failures, WebSocket errors)
+- Safe broadcast (snapshot subscribers, JSON serialization error handling)
 
 **Broken/Incomplete:**
-- ❌ No observability/logging
-- ❌ No session limit
-- ❌ Silent message loss on broadcast
+- ❌ No message size limit (OOM risk)
+- ❌ No session limit (memory exhaustion risk)
+- ❌ No rate limiting (DoS risk)
+- ❌ No heartbeat (zombie connection risk)
+- ❌ `(command as any)` type casts (technical debt)
 
 ---
 
@@ -141,41 +146,40 @@ function createServerUIContext(
 | 4 | **No input validation** | ~~HIGH~~ | ✅ FIXED (validation.ts) |
 | 5 | **No command timeout** | ~~HIGH~~ | ✅ FIXED (withTimeout wrapper) |
 | 6 | **`(command as any).sessionId`** | MEDIUM | Pending |
-| 7 | **No observability** | HIGH | Pending |
-| 8 | **Silent message loss** | MEDIUM | Pending |
-| 9 | **No session limit** | MEDIUM | Pending |
+| 7 | **No observability** | ~~HIGH~~ | ✅ FIXED (console.error logging) |
+| 8 | **Silent message loss** | ~~MEDIUM~~ | ✅ FIXED (logging + snapshot) |
+| 9 | **No session limit** | MEDIUM | Deferred |
 | 10 | **Windows path handling** | ~~LOW~~ | ✅ FIXED (path.basename) |
+| 11 | **Set mutation during iteration** | ~~HIGH~~ | ✅ FIXED (snapshot) |
+| 12 | **WebSocket state race** | ~~HIGH~~ | ✅ FIXED (try/catch) |
+| 13 | **Non-null assertion** | ~~LOW~~ | ✅ FIXED (handle undefined) |
+| 14 | **No message size limit** | CRITICAL | Deferred |
+| 15 | **No rate limiting** | HIGH | Deferred |
 
 ---
 
 ## BUGS FOUND (Deep Review)
 
-### Active Bugs
+### Active Bugs (all fixed)
 
 | Bug | File:Line | Status |
 |-----|-----------|--------|
 | `set_model` uses internal API | `command-router.ts:67-72` | ✅ FIXED |
-| handleGetState non-null assertion | `command-router.ts:48` | Pending (works via executeCommand) |
+| handleGetState non-null assertion | `command-router.ts:48` | ✅ FIXED |
 | Windows path handling | `command-router.ts:175` | ✅ FIXED |
-| No command.id validation | Everywhere | Pending (id is optional in protocol) |
+| Set mutation during iteration | `session-manager.ts:189` | ✅ FIXED (snapshot) |
+| WebSocket state race | `server.ts:61-63` | ✅ FIXED (try/catch) |
+| Silent broadcast failures | `session-manager.ts:192` | ✅ FIXED (logging) |
 
-### Silent Failures
+### Missing Safety (deferred with contract)
 
-| Bug | Location | Consequence |
-|-----|----------|-------------|
-| Subscriber send failures swallowed | `session-manager.ts:147-150` | Message lost, no logging |
-| WebSocket state race | `server.ts:72-75` | State changes between check and send |
-
-### Missing Safety
-
-| Missing | Consequence |
-|---------|-------------|
-| No maximum session count | Memory exhaustion |
-| No message size limit | OOM on large JSON |
-| No rate limiting | DoS vector |
-| No request timeout on session commands | Hung LLM API = hung server |
-| No heartbeat | Zombie connections |
-| No graceful session drain | In-flight requests die on shutdown |
+| Missing | Consequence | Trigger |
+|---------|-------------|---------|
+| No maximum session count | Memory exhaustion | Before production |
+| No message size limit | OOM on large JSON | Before production |
+| No rate limiting | DoS vector | Before production |
+| No heartbeat | Zombie connections | Before production |
+| No graceful session drain | In-flight requests die | Before v1.0 |
 
 ---
 
@@ -195,9 +199,9 @@ function createServerUIContext(
 
 | Anti-pattern | Location | Fix |
 |--------------|----------|-----|
-| `(command as any).sessionId` | session-manager.ts:193, 247 | Create typed accessor |
-| `(session.modelRegistry as any).getModel()` | command-router.ts:68 | Use public API |
-| Silent catch in broadcast | session-manager.ts:149, 159 | Log failures |
+| `(command as any).sessionId` | session-manager.ts | Create typed accessor |
+| `(command as any).type` | session-manager.ts | Create typed accessor |
+| `(command as any).id` | session-manager.ts | Create typed accessor |
 | Server knows switch_session semantics | server.ts:105-109 | Move to session-manager |
 
 ---
@@ -246,9 +250,15 @@ function createServerUIContext(
 | No timeout | ✅ PAID | Phase 3.5 complete (withTimeout) |
 | `set_model` internal API | ✅ PAID | Phase 3.5 complete (use find()) |
 | Windows path handling | ✅ PAID | Phase 3.5 complete (path.basename) |
-| `(command as any).sessionId` | Medium touch | Pending |
-| No observability | Medium | Pending |
-| Silent broadcast failures | Low | Pending |
+| Silent broadcast failures | ✅ PAID | Deep Review (logging + snapshot) |
+| WebSocket state race | ✅ PAID | Deep Review (try/catch) |
+| Set mutation during iteration | ✅ PAID | Deep Review (snapshot) |
+| Non-null assertion | ✅ PAID | Deep Review (handle undefined) |
+| Double-dispose race | ✅ PAID | Deep Review (reorder + try/catch) |
+| `(command as any).*` | Medium touch | Pending |
+| No message size limit | HIGH | Deferred |
+| No session limit | MEDIUM | Deferred |
+| No rate limiting | MEDIUM | Deferred |
 
 ---
 
@@ -260,28 +270,46 @@ function createServerUIContext(
 | ~~Tests~~ | ~~CRITICAL~~ | ✅ COMPLETE (22 tests) |
 | ~~Input validation~~ | ~~HIGH~~ | ✅ COMPLETE |
 | ~~Command timeout~~ | ~~HIGH~~ | ✅ COMPLETE |
-| Observability | HIGH | Pending |
-| Session limit | MEDIUM | Pending |
-| Silent message loss | MEDIUM | Pending |
+| ~~Observability~~ | ~~HIGH~~ | ✅ COMPLETE (console.error) |
+| ~~Silent message loss~~ | ~~MEDIUM~~ | ✅ COMPLETE |
+| ~~Broadcast safety~~ | ~~HIGH~~ | ✅ COMPLETE |
+| Message size limit | CRITICAL | Deferred |
+| Session limit | HIGH | Deferred |
+| Rate limiting | HIGH | Deferred |
+| Heartbeat | MEDIUM | Deferred |
+| Graceful shutdown | MEDIUM | Deferred |
 
 ---
 
 ## IMPLEMENTATION ORDER (Next Session)
 
-### Phase 4: Observability
+### Phase 5: Resource Safety (ResourceGovernor)
 
-1. Add structured logging (pino or custom)
-2. Log command execution (start/end/error)
-3. Log failed broadcast sends
-4. Add session metrics (count, message throughput)
+The NEXUS intervention: A single class that enforces all limits.
 
-### Phase 5: Resource Safety
+```typescript
+class ResourceGovernor {
+  canCreateSession(): boolean;      // Enforce max sessions
+  canAcceptMessage(size: number): boolean;  // Enforce max message size
+  canExecuteCommand(sessionId: string): boolean;  // Rate limiting
+  recordHeartbeat(sessionId: string): void;  // Track liveness
+  getZombieSessions(): string[];    // Find dead connections
+}
+```
 
-1. Add configurable session limit
-2. Add message size limit
-3. Add graceful shutdown (drain sessions)
+1. Add configurable session limit (default: 100)
+2. Add message size limit (default: 10MB)
+3. Add rate limiting per session (default: 100 commands/minute)
+4. Add heartbeat tracking (default: 30s interval)
 
-### Phase 6: Protocol Versioning
+### Phase 6: Graceful Shutdown
+
+1. Track in-flight commands per session
+2. On SIGTERM: stop accepting new commands, drain existing
+3. Timeout after configurable period (default: 30s)
+4. Force exit if drain doesn't complete
+
+### Phase 7: Protocol Versioning
 
 Add to server_ready event:
 ```json
@@ -336,4 +364,4 @@ git clean -fd
 
 ---
 
-**Start here:** Phase 4 — Add structured logging, observability, and session metrics.
+**Start here:** Phase 5 — Implement ResourceGovernor for session/message/rate limits.
