@@ -190,6 +190,216 @@ async function testCommandRouter() {
 }
 
 // =============================================================================
+// RESOURCE GOVERNOR TESTS
+// =============================================================================
+
+import { ResourceGovernor, DEFAULT_CONFIG } from "./resource-governor.js";
+
+async function testResourceGovernor() {
+  console.log("\n=== Resource Governor Tests ===\n");
+
+  // Test: Default config values
+  await test("governor: has default config", () => {
+    const governor = new ResourceGovernor();
+    const config = governor.getConfig();
+    assert.strictEqual(config.maxSessions, 100, "Default maxSessions should be 100");
+    assert.strictEqual(config.maxMessageSizeBytes, 10 * 1024 * 1024, "Default maxMessageSizeBytes should be 10MB");
+    assert.strictEqual(config.maxCommandsPerMinute, 100, "Default maxCommandsPerMinute should be 100");
+    assert.strictEqual(config.maxGlobalCommandsPerMinute, 1000, "Default maxGlobalCommandsPerMinute should be 1000");
+  });
+
+  // Test: Custom config
+  await test("governor: accepts custom config", () => {
+    const governor = new ResourceGovernor({ ...DEFAULT_CONFIG, maxSessions: 5 });
+    assert.strictEqual(governor.getConfig().maxSessions, 5);
+  });
+
+  // Test: Atomic session reservation
+  await test("governor: atomic session reservation", () => {
+    const governor = new ResourceGovernor({ ...DEFAULT_CONFIG, maxSessions: 2 });
+    assert.strictEqual(governor.tryReserveSessionSlot(), true, "First slot reserved");
+    assert.strictEqual(governor.getSessionCount(), 1, "Count is 1");
+    assert.strictEqual(governor.tryReserveSessionSlot(), true, "Second slot reserved");
+    assert.strictEqual(governor.getSessionCount(), 2, "Count is 2");
+    assert.strictEqual(governor.tryReserveSessionSlot(), false, "Third slot rejected");
+    assert.strictEqual(governor.getSessionCount(), 2, "Count still 2");
+  });
+
+  // Test: Release session slot
+  await test("governor: release session slot", () => {
+    const governor = new ResourceGovernor({ ...DEFAULT_CONFIG, maxSessions: 1 });
+    assert.strictEqual(governor.tryReserveSessionSlot(), true, "Slot reserved");
+    governor.releaseSessionSlot();
+    assert.strictEqual(governor.getSessionCount(), 0, "Count back to 0");
+    assert.strictEqual(governor.tryReserveSessionSlot(), true, "Can reserve again");
+  });
+
+  // Test: Legacy session limit API (deprecated but still works)
+  await test("governor: enforces session limit (legacy API)", () => {
+    const governor = new ResourceGovernor({ ...DEFAULT_CONFIG, maxSessions: 2 });
+    assert.strictEqual(governor.canCreateSession().allowed, true, "First session should be allowed");
+    governor.registerSession("s1");
+    assert.strictEqual(governor.canCreateSession().allowed, true, "Second session should be allowed");
+    governor.registerSession("s2");
+    const result = governor.canCreateSession();
+    assert.strictEqual(result.allowed, false, "Third session should be rejected");
+    assert(result.reason?.includes("Session limit"), "Should mention session limit");
+  });
+
+  // Test: Session count tracking via unregister
+  await test("governor: tracks session count via unregister", () => {
+    const governor = new ResourceGovernor();
+    governor.registerSession("s1");
+    assert.strictEqual(governor.getSessionCount(), 1);
+    governor.registerSession("s2");
+    assert.strictEqual(governor.getSessionCount(), 2);
+    governor.unregisterSession("s1");
+    assert.strictEqual(governor.getSessionCount(), 1);
+  });
+
+  // Test: Message size limit
+  await test("governor: enforces message size limit", () => {
+    const governor = new ResourceGovernor({ ...DEFAULT_CONFIG, maxMessageSizeBytes: 100 });
+    assert.strictEqual(governor.canAcceptMessage(50).allowed, true, "50 bytes should be allowed");
+    assert.strictEqual(governor.canAcceptMessage(100).allowed, true, "100 bytes should be allowed");
+    const result = governor.canAcceptMessage(101);
+    assert.strictEqual(result.allowed, false, "101 bytes should be rejected");
+    assert(result.reason?.includes("exceeds limit"), "Should mention exceeds limit");
+  });
+
+  // Test: Invalid message sizes (negative, NaN, Infinity)
+  await test("governor: rejects invalid message sizes", () => {
+    const governor = new ResourceGovernor();
+    
+    const negResult = governor.canAcceptMessage(-1);
+    assert.strictEqual(negResult.allowed, false, "Negative size should be rejected");
+    assert(negResult.reason?.includes("Invalid"), "Should mention Invalid");
+    
+    const nanResult = governor.canAcceptMessage(NaN);
+    assert.strictEqual(nanResult.allowed, false, "NaN should be rejected");
+    
+    const infResult = governor.canAcceptMessage(Infinity);
+    assert.strictEqual(infResult.allowed, false, "Infinity should be rejected");
+  });
+
+  // Test: Per-session rate limiting
+  await test("governor: enforces per-session rate limit", () => {
+    const governor = new ResourceGovernor({ ...DEFAULT_CONFIG, maxCommandsPerMinute: 3, maxGlobalCommandsPerMinute: 100 });
+    assert.strictEqual(governor.canExecuteCommand("s1").allowed, true, "1st command allowed");
+    assert.strictEqual(governor.canExecuteCommand("s1").allowed, true, "2nd command allowed");
+    assert.strictEqual(governor.canExecuteCommand("s1").allowed, true, "3rd command allowed");
+    const result = governor.canExecuteCommand("s1");
+    assert.strictEqual(result.allowed, false, "4th command should be rejected");
+    assert(result.reason?.includes("Rate limit"), "Should mention rate limit");
+  });
+
+  // Test: Rate limiting is per-session
+  await test("governor: rate limit is per session", () => {
+    const governor = new ResourceGovernor({ ...DEFAULT_CONFIG, maxCommandsPerMinute: 2, maxGlobalCommandsPerMinute: 100 });
+    assert.strictEqual(governor.canExecuteCommand("s1").allowed, true);
+    assert.strictEqual(governor.canExecuteCommand("s1").allowed, true);
+    assert.strictEqual(governor.canExecuteCommand("s1").allowed, false, "s1 should be rate limited");
+    assert.strictEqual(governor.canExecuteCommand("s2").allowed, true, "s2 should still be allowed");
+    assert.strictEqual(governor.canExecuteCommand("s2").allowed, true);
+    assert.strictEqual(governor.canExecuteCommand("s2").allowed, false, "s2 should now be rate limited");
+  });
+
+  // Test: Global rate limiting
+  await test("governor: enforces global rate limit", () => {
+    const governor = new ResourceGovernor({ ...DEFAULT_CONFIG, maxCommandsPerMinute: 100, maxGlobalCommandsPerMinute: 3 });
+    assert.strictEqual(governor.canExecuteCommand("s1").allowed, true, "1st global command");
+    assert.strictEqual(governor.canExecuteCommand("s2").allowed, true, "2nd global command");
+    assert.strictEqual(governor.canExecuteCommand("s3").allowed, true, "3rd global command");
+    const result = governor.canExecuteCommand("s4");
+    assert.strictEqual(result.allowed, false, "4th command should hit global limit");
+    assert(result.reason?.includes("Global rate limit"), "Should mention global rate limit");
+  });
+
+  // Test: Rate limit usage tracking
+  await test("governor: tracks rate limit usage", () => {
+    const governor = new ResourceGovernor({ ...DEFAULT_CONFIG, maxCommandsPerMinute: 5, maxGlobalCommandsPerMinute: 10 });
+    governor.canExecuteCommand("s1");
+    governor.canExecuteCommand("s1");
+    governor.canExecuteCommand("s2");
+    const usage = governor.getRateLimitUsage("s1");
+    assert.strictEqual(usage.session, 2, "s1 should have 2 commands");
+    assert.strictEqual(usage.global, 3, "global should have 3 commands");
+  });
+
+  // Test: Heartbeat tracking
+  await test("governor: tracks heartbeats", () => {
+    const governor = new ResourceGovernor();
+    governor.registerSession("s1");
+    const lastBeat = governor.getLastHeartbeat("s1");
+    assert.strictEqual(typeof lastBeat, "number", "Should have heartbeat timestamp");
+    governor.recordHeartbeat("s1");
+    const newBeat = governor.getLastHeartbeat("s1");
+    assert(newBeat! >= lastBeat!, "Heartbeat should be updated");
+  });
+
+  // Test: Zombie detection
+  await test("governor: detects zombie sessions", async () => {
+    const governor = new ResourceGovernor({
+      ...DEFAULT_CONFIG,
+      zombieTimeoutMs: 100, // 100ms for testing
+    });
+    governor.registerSession("s1");
+    assert.strictEqual(governor.getZombieSessions().length, 0, "Fresh session is not zombie");
+    
+    // Wait for zombie timeout
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    
+    const zombies = governor.getZombieSessions();
+    assert.strictEqual(zombies.length, 1, "Should detect zombie");
+    assert.strictEqual(zombies[0], "s1", "Zombie should be s1");
+  });
+
+  // Test: Metrics include global rate limit
+  await test("governor: metrics include global rate limit", () => {
+    const governor = new ResourceGovernor({ ...DEFAULT_CONFIG, maxGlobalCommandsPerMinute: 5 });
+    governor.canExecuteCommand("s1");
+    governor.canExecuteCommand("s1");
+    const metrics = governor.getMetrics();
+    assert.strictEqual(metrics.rateLimitUsage.globalCount, 2, "Should have 2 global commands");
+    assert.strictEqual(metrics.rateLimitUsage.globalLimit, 5, "Should have limit 5");
+    assert.strictEqual(typeof metrics.commandsRejected.globalRateLimit, "number", "Should track global rejections");
+  });
+
+  // Test: Cleanup stale timestamps
+  await test("governor: cleans up stale timestamps", () => {
+    const governor = new ResourceGovernor();
+    governor.canExecuteCommand("s1");
+    governor.canExecuteCommand("s1");
+    
+    // Timestamps should exist
+    const usageBefore = governor.getRateLimitUsage("s1");
+    assert.strictEqual(usageBefore.session, 2, "Should have 2 timestamps");
+    
+    // Cleanup (won't remove recent ones)
+    governor.cleanupStaleTimestamps();
+    
+    const usageAfter = governor.getRateLimitUsage("s1");
+    assert.strictEqual(usageAfter.session, 2, "Recent timestamps still there");
+  });
+
+  // Test: Cleanup stale data for deleted sessions
+  await test("governor: cleans up stale data", () => {
+    const governor = new ResourceGovernor();
+    governor.registerSession("s1");
+    governor.registerSession("s2");
+    governor.canExecuteCommand("s2");
+    governor.unregisterSession("s2");
+    
+    // s2 is unregistered but may still have rate limit data
+    // Clean up with only s1 active
+    governor.cleanupStaleData(new Set(["s1"]));
+    
+    // s2's data should be cleaned
+    assert.strictEqual(governor.getLastHeartbeat("s2"), undefined, "s2 heartbeat should be cleaned");
+  });
+}
+
+// =============================================================================
 // SESSION MANAGER TESTS
 // =============================================================================
 
@@ -298,6 +508,128 @@ async function testSessionManager() {
     // Cleanup
     await manager.executeCommand({ type: "delete_session", sessionId: "switch-test" });
   });
+
+  // Test: Session limit enforcement through manager
+  await test("session-manager: enforces session limit via governor", async () => {
+    // Create a manager with a low session limit
+    const { ResourceGovernor } = await import("./resource-governor.js");
+    const governor = new ResourceGovernor({
+      maxSessions: 2,
+      maxMessageSizeBytes: 10 * 1024 * 1024,
+      maxCommandsPerMinute: 100,
+      maxGlobalCommandsPerMinute: 1000,
+      heartbeatIntervalMs: 30000,
+      zombieTimeoutMs: 5 * 60 * 1000,
+    });
+    const limitedManager = new PiSessionManager(governor);
+
+    // Create two sessions - should succeed
+    const r1 = await limitedManager.executeCommand({ type: "create_session", sessionId: "lim1" });
+    assert.strictEqual(r1.success, true, "First session should succeed");
+    const r2 = await limitedManager.executeCommand({ type: "create_session", sessionId: "lim2" });
+    assert.strictEqual(r2.success, true, "Second session should succeed");
+
+    // Third session should fail
+    const r3 = await limitedManager.executeCommand({ type: "create_session", sessionId: "lim3" });
+    assert.strictEqual(r3.success, false, "Third session should fail");
+    assert(r3.error?.includes("Session limit"), "Should mention session limit");
+
+    // Cleanup
+    await limitedManager.executeCommand({ type: "delete_session", sessionId: "lim1" });
+    await limitedManager.executeCommand({ type: "delete_session", sessionId: "lim2" });
+  });
+
+  // Test: Graceful shutdown rejects new commands
+  await test("session-manager: rejects commands during shutdown", async () => {
+    const manager = new PiSessionManager();
+    
+    // Create a session first
+    await manager.executeCommand({ type: "create_session", sessionId: "shutdown-test" });
+    
+    // Initiate shutdown (don't await yet)
+    const shutdownPromise = manager.initiateShutdown(1000);
+    
+    // Try to execute a command - should be rejected
+    const response = await manager.executeCommand({ type: "list_sessions" });
+    assert.strictEqual(response.success, false, "Should reject during shutdown");
+    assert(response.error?.includes("shutting down"), "Should mention shutting down");
+    
+    // Wait for shutdown to complete
+    await shutdownPromise;
+    
+    // Cleanup
+    // Note: session is still there, just can't execute commands
+  });
+
+  // Test: Shutdown with no in-flight commands
+  await test("session-manager: shutdown with no in-flight commands", async () => {
+    const manager = new PiSessionManager();
+    
+    const result = await manager.initiateShutdown(1000);
+    assert.strictEqual(result.drained, 0, "Should drain 0 commands");
+    assert.strictEqual(result.timedOut, false, "Should not timeout");
+  });
+
+  // Test: In-flight count tracking
+  await test("session-manager: tracks in-flight commands", async () => {
+    const manager = new PiSessionManager();
+    
+    // Create a session
+    await manager.executeCommand({ type: "create_session", sessionId: "inflight-test" });
+    
+    // After command completes, in-flight should be 0
+    assert.strictEqual(manager.getInFlightCount(), 0, "No in-flight after completion");
+    
+    // Cleanup
+    await manager.executeCommand({ type: "delete_session", sessionId: "inflight-test" });
+  });
+
+  // Test: Idempotent shutdown
+  await test("session-manager: shutdown is idempotent", async () => {
+    const manager = new PiSessionManager();
+    
+    // First shutdown
+    const result1 = await manager.initiateShutdown(1000);
+    assert.strictEqual(result1.timedOut, false, "First shutdown should succeed");
+    
+    // Second shutdown should return immediately without error
+    const result2 = await manager.initiateShutdown(1000);
+    assert.strictEqual(result2.timedOut, false, "Second shutdown should be idempotent");
+    assert.strictEqual(result2.drained, 0, "No commands to drain on second call");
+  });
+
+  // Test: isInShutdown reflects state
+  await test("session-manager: isInShutdown reflects state", async () => {
+    const manager = new PiSessionManager();
+    
+    assert.strictEqual(manager.isInShutdown(), false, "Not in shutdown initially");
+    
+    await manager.initiateShutdown(1000);
+    
+    assert.strictEqual(manager.isInShutdown(), true, "In shutdown after initiateShutdown");
+  });
+
+  // Test: disposeAllSessions
+  await test("session-manager: disposeAllSessions cleans up", async () => {
+    const manager = new PiSessionManager();
+    
+    // Create sessions
+    await manager.executeCommand({ type: "create_session", sessionId: "dispose1" });
+    await manager.executeCommand({ type: "create_session", sessionId: "dispose2" });
+    
+    // Verify sessions exist
+    const listBefore = await manager.executeCommand({ type: "list_sessions" });
+    assert.strictEqual((listBefore as any).data.sessions.length, 2, "Should have 2 sessions");
+    
+    // Dispose all
+    const result = manager.disposeAllSessions();
+    assert.strictEqual(result.disposed, 2, "Should dispose 2 sessions");
+    assert.strictEqual(result.failed, 0, "Should have 0 failures");
+    
+    // Verify sessions are gone
+    const listAfter = await manager.executeCommand({ type: "list_sessions" });
+    assert.strictEqual((listAfter as any).data.sessions.length, 0, "Should have 0 sessions");
+  });
 }
 
 // =============================================================================
@@ -309,6 +641,7 @@ async function main() {
 
   await testValidation();
   await testCommandRouter();
+  await testResourceGovernor();
   await testSessionManager();
 
   console.log("\n" + "=".repeat(50));
