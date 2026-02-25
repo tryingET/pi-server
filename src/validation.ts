@@ -49,6 +49,16 @@ const SESSION_COMMANDS = new Set([
   "get_context_usage",
 ]);
 
+// Server commands that don't require sessionId
+const SERVER_COMMANDS = new Set([
+  "list_sessions",
+  "create_session",
+  "delete_session",
+  "switch_session",
+  "get_metrics",
+  "health_check",
+]);
+
 /**
  * Validate a command has required fields.
  * Returns array of errors (empty if valid).

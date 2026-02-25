@@ -237,6 +237,21 @@ export class PiSessionManager {
   // ==========================================================================
 
   async createSession(sessionId: string, cwd?: string): Promise<SessionInfo> {
+    // Validate session ID
+    const sessionIdError = this.governor.validateSessionId(sessionId);
+    if (sessionIdError) {
+      throw new Error(sessionIdError);
+    }
+
+    // Validate cwd if provided
+    if (cwd) {
+      const cwdError = this.governor.validateCwd(cwd);
+      if (cwdError) {
+        throw new Error(cwdError);
+      }
+    }
+
+    // Check for duplicate (still possible race, but unlikely with valid IDs)
     if (this.sessions.has(sessionId)) {
       throw new Error(`Session ${sessionId} already exists`);
     }
@@ -553,6 +568,26 @@ export class PiSessionManager {
             data: { sessionInfo },
           };
         }
+
+        case "get_metrics":
+          return {
+            id,
+            type: "response",
+            command: "get_metrics",
+            success: true,
+            data: this.governor.getMetrics(),
+          };
+
+        case "health_check": {
+          const health = this.governor.isHealthy();
+          return {
+            id,
+            type: "response",
+            command: "health_check",
+            success: true,
+            data: health,
+          };
+        }
       }
 
       // Session commands - get the session first
@@ -629,6 +664,9 @@ export class PiSessionManager {
   // ==========================================================================
 
   private generateSessionId(): string {
-    return `session-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+    // Use crypto for collision-safe ID generation
+    const timestamp = Date.now().toString(36);
+    const random = crypto.randomUUID().split("-")[0];
+    return `session-${timestamp}-${random}`;
   }
 }

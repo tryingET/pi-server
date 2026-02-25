@@ -32,7 +32,9 @@ export type ServerCommand =
   | { id?: string; type: "list_sessions" }
   | { id?: string; type: "create_session"; sessionId?: string; cwd?: string }
   | { id?: string; type: "delete_session"; sessionId: string }
-  | { id?: string; type: "switch_session"; sessionId: string };
+  | { id?: string; type: "switch_session"; sessionId: string }
+  | { id?: string; type: "get_metrics" }
+  | { id?: string; type: "health_check" };
 
 // ============================================================================
 // SESSION COMMANDS (pass through to AgentSession)
@@ -129,6 +131,33 @@ export type ServerResponse =
       command: "switch_session";
       success: true;
       data: { sessionInfo: SessionInfo };
+    })
+  | (RpcResponseBase & {
+      command: "get_metrics";
+      success: true;
+      data: {
+        sessionCount: number;
+        connectionCount: number;
+        totalCommandsExecuted: number;
+        commandsRejected: {
+          sessionLimit: number;
+          messageSize: number;
+          rateLimit: number;
+          globalRateLimit: number;
+          connectionLimit: number;
+        };
+        zombieSessionsDetected: number;
+        zombieSessionsCleaned: number;
+        rateLimitUsage: {
+          globalCount: number;
+          globalLimit: number;
+        };
+      };
+    })
+  | (RpcResponseBase & {
+      command: "health_check";
+      success: true;
+      data: { healthy: boolean; issues: string[] };
     });
 
 // Session command responses (mirrors RpcCommand types)

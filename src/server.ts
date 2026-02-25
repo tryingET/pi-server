@@ -131,6 +131,21 @@ export class PiServer {
 
   private setupWebSocket(wss: WebSocketServer): void {
     wss.on("connection", (ws: WebSocket) => {
+      // Check connection limit
+      const connResult = this.sessionManager.getGovernor().canAcceptConnection();
+      if (!connResult.allowed) {
+        console.error(`[WebSocket] Connection rejected: ${connResult.reason}`);
+        try {
+          ws.close(1013, connResult.reason);
+        } catch {
+          // Ignore close errors
+        }
+        return;
+      }
+
+      // Register connection
+      this.sessionManager.getGovernor().registerConnection();
+
       const subscriber: Subscriber = {
         send: (data: string) => {
           // Check state immediately before send; if closed, silently skip
@@ -194,11 +209,13 @@ export class PiServer {
 
       ws.on("close", () => {
         this.sessionManager.removeSubscriber(subscriber);
+        this.sessionManager.getGovernor().unregisterConnection();
       });
 
       ws.on("error", (error) => {
         console.error(`[WebSocket] Connection error:`, error);
         this.sessionManager.removeSubscriber(subscriber);
+        this.sessionManager.getGovernor().unregisterConnection();
       });
     });
   }

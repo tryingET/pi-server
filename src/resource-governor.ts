@@ -6,9 +6,14 @@
  * - Session limits (prevents resource exhaustion)
  * - Rate limiting (prevents abuse)
  * - Heartbeat tracking (enables zombie detection)
+ * - Connection limits (prevents DoS)
  *
  * Makes testing trivial (mock the governor).
  */
+
+// ============================================================================
+// CONFIG
+// ============================================================================
 
 export interface ResourceGovernorConfig {
   /** Maximum concurrent sessions (default: 100) */
@@ -19,6 +24,8 @@ export interface ResourceGovernorConfig {
   maxCommandsPerMinute: number;
   /** Maximum commands per minute globally across all sessions (default: 1000) */
   maxGlobalCommandsPerMinute: number;
+  /** Maximum concurrent WebSocket connections (default: 1000) */
+  maxConnections: number;
   /** Heartbeat interval in ms for zombie detection (default: 30000) */
   heartbeatIntervalMs: number;
   /** Time without heartbeat before session is considered zombie (default: 5 min) */
@@ -30,25 +37,37 @@ export const DEFAULT_CONFIG: ResourceGovernorConfig = {
   maxMessageSizeBytes: 10 * 1024 * 1024, // 10MB
   maxCommandsPerMinute: 100,
   maxGlobalCommandsPerMinute: 1000,
+  maxConnections: 1000,
   heartbeatIntervalMs: 30000,
   zombieTimeoutMs: 5 * 60 * 1000, // 5 minutes
 };
 
+// ============================================================================
+// METRICS
+// ============================================================================
+
 export interface GovernorMetrics {
   sessionCount: number;
+  connectionCount: number;
   totalCommandsExecuted: number;
   commandsRejected: {
     sessionLimit: number;
     messageSize: number;
     rateLimit: number;
     globalRateLimit: number;
+    connectionLimit: number;
   };
   zombieSessionsDetected: number;
+  zombieSessionsCleaned: number;
   rateLimitUsage: {
     globalCount: number;
     globalLimit: number;
   };
 }
+
+// ============================================================================
+// RESULT TYPES
+// ============================================================================
 
 export interface RejectionResult {
   allowed: false;
@@ -61,6 +80,29 @@ export interface AllowResult {
 
 export type GovernorResult = AllowResult | RejectionResult;
 
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+/** Threshold for triggering automatic timestamp cleanup */
+const TIMESTAMP_CLEANUP_THRESHOLD = 10000;
+
+/** Rate limit window in ms (1 minute) */
+const RATE_WINDOW_MS = 60000;
+
+/** Session ID max length */
+const SESSION_ID_MAX_LENGTH = 256;
+
+/** Valid session ID pattern (alphanumeric, dash, underscore, dot) */
+const SESSION_ID_PATTERN = /^[a-zA-Z0-9_.-]+$/;
+
+/** Dangerous path patterns */
+const DANGEROUS_PATH_PATTERNS = [/\.\./, /^\//, /^~/, /^\//];
+
+// ============================================================================
+// GOVERNOR CLASS
+// ============================================================================
+
 /**
  * ResourceGovernor enforces resource limits for the server.
  * 
@@ -69,12 +111,9 @@ export type GovernorResult = AllowResult | RejectionResult;
  * - Session-specific data is cleaned up when sessions are deleted
  * - Call cleanupStaleData() after deleting sessions
  */
-
-/** Threshold for triggering automatic timestamp cleanup */
-const TIMESTAMP_CLEANUP_THRESHOLD = 10000;
-
 export class ResourceGovernor {
   private sessionCount = 0;
+  private connectionCount = 0;
   private commandTimestamps = new Map<string, number[]>();
   private globalCommandTimestamps: number[] = [];
   private lastHeartbeat = new Map<string, number>();
@@ -84,8 +123,10 @@ export class ResourceGovernor {
     messageSize: 0,
     rateLimit: 0,
     globalRateLimit: 0,
+    connectionLimit: 0,
   };
   private zombieSessionsDetected = 0;
+  private zombieSessionsCleaned = 0;
 
   constructor(private config: ResourceGovernorConfig = DEFAULT_CONFIG) {}
 
@@ -98,13 +139,53 @@ export class ResourceGovernor {
   }
 
   // ==========================================================================
+  // SESSION ID VALIDATION
+  // ==========================================================================
+
+  /**
+   * Validate a session ID.
+   * Returns null if valid, or an error message if invalid.
+   */
+  validateSessionId(sessionId: string): string | null {
+    if (!sessionId || typeof sessionId !== "string") {
+      return "Session ID must be a non-empty string";
+    }
+    if (sessionId.length > SESSION_ID_MAX_LENGTH) {
+      return `Session ID too long (max ${SESSION_ID_MAX_LENGTH} characters)`;
+    }
+    if (!SESSION_ID_PATTERN.test(sessionId)) {
+      return "Session ID must contain only alphanumeric characters, underscores, dashes, and dots";
+    }
+    return null;
+  }
+
+  // ==========================================================================
+  // CWD VALIDATION
+  // ==========================================================================
+
+  /**
+   * Validate a working directory path.
+   * Returns null if valid, or an error message if invalid.
+   */
+  validateCwd(cwd: string): string | null {
+    if (!cwd || typeof cwd !== "string") {
+      return "CWD must be a non-empty string";
+    }
+    for (const pattern of DANGEROUS_PATH_PATTERNS) {
+      if (pattern.test(cwd)) {
+        return "CWD contains potentially dangerous path components";
+      }
+    }
+    return null;
+  }
+
+  // ==========================================================================
   // SESSION LIMITS
   // ==========================================================================
 
   /**
    * Atomically check and reserve a session slot.
    * Returns true if slot was reserved, false if limit reached.
-   * Use this instead of canCreateSession + registerSession to avoid races.
    */
   tryReserveSessionSlot(): boolean {
     if (this.sessionCount >= this.config.maxSessions) {
@@ -117,15 +198,19 @@ export class ResourceGovernor {
 
   /**
    * Release a reserved session slot (used if session creation fails after reservation).
+   * Asserts that count doesn't go negative in development.
    */
   releaseSessionSlot(): void {
-    this.sessionCount = Math.max(0, this.sessionCount - 1);
+    this.sessionCount--;
+    if (this.sessionCount < 0) {
+      console.error("[ResourceGovernor] WARNING: sessionCount went negative, resetting to 0");
+      this.sessionCount = 0;
+    }
   }
 
   /**
    * Check if a new session can be created.
-   * WARNING: Not atomic - use tryReserveSessionSlot for race-free operation.
-   * @deprecated Use tryReserveSessionSlot instead
+   * @deprecated Use tryReserveSessionSlot for atomic operation
    */
   canCreateSession(): GovernorResult {
     if (this.sessionCount >= this.config.maxSessions) {
@@ -139,9 +224,8 @@ export class ResourceGovernor {
   }
 
   /**
-   * Register a new session. Call AFTER session is created.
-   * WARNING: Not atomic - use tryReserveSessionSlot for race-free operation.
-   * @deprecated Use tryReserveSessionSlot instead
+   * Register a new session.
+   * @deprecated Use tryReserveSessionSlot for atomic operation
    */
   registerSession(sessionId: string): void {
     this.sessionCount++;
@@ -152,7 +236,11 @@ export class ResourceGovernor {
    * Unregister a session. Call AFTER session is deleted.
    */
   unregisterSession(sessionId: string): void {
-    this.sessionCount = Math.max(0, this.sessionCount - 1);
+    this.sessionCount--;
+    if (this.sessionCount < 0) {
+      console.error("[ResourceGovernor] WARNING: sessionCount went negative, resetting to 0");
+      this.sessionCount = 0;
+    }
     this.lastHeartbeat.delete(sessionId);
     this.commandTimestamps.delete(sessionId);
   }
@@ -165,6 +253,49 @@ export class ResourceGovernor {
   }
 
   // ==========================================================================
+  // CONNECTION LIMITS
+  // ==========================================================================
+
+  /**
+   * Check if a new connection can be accepted.
+   */
+  canAcceptConnection(): GovernorResult {
+    if (this.connectionCount >= this.config.maxConnections) {
+      this.commandsRejected.connectionLimit++;
+      return {
+        allowed: false,
+        reason: `Connection limit reached (${this.config.maxConnections} connections)`,
+      };
+    }
+    return { allowed: true };
+  }
+
+  /**
+   * Register a new connection.
+   */
+  registerConnection(): void {
+    this.connectionCount++;
+  }
+
+  /**
+   * Unregister a connection.
+   */
+  unregisterConnection(): void {
+    this.connectionCount--;
+    if (this.connectionCount < 0) {
+      console.error("[ResourceGovernor] WARNING: connectionCount went negative, resetting to 0");
+      this.connectionCount = 0;
+    }
+  }
+
+  /**
+   * Get current connection count.
+   */
+  getConnectionCount(): number {
+    return this.connectionCount;
+  }
+
+  // ==========================================================================
   // MESSAGE SIZE LIMITS
   // ==========================================================================
 
@@ -173,7 +304,6 @@ export class ResourceGovernor {
    * Rejects negative sizes, NaN, and sizes exceeding the limit.
    */
   canAcceptMessage(sizeBytes: number): GovernorResult {
-    // Check for invalid sizes (negative, NaN, Infinity)
     if (!Number.isFinite(sizeBytes) || sizeBytes < 0) {
       this.commandsRejected.messageSize++;
       return {
@@ -196,27 +326,23 @@ export class ResourceGovernor {
   // RATE LIMITING
   // ==========================================================================
 
-  /** Rate limit window in ms (1 minute) */
-  private static readonly RATE_WINDOW_MS = 60000;
-
   /**
    * Check if a command can be executed for the given session.
    * Implements sliding window rate limiting (both per-session and global).
-   * 
-   * IMPORTANT: Call this AFTER validation passes, not before.
-   * Invalid commands should not count against the rate limit.
    */
   canExecuteCommand(sessionId: string): GovernorResult {
     const now = Date.now();
-    const windowStart = now - ResourceGovernor.RATE_WINDOW_MS;
+    const windowStart = now - RATE_WINDOW_MS;
 
-    // Auto-cleanup if global timestamps exceed threshold (prevents unbounded memory)
+    // Auto-cleanup if global timestamps exceed threshold
     if (this.globalCommandTimestamps.length > TIMESTAMP_CLEANUP_THRESHOLD) {
+      this.globalCommandTimestamps = this.globalCommandTimestamps.filter((t) => t > windowStart);
+    } else {
+      // Normal filter
       this.globalCommandTimestamps = this.globalCommandTimestamps.filter((t) => t > windowStart);
     }
 
     // Check global rate limit first
-    this.globalCommandTimestamps = this.globalCommandTimestamps.filter((t) => t > windowStart);
     if (this.globalCommandTimestamps.length >= this.config.maxGlobalCommandsPerMinute) {
       this.commandsRejected.globalRateLimit++;
       return {
@@ -231,7 +357,6 @@ export class ResourceGovernor {
       timestamps = [];
       this.commandTimestamps.set(sessionId, timestamps);
     } else {
-      // Filter to commands within the window
       timestamps = timestamps.filter((t) => t > windowStart);
       this.commandTimestamps.set(sessionId, timestamps);
     }
@@ -244,7 +369,7 @@ export class ResourceGovernor {
       };
     }
 
-    // Record this command in both buckets
+    // Record this command
     timestamps.push(now);
     this.globalCommandTimestamps.push(now);
     this.totalCommandsExecuted++;
@@ -257,7 +382,7 @@ export class ResourceGovernor {
    */
   getRateLimitUsage(sessionId: string): { session: number; global: number } {
     const now = Date.now();
-    const windowStart = now - ResourceGovernor.RATE_WINDOW_MS;
+    const windowStart = now - RATE_WINDOW_MS;
     
     const sessionTimestamps = this.commandTimestamps.get(sessionId)?.filter((t) => t > windowStart) ?? [];
     const globalCount = this.globalCommandTimestamps.filter((t) => t > windowStart).length;
@@ -273,16 +398,14 @@ export class ResourceGovernor {
   // ==========================================================================
 
   /**
-   * Record a heartbeat for a session (activity indicator).
-   * Call when the session is active.
+   * Record a heartbeat for a session.
    */
   recordHeartbeat(sessionId: string): void {
     this.lastHeartbeat.set(sessionId, Date.now());
   }
 
   /**
-   * Get list of session IDs that have not sent a heartbeat recently.
-   * These are potential "zombie" sessions.
+   * Get list of zombie session IDs.
    */
   getZombieSessions(): string[] {
     const now = Date.now();
@@ -302,6 +425,22 @@ export class ResourceGovernor {
   }
 
   /**
+   * Clean up zombie sessions. Returns IDs of cleaned sessions.
+   * Call this periodically or when you want to force cleanup.
+   */
+  cleanupZombieSessions(): string[] {
+    const zombies = this.getZombieSessions();
+    for (const sessionId of zombies) {
+      this.lastHeartbeat.delete(sessionId);
+      this.commandTimestamps.delete(sessionId);
+    }
+    if (zombies.length > 0) {
+      this.zombieSessionsCleaned += zombies.length;
+    }
+    return zombies;
+  }
+
+  /**
    * Get the last heartbeat time for a session.
    */
   getLastHeartbeat(sessionId: string): number | undefined {
@@ -317,18 +456,44 @@ export class ResourceGovernor {
    */
   getMetrics(): GovernorMetrics {
     const now = Date.now();
-    const windowStart = now - ResourceGovernor.RATE_WINDOW_MS;
+    const windowStart = now - RATE_WINDOW_MS;
     const globalCount = this.globalCommandTimestamps.filter((t) => t > windowStart).length;
     
     return {
       sessionCount: this.sessionCount,
+      connectionCount: this.connectionCount,
       totalCommandsExecuted: this.totalCommandsExecuted,
       commandsRejected: { ...this.commandsRejected },
       zombieSessionsDetected: this.zombieSessionsDetected,
+      zombieSessionsCleaned: this.zombieSessionsCleaned,
       rateLimitUsage: {
         globalCount,
         globalLimit: this.config.maxGlobalCommandsPerMinute,
       },
+    };
+  }
+
+  /**
+   * Check if the server is healthy.
+   */
+  isHealthy(): { healthy: boolean; issues: string[] } {
+    const issues: string[] = [];
+    
+    if (this.sessionCount >= this.config.maxSessions * 0.9) {
+      issues.push(`Session count at ${this.sessionCount}/${this.config.maxSessions} (90%+)`);
+    }
+    if (this.connectionCount >= this.config.maxConnections * 0.9) {
+      issues.push(`Connection count at ${this.connectionCount}/${this.config.maxConnections} (90%+)`);
+    }
+    
+    const zombies = this.getZombieSessions();
+    if (zombies.length > 0) {
+      issues.push(`${zombies.length} zombie sessions detected`);
+    }
+    
+    return {
+      healthy: issues.length === 0,
+      issues,
     };
   }
 
@@ -342,8 +507,10 @@ export class ResourceGovernor {
       messageSize: 0,
       rateLimit: 0,
       globalRateLimit: 0,
+      connectionLimit: 0,
     };
     this.zombieSessionsDetected = 0;
+    this.zombieSessionsCleaned = 0;
   }
 
   // ==========================================================================
@@ -352,16 +519,13 @@ export class ResourceGovernor {
 
   /**
    * Clean up stale rate limit data.
-   * Call periodically to prevent memory leaks from old timestamps.
    */
   cleanupStaleTimestamps(): void {
     const now = Date.now();
-    const windowStart = now - ResourceGovernor.RATE_WINDOW_MS;
+    const windowStart = now - RATE_WINDOW_MS;
 
-    // Clean global timestamps
     this.globalCommandTimestamps = this.globalCommandTimestamps.filter((t) => t > windowStart);
 
-    // Clean per-session timestamps
     for (const [sessionId, timestamps] of this.commandTimestamps) {
       const filtered = timestamps.filter((t) => t > windowStart);
       if (filtered.length === 0) {
@@ -374,17 +538,14 @@ export class ResourceGovernor {
 
   /**
    * Clean up stale data for deleted sessions.
-   * Call when a session is deleted.
    */
   cleanupStaleData(activeSessionIds: Set<string>): void {
-    // Clean up command timestamps for sessions that no longer exist
     for (const sessionId of this.commandTimestamps.keys()) {
       if (!activeSessionIds.has(sessionId)) {
         this.commandTimestamps.delete(sessionId);
       }
     }
 
-    // Clean up heartbeat data for sessions that no longer exist
     for (const sessionId of this.lastHeartbeat.keys()) {
       if (!activeSessionIds.has(sessionId)) {
         this.lastHeartbeat.delete(sessionId);
