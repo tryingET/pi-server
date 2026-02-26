@@ -80,20 +80,14 @@ describe("command-replay-store", () => {
       const store = new CommandReplayStore();
       const cmd1 = makeCommand({ type: "get_state", sessionId: "s1" });
       const cmd2 = makeCommand({ type: "get_messages", sessionId: "s1" });
-      assert.notStrictEqual(
-        store.getCommandFingerprint(cmd1),
-        store.getCommandFingerprint(cmd2)
-      );
+      assert.notStrictEqual(store.getCommandFingerprint(cmd1), store.getCommandFingerprint(cmd2));
     });
 
     it("includes other fields in fingerprint", () => {
       const store = new CommandReplayStore();
       const cmd1 = makeCommand({ type: "get_state", sessionId: "s1" });
       const cmd2 = makeCommand({ type: "get_state", sessionId: "s2" });
-      assert.notStrictEqual(
-        store.getCommandFingerprint(cmd1),
-        store.getCommandFingerprint(cmd2)
-      );
+      assert.notStrictEqual(store.getCommandFingerprint(cmd1), store.getCommandFingerprint(cmd2));
     });
 
     it("excludes idempotencyKey from fingerprint", () => {
@@ -101,21 +95,20 @@ describe("command-replay-store", () => {
       const cmd1 = makeCommand({ type: "get_state", sessionId: "s1" });
       const cmd2 = makeCommand({ type: "get_state", sessionId: "s1", idempotencyKey: "key1" });
       // Same semantic command, different retry identity
-      assert.strictEqual(
-        store.getCommandFingerprint(cmd1),
-        store.getCommandFingerprint(cmd2)
-      );
+      assert.strictEqual(store.getCommandFingerprint(cmd1), store.getCommandFingerprint(cmd2));
     });
 
     it("excludes both id and idempotencyKey from fingerprint", () => {
       const store = new CommandReplayStore();
       const cmd1 = makeCommand({ id: "id1", type: "get_state", sessionId: "s1" });
-      const cmd2 = makeCommand({ id: "id2", type: "get_state", sessionId: "s1", idempotencyKey: "key1" });
+      const cmd2 = makeCommand({
+        id: "id2",
+        type: "get_state",
+        sessionId: "s1",
+        idempotencyKey: "key1",
+      });
       // Same semantic command, completely different retry identity
-      assert.strictEqual(
-        store.getCommandFingerprint(cmd1),
-        store.getCommandFingerprint(cmd2)
-      );
+      assert.strictEqual(store.getCommandFingerprint(cmd1), store.getCommandFingerprint(cmd2));
     });
   });
 
@@ -177,7 +170,11 @@ describe("command-replay-store", () => {
         idempotencyKey: "key1",
         commandType: "get_state",
         fingerprint,
-        response: makeResponse({ command: "get_state", success: true, data: { foo: "bar" } as any }),
+        response: makeResponse({
+          command: "get_state",
+          success: true,
+          data: { foo: "bar" } as any,
+        }),
       });
 
       const result = store.checkReplay(command, fingerprint);
@@ -346,7 +343,11 @@ describe("command-replay-store", () => {
     it("returns conflict for idempotency key with different fingerprint", () => {
       const store = new CommandReplayStore();
       const command1 = makeCommand({ type: "get_state", sessionId: "s1", idempotencyKey: "key1" });
-      const command2 = makeCommand({ type: "get_messages", sessionId: "s1", idempotencyKey: "key1" });
+      const command2 = makeCommand({
+        type: "get_messages",
+        sessionId: "s1",
+        idempotencyKey: "key1",
+      });
       const fp1 = store.getCommandFingerprint(command1);
       const fp2 = store.getCommandFingerprint(command2);
 
@@ -414,7 +415,12 @@ describe("command-replay-store", () => {
       // so same semantic command with different retry identity should replay, not conflict
       const store = new CommandReplayStore();
       const command1 = makeCommand({ id: "cmd-1", type: "get_state", sessionId: "s1" });
-      const command2 = makeCommand({ id: "cmd-1", type: "get_state", sessionId: "s1", idempotencyKey: "retry-key" });
+      const command2 = makeCommand({
+        id: "cmd-1",
+        type: "get_state",
+        sessionId: "s1",
+        idempotencyKey: "retry-key",
+      });
       const fp1 = store.getCommandFingerprint(command1);
       const fp2 = store.getCommandFingerprint(command2);
 
@@ -427,7 +433,12 @@ describe("command-replay-store", () => {
         laneKey: "session:s1",
         fingerprint: fp1,
         success: true,
-        response: makeResponse({ id: "cmd-1", command: "get_state", success: true, data: { state: "ok" } as any }),
+        response: makeResponse({
+          id: "cmd-1",
+          command: "get_state",
+          success: true,
+          data: { state: "ok" } as any,
+        }),
         finishedAt: Date.now(),
       });
 
@@ -479,7 +490,9 @@ describe("command-replay-store", () => {
         commandType: "get_state",
         laneKey: "session:s1",
         fingerprint: fp1,
-        promise: Promise.resolve(makeResponse({ id: "cmd-1", command: "get_state", success: true })),
+        promise: Promise.resolve(
+          makeResponse({ id: "cmd-1", command: "get_state", success: true })
+        ),
       });
 
       const result = store.checkReplay(command2, fp2);
@@ -488,8 +501,17 @@ describe("command-replay-store", () => {
 
     it("strips ID from response when request has no ID", () => {
       const store = new CommandReplayStore();
-      const commandWithId = makeCommand({ id: "cmd-1", type: "get_state", sessionId: "s1", idempotencyKey: "key1" });
-      const commandNoId = makeCommand({ type: "get_state", sessionId: "s1", idempotencyKey: "key1" });
+      const commandWithId = makeCommand({
+        id: "cmd-1",
+        type: "get_state",
+        sessionId: "s1",
+        idempotencyKey: "key1",
+      });
+      const commandNoId = makeCommand({
+        type: "get_state",
+        sessionId: "s1",
+        idempotencyKey: "key1",
+      });
       const fingerprint = store.getCommandFingerprint(commandWithId);
 
       store.cacheIdempotencyResult({
@@ -509,8 +531,18 @@ describe("command-replay-store", () => {
 
     it("preserves ID in response when request has ID", () => {
       const store = new CommandReplayStore();
-      const command1 = makeCommand({ id: "original", type: "get_state", sessionId: "s1", idempotencyKey: "key1" });
-      const command2 = makeCommand({ id: "new-request", type: "get_state", sessionId: "s1", idempotencyKey: "key1" });
+      const command1 = makeCommand({
+        id: "original",
+        type: "get_state",
+        sessionId: "s1",
+        idempotencyKey: "key1",
+      });
+      const command2 = makeCommand({
+        id: "new-request",
+        type: "get_state",
+        sessionId: "s1",
+        idempotencyKey: "key1",
+      });
       const fingerprint = store.getCommandFingerprint(command1);
 
       store.cacheIdempotencyResult({
@@ -538,7 +570,12 @@ describe("command-replay-store", () => {
       const store = new CommandReplayStore();
 
       // Add some state
-      const command = makeCommand({ id: "cmd-1", type: "get_state", sessionId: "s1", idempotencyKey: "key1" });
+      const command = makeCommand({
+        id: "cmd-1",
+        type: "get_state",
+        sessionId: "s1",
+        idempotencyKey: "key1",
+      });
       const fingerprint = store.getCommandFingerprint(command);
 
       store.cacheIdempotencyResult({

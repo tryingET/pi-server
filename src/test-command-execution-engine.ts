@@ -333,7 +333,9 @@ describe("command-execution-engine", () => {
         commandType: "prompt",
         laneKey: "session:s2", // Different lane
         fingerprint: "fp1",
-        promise: Promise.resolve(makeResponse({ command: "prompt", success: false, error: "failed" })),
+        promise: Promise.resolve(
+          makeResponse({ command: "prompt", success: false, error: "failed" })
+        ),
       });
 
       const result = await engine.awaitDependencies(["inflight-cmd"], "session:s1");
@@ -528,7 +530,10 @@ describe("command-execution-engine", () => {
       const promise = new Promise<RpcResponse>(() => {}); // Never resolves
 
       await assert.rejects(
-        engine.executeWithTimeout("get_state", promise, { type: "get_state", sessionId: "s1" } as any),
+        engine.executeWithTimeout("get_state", promise, {
+          type: "get_state",
+          sessionId: "s1",
+        } as any),
         /timed out/
       );
     });
@@ -645,7 +650,10 @@ describe("command-execution-engine", () => {
 
       // Check while tasks are running (before they complete)
       const statsDuring = engine.getStats();
-      assert.ok(statsDuring.laneCount >= 2, `Expected at least 2 lanes, got ${statsDuring.laneCount}`);
+      assert.ok(
+        statsDuring.laneCount >= 2,
+        `Expected at least 2 lanes, got ${statsDuring.laneCount}`
+      );
 
       await Promise.all(tasks);
 

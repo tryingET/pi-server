@@ -13,7 +13,6 @@ import { CommandExecutionEngine } from "./command-execution-engine.js";
 import { CommandReplayStore } from "./command-replay-store.js";
 import { SessionVersionStore } from "./session-version-store.js";
 import type { SessionResolver, RpcResponse } from "./types.js";
-import type { AgentSession } from "@mariozechner/pi-coding-agent";
 
 // =============================================================================
 // TEST INFRASTRUCTURE
@@ -105,9 +104,7 @@ describe("fuzz: lane serialization", () => {
     const laneCount = 10;
     const tasksPerLane = 10;
 
-    let maxConcurrent = 0;
-    let currentConcurrent = 0;
-    const lock = { currentConcurrent, maxConcurrent };
+    const lock = { currentConcurrent: 0, maxConcurrent: 0 };
 
     const tasks: Promise<RpcResponse>[] = [];
 
@@ -192,7 +189,11 @@ describe("fuzz: in-flight tracking", () => {
 
     // Verify all tracked
     const statsAfterRegister = replayStore.getStats();
-    assert.strictEqual(statsAfterRegister.inFlightCount, commandCount, "All commands should be in-flight");
+    assert.strictEqual(
+      statsAfterRegister.inFlightCount,
+      commandCount,
+      "All commands should be in-flight"
+    );
 
     // Wait for all to complete
     await Promise.all(registerTasks.map((t) => t.promise));
@@ -204,7 +205,11 @@ describe("fuzz: in-flight tracking", () => {
 
     // Verify all cleaned up
     const statsAfterUnregister = replayStore.getStats();
-    assert.strictEqual(statsAfterUnregister.inFlightCount, 0, "All commands should be unregistered");
+    assert.strictEqual(
+      statsAfterUnregister.inFlightCount,
+      0,
+      "All commands should be unregistered"
+    );
   });
 
   it("in-flight limit rejection under load", async () => {
@@ -270,7 +275,11 @@ describe("fuzz: in-flight tracking", () => {
     replayStore.unregisterInFlight(cmdId, record1);
 
     // Now gone
-    assert.strictEqual(replayStore.getInFlight(cmdId), undefined, "Should unregister with correct record");
+    assert.strictEqual(
+      replayStore.getInFlight(cmdId),
+      undefined,
+      "Should unregister with correct record"
+    );
   });
 });
 
@@ -283,18 +292,21 @@ describe("fuzz: outcome storage", () => {
     const tasks = Array.from({ length: commandCount }, (_, i) => {
       return new Promise<void>((resolve) => {
         // Randomize order of writes
-        setTimeout(() => {
-          replayStore.storeCommandOutcome({
-            commandId: `outcome-cmd-${i}`,
-            commandType: "test",
-            laneKey: `lane-${i % 20}`,
-            fingerprint: `fp-${i}`,
-            success: true,
-            response: makeResponse({ success: true }),
-            finishedAt: Date.now(),
-          });
-          resolve();
-        }, randInt(0, 50));
+        setTimeout(
+          () => {
+            replayStore.storeCommandOutcome({
+              commandId: `outcome-cmd-${i}`,
+              commandType: "test",
+              laneKey: `lane-${i % 20}`,
+              fingerprint: `fp-${i}`,
+              success: true,
+              response: makeResponse({ success: true }),
+              finishedAt: Date.now(),
+            });
+            resolve();
+          },
+          randInt(0, 50)
+        );
       });
     });
 
@@ -321,7 +333,10 @@ describe("fuzz: outcome storage", () => {
         laneKey: "test-lane",
         fingerprint: `fp-${i}`,
         success: i % 2 === 0,
-        response: makeResponse({ success: i % 2 === 0, error: i % 2 === 0 ? undefined : `error-${i}` }),
+        response: makeResponse({
+          success: i % 2 === 0,
+          error: i % 2 === 0 ? undefined : `error-${i}`,
+        }),
         finishedAt: Date.now() + i,
       });
     }
@@ -395,11 +410,7 @@ describe("fuzz: fingerprinting", () => {
 
     // All should be equal
     for (let i = 1; i < fingerprints.length; i++) {
-      assert.strictEqual(
-        fingerprints[i],
-        fingerprints[0],
-        `Fingerprint ${i} should match base`
-      );
+      assert.strictEqual(fingerprints[i], fingerprints[0], `Fingerprint ${i} should match base`);
     }
   });
 
@@ -436,12 +447,15 @@ describe("fuzz: synthetic IDs", () => {
     // Generate IDs concurrently
     const tasks = Array.from({ length: commandCount }, () => {
       return new Promise<void>((resolve) => {
-        setTimeout(() => {
-          const cmd = { type: "test" };
-          const id = replayStore.getOrCreateCommandId(cmd as any);
-          ids.add(id);
-          resolve();
-        }, randInt(0, 10));
+        setTimeout(
+          () => {
+            const cmd = { type: "test" };
+            const id = replayStore.getOrCreateCommandId(cmd as any);
+            ids.add(id);
+            resolve();
+          },
+          randInt(0, 10)
+        );
       });
     });
 
@@ -503,7 +517,10 @@ describe("fuzz: dependency chains", () => {
     // All should fail with timeout
     for (const result of results) {
       assert.strictEqual(result.ok, false, "Should fail with timeout");
-      assert.ok(result.error?.includes("timed out") || result.error?.includes("stuck-cmd"), "Should mention timeout or dependency");
+      assert.ok(
+        result.error?.includes("timed out") || result.error?.includes("stuck-cmd"),
+        "Should mention timeout or dependency"
+      );
     }
   });
 

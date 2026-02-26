@@ -204,7 +204,10 @@ describe("session-version-store", () => {
         command: "prompt",
         success: true,
       } as any;
-      const result = store.applyVersion({ type: "prompt", sessionId: "session-1" } as any, response);
+      const result = store.applyVersion(
+        { type: "prompt", sessionId: "session-1" } as any,
+        response
+      );
       assert.strictEqual(result.sessionVersion, 1);
       assert.strictEqual(store.getVersion("session-1"), 1);
     });
@@ -218,7 +221,10 @@ describe("session-version-store", () => {
         success: true,
         data: {} as any,
       } as any;
-      const result = store.applyVersion({ type: "get_state", sessionId: "session-1" } as any, response);
+      const result = store.applyVersion(
+        { type: "get_state", sessionId: "session-1" } as any,
+        response
+      );
       assert.strictEqual(result.sessionVersion, 0);
       assert.strictEqual(store.getVersion("session-1"), 0);
     });
@@ -232,7 +238,12 @@ describe("session-version-store", () => {
         success: true,
       } as any;
       const result = store.applyVersion(
-        { type: "extension_ui_response", sessionId: "session-1", requestId: "r1", response: { method: "cancelled" } } as any,
+        {
+          type: "extension_ui_response",
+          sessionId: "session-1",
+          requestId: "r1",
+          response: { method: "cancelled" },
+        } as any,
         response
       );
       assert.strictEqual(result.sessionVersion, 0);
@@ -258,7 +269,10 @@ describe("session-version-store", () => {
         command: "prompt",
         success: true,
       } as any;
-      const result = store.applyVersion({ type: "prompt", sessionId: "unknown-session" } as any, response);
+      const result = store.applyVersion(
+        { type: "prompt", sessionId: "unknown-session" } as any,
+        response
+      );
       // Should still work, treating as starting from 0
       assert.strictEqual(result.sessionVersion, 1);
     });

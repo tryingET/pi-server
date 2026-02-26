@@ -329,9 +329,7 @@ export class CommandExecutionEngine {
       return promise;
     }
 
-    return withTimeout(promise, timeoutMs, commandType, () =>
-      this.abortTimedOutCommand(command)
-    );
+    return withTimeout(promise, timeoutMs, commandType, () => this.abortTimedOutCommand(command));
   }
 
   // ==========================================================================

@@ -306,10 +306,7 @@ export class CommandReplayStore {
    *
    * @returns true if registered, false if limit exceeded
    */
-  registerInFlight(
-    commandId: string,
-    record: InFlightCommandRecord
-  ): boolean {
+  registerInFlight(commandId: string, record: InFlightCommandRecord): boolean {
     const existed = this.commandInFlightById.has(commandId);
 
     // Reject if at capacity and this is a new entry
@@ -395,10 +392,7 @@ export class CommandReplayStore {
    * - "replay_cached": Found cached response, return it (with replayed: true)
    * - "replay_inflight": Found in-flight command, await its promise
    */
-  checkReplay(
-    command: RpcCommand,
-    fingerprint: string
-  ): ReplayCheckResult {
+  checkReplay(command: RpcCommand, fingerprint: string): ReplayCheckResult {
     const id = getCommandId(command);
     const commandType = command.type;
     const idempotencyKey = getCommandIdempotencyKey(command);
@@ -425,10 +419,7 @@ export class CommandReplayStore {
         // Replay cached response
         return {
           kind: "replay_cached",
-          response: this.cloneResponseForRequest(
-            { ...cached.response, replayed: true },
-            id
-          ),
+          response: this.cloneResponseForRequest({ ...cached.response, replayed: true }, id),
         };
       }
     }
@@ -442,23 +433,14 @@ export class CommandReplayStore {
         if (completed.fingerprint !== fingerprint) {
           return {
             kind: "conflict",
-            response: this.createConflictResponse(
-              id,
-              commandType,
-              "id",
-              id,
-              completed.commandType
-            ),
+            response: this.createConflictResponse(id, commandType, "id", id, completed.commandType),
           };
         }
 
         // Replay completed response
         return {
           kind: "replay_cached",
-          response: this.cloneResponseForRequest(
-            { ...completed.response, replayed: true },
-            id
-          ),
+          response: this.cloneResponseForRequest({ ...completed.response, replayed: true }, id),
         };
       }
 
@@ -469,13 +451,7 @@ export class CommandReplayStore {
         if (inFlight.fingerprint !== fingerprint) {
           return {
             kind: "conflict",
-            response: this.createConflictResponse(
-              id,
-              commandType,
-              "id",
-              id,
-              inFlight.commandType
-            ),
+            response: this.createConflictResponse(id, commandType, "id", id, inFlight.commandType),
           };
         }
 

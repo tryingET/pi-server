@@ -32,14 +32,9 @@ import { ExtensionUIManager } from "./extension-ui.js";
 import { createServerUIContext } from "./server-ui-context.js";
 import { validateCommand, formatValidationErrors } from "./validation.js";
 import { ResourceGovernor, DEFAULT_CONFIG } from "./resource-governor.js";
-import {
-  CommandReplayStore,
-  type InFlightCommandRecord,
-} from "./command-replay-store.js";
+import { CommandReplayStore, type InFlightCommandRecord } from "./command-replay-store.js";
 import { SessionVersionStore } from "./session-version-store.js";
-import {
-  CommandExecutionEngine,
-} from "./command-execution-engine.js";
+import { CommandExecutionEngine } from "./command-execution-engine.js";
 
 /** Default timeout for session commands (5 minutes for LLM operations) */
 const DEFAULT_COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
@@ -654,7 +649,11 @@ export class PiSessionManager implements SessionResolver {
         }
 
         if (sessionId !== undefined && ifSessionVersion !== undefined) {
-          const versionError = this.executionEngine.checkSessionVersion(sessionId, ifSessionVersion, commandType);
+          const versionError = this.executionEngine.checkSessionVersion(
+            sessionId,
+            ifSessionVersion,
+            commandType
+          );
           if (versionError) {
             return {
               id,
@@ -712,7 +711,11 @@ export class PiSessionManager implements SessionResolver {
     let response: RpcResponse;
 
     try {
-      response = await this.executionEngine.executeWithTimeout(commandType, commandExecution, command);
+      response = await this.executionEngine.executeWithTimeout(
+        commandType,
+        commandExecution,
+        command
+      );
     } catch (error) {
       // ADR-0001: Create timeout response and store it BEFORE returning
       response = {
@@ -721,7 +724,7 @@ export class PiSessionManager implements SessionResolver {
         command: commandType,
         success: false,
         error: error instanceof Error ? error.message : String(error),
-        timedOut: true,  // Mark as timeout for debugging
+        timedOut: true, // Mark as timeout for debugging
       };
     }
 
