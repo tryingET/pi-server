@@ -837,14 +837,26 @@ export class PiSessionManager implements SessionResolver {
           };
         }
 
-        case "get_metrics":
+        case "get_metrics": {
+          const governorMetrics = this.governor.getMetrics();
+          const replayStats = this.replayStore.getStats();
+          const versionStats = this.versionStore.getStats();
+          const executionStats = this.executionEngine.getStats();
           return {
             id,
             type: "response",
             command: "get_metrics",
             success: true,
-            data: this.governor.getMetrics(),
+            data: {
+              ...governorMetrics,
+              stores: {
+                replay: replayStats,
+                version: versionStats,
+                execution: executionStats,
+              },
+            },
           };
+        }
 
         case "health_check": {
           const health = this.governor.isHealthy();

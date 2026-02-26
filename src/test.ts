@@ -187,6 +187,32 @@ async function testValidation() {
     );
   });
 
+  await test("validation: dependsOn bounds enforced", () => {
+    // Create an array that exceeds MAX_DEPENDENCIES (32)
+    const tooManyDeps = Array.from({ length: 50 }, (_, i) => `dep-${i}`);
+    const errors = validateCommand({
+      type: "list_sessions",
+      id: "cmd-1",
+      dependsOn: tooManyDeps,
+    });
+    assert(
+      errors.some((e) => e.field === "dependsOn" && e.message.includes("Too many")),
+      "Should reject too many dependencies"
+    );
+  });
+
+  await test("validation: dependsOn elements must be non-empty strings", () => {
+    const errors = validateCommand({
+      type: "list_sessions",
+      id: "cmd-1",
+      dependsOn: ["valid", "", "also-valid"],
+    });
+    assert(
+      errors.some((e) => e.field === "dependsOn[1]" && e.message.includes("non-empty")),
+      "Should reject empty string in dependsOn"
+    );
+  });
+
   await test("validation: validates idempotency key type", () => {
     const errors = validateCommand({
       type: "list_sessions",
@@ -1215,6 +1241,40 @@ async function testSessionManager() {
     await manager.initiateShutdown(1000);
 
     assert.strictEqual(manager.isInShutdown(), true, "In shutdown after initiateShutdown");
+  });
+
+  // Test: get_metrics includes store stats (ADR-0001 observability)
+  await test("session-manager: get_metrics includes store stats", async () => {
+    const manager = new PiSessionManager();
+
+    // Create a session
+    await manager.executeCommand({ type: "create_session", sessionId: "metrics-test" });
+
+    // Execute a command
+    await manager.executeCommand({ type: "list_sessions" });
+
+    // Get metrics
+    const response = await manager.executeCommand({ type: "get_metrics" });
+    assert.strictEqual(response.success, true, "get_metrics should succeed");
+
+    const data = (response as any).data;
+    assert.ok(data.stores, "Should have stores object");
+    assert.ok(data.stores.replay, "Should have replay store stats");
+    assert.ok(data.stores.version, "Should have version store stats");
+    assert.ok(data.stores.execution, "Should have execution store stats");
+
+    // Verify replay store has expected fields
+    assert.strictEqual(typeof data.stores.replay.inFlightCount, "number");
+    assert.strictEqual(typeof data.stores.replay.outcomeCount, "number");
+    assert.strictEqual(typeof data.stores.replay.idempotencyCacheSize, "number");
+    assert.strictEqual(typeof data.stores.replay.maxInFlightCommands, "number");
+    assert.strictEqual(typeof data.stores.replay.maxCommandOutcomes, "number");
+
+    // Verify version store has session
+    assert.strictEqual(data.stores.version.sessionCount, 1, "Should have 1 session");
+
+    // Cleanup
+    await manager.executeCommand({ type: "delete_session", sessionId: "metrics-test" });
   });
 
   // Test: disposeAllSessions

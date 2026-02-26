@@ -349,6 +349,29 @@ All stores have bounded memory:
 | `commandOutcomes` | 2,000 entries | `maxCommandOutcomes` |
 | `idempotencyCache` | TTL-based | `idempotencyTtlMs` (10 min) |
 | `laneTails` | Auto-cleanup | Tasks delete on completion |
+| `dependsOn` array | 32 entries | `MAX_DEPENDENCIES` in validation.ts |
+
+### Validation Order (Critical)
+
+Validation happens in this order to prevent abuse:
+
+1. **Structural validation** — Field types, required fields, bounds (validation.ts)
+2. **Replay check** — Free O(1) lookup, no rate limit charged
+3. **Rate limiting** — Only for NEW executions
+4. **Semantic validation** — Dependency existence, version checks (inside lane)
+
+**Why failed commands consume rate limit:** This prevents gaming the system by sending commands that will fail (e.g., with typos in `dependsOn`). The command WAS executed — it just failed.
+
+### Observability
+
+Store stats are available via `get_metrics`:
+
+```typescript
+const response = await executeCommand({ type: "get_metrics" });
+// response.data.stores.replay.{inFlightCount, outcomeCount, ...}
+// response.data.stores.version.{sessionCount}
+// response.data.stores.execution.{laneCount}
+```
 
 ---
 

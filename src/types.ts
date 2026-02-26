@@ -168,6 +168,23 @@ export type ServerResponse =
           globalCount: number;
           globalLimit: number;
         };
+        /** Store stats for observability (ADR-0001) */
+        stores: {
+          replay: {
+            inFlightCount: number;
+            outcomeCount: number;
+            idempotencyCacheSize: number;
+            maxInFlightCommands: number;
+            maxCommandOutcomes: number;
+            inFlightRejections: number;
+          };
+          version: {
+            sessionCount: number;
+          };
+          execution: {
+            laneCount: number;
+          };
+        };
       };
     })
   | (RpcResponseBase & {
