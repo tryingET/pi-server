@@ -123,6 +123,9 @@ In this case: static was correct, dynamic was dead code.
 | **Track errors, don't mask** | Count negative-count errors instead of silent reset | `doubleUnregisterErrors` |
 | **Subscribe after success** | Subscribe to session only after command succeeds | `switch_session` handler |
 | **Server ready on connect** | Send server_ready to each new WebSocket connection | `setupWebSocket()` |
+| **Test isolation via withFreshServer** | Each test suite gets fresh server instance | `test-integration.ts` |
+| **Safe port allocation via get-port** | Avoid port collisions in tests | `test-integration.ts` |
+| **Event-based server readiness** | Wait for actual connection, not sleep | `waitForServerReady()` |
 
 ---
 
