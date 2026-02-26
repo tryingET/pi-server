@@ -915,7 +915,11 @@ async function testSessionManager() {
     assert.notStrictEqual(second.replayed, true, "Expired idempotency entry should not replay");
   });
 
-  await test("session-manager: replay after timeout reflects eventual command result", async () => {
+  await test("session-manager: replay after timeout returns SAME timeout response (ADR-0001)", async () => {
+    // ADR-0001: Same command ID must ALWAYS return the same response.
+    // If a command times out, the timeout response IS the final response.
+    // Late completion does NOT update the stored outcome.
+
     const localManager = new PiSessionManager(undefined, {
       defaultCommandTimeoutMs: 10,
       shortCommandTimeoutMs: 10,
@@ -930,7 +934,7 @@ async function testSessionManager() {
       commandType: string
     ) => {
       if (commandType === "list_sessions") {
-        await new Promise((resolve) => setTimeout(resolve, 40));
+        await new Promise((resolve) => setTimeout(resolve, 40)); // Takes longer than timeout
         return {
           id,
           type: "response",
@@ -948,19 +952,23 @@ async function testSessionManager() {
     });
     assert.strictEqual(first.success, false, "Initial caller should time out");
     assert(first.error?.includes("timed out"), `Expected timeout error, got: ${first.error}`);
+    assert.strictEqual(first.timedOut, true, "Should have timedOut flag");
 
     await new Promise((resolve) => setTimeout(resolve, 70));
 
+    // ADR-0001: Replay returns the SAME timeout response (idempotency invariant)
     const second = await localManager.executeCommand({
       id: "timeout-replay",
       type: "list_sessions",
     });
     assert.strictEqual(
       second.success,
-      true,
-      "Replay should reflect eventual successful completion"
+      false,
+      "Replay should return SAME timeout response (ADR-0001 invariant)"
     );
+    assert(second.error?.includes("timed out"), "Replay should have timeout error");
     assert.strictEqual(second.replayed, true, "Second response should be replayed");
+    assert.strictEqual(second.timedOut, true, "Replay should have timedOut flag");
   });
 
   await test("session-manager: failed commands consume rate limit (no refund)", async () => {
