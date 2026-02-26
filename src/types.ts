@@ -125,6 +125,8 @@ export interface RpcResponseBase {
   sessionVersion?: number;
   /** True when response was replayed from idempotency/duplicate-command cache. */
   replayed?: boolean;
+  /** True when the response is due to a timeout (ADR-0001: timeout IS a response). */
+  timedOut?: boolean;
 }
 
 // Server command responses
@@ -344,6 +346,32 @@ export type RpcBroadcast =
 export interface Subscriber {
   send: (data: string) => void;
   subscribedSessions: Set<string>;
+}
+
+// ============================================================================
+// SESSION RESOLVER
+// ============================================================================
+
+import type { AgentSession } from "@mariozechner/pi-coding-agent";
+
+/**
+ * Interface for resolving sessions by ID.
+ *
+ * This is the NEXUS abstraction - a clean seam that enables:
+ * - Test doubles for unit testing without real AgentSession
+ * - Future multi-server clustering (resolver over RPC)
+ * - Session migration between servers
+ * - Dependency injection for cleaner architecture
+ *
+ * Implementations must be idempotent: calling getSession multiple times
+ * with the same ID returns the same session (or undefined consistently).
+ */
+export interface SessionResolver {
+  /**
+   * Get a session by ID.
+   * @returns The session if it exists, undefined otherwise.
+   */
+  getSession(sessionId: string): AgentSession | undefined;
 }
 
 // ============================================================================

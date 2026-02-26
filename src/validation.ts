@@ -12,6 +12,8 @@ export interface ValidationError {
   message: string;
 }
 
+import { SYNTHETIC_ID_PREFIX } from "./command-replay-store.js";
+
 const MAX_PROMPT_MESSAGE_LENGTH = 200_000;
 const MAX_BASH_COMMAND_LENGTH = 20_000;
 const MAX_SESSION_NAME_LENGTH = 256;
@@ -25,6 +27,14 @@ function hasControlCharacters(value: string): boolean {
     if (code <= 31 || code === 127) return true;
   }
   return false;
+}
+
+/**
+ * Check if a command ID uses a reserved prefix.
+ * Client-provided IDs starting with reserved prefixes are rejected.
+ */
+function isReservedIdPrefix(id: string): boolean {
+  return id.startsWith(SYNTHETIC_ID_PREFIX);
 }
 
 const EXTENSION_UI_RESPONSE_METHODS = new Set([
@@ -107,6 +117,8 @@ export function validateCommand(command: unknown): ValidationError[] {
     errors.push({ field: "id", message: "Must be a non-empty string if provided" });
   } else if (typeof cmd.id === "string" && cmd.id.length > MAX_COMMAND_ID_LENGTH) {
     errors.push({ field: "id", message: `Too long (max ${MAX_COMMAND_ID_LENGTH} chars)` });
+  } else if (typeof cmd.id === "string" && isReservedIdPrefix(cmd.id)) {
+    errors.push({ field: "id", message: `Cannot use reserved prefix '${SYNTHETIC_ID_PREFIX}'` });
   }
 
   if ("idempotencyKey" in cmd) {
