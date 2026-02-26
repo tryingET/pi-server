@@ -1,212 +1,45 @@
-# pi-app-server
+# pi-server
 
-A deterministic session multiplexer for [@mariozechner/pi-coding-agent](https://github.com/badlogic/pi-mono).
-It exposes many independent `AgentSession`s through two transports:
+Session multiplexer for [pi-coding-agent](https://www.npmjs.com/package/@mariozechner/pi-coding-agent). Exposes N independent `AgentSession` instances through WebSocket and stdio transports.
 
-- **WebSocket** (`ws://localhost:3141` by default)
-- **stdio** (JSON Lines on stdin/stdout)
+[![CI](https://github.com/tryingET/pi-server/actions/workflows/ci.yml/badge.svg)](https://github.com/tryingET/pi-server/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/pi-app-server.svg)](https://www.npmjs.com/package/pi-app-server)
 
-> **Design thesis:** the protocol is the architecture.
+## Features
 
-### Quick navigation
-
-- [Run](#run)
-- [Protocol Overview](#protocol-overview)
-- [Supported Commands](#supported-commands)
-- [Ordering and Determinism Guarantees](#ordering-and-determinism-guarantees)
-- [Normative Client Contract (MUST/SHOULD)](#normative-client-contract-mustshould)
-- [Architecture](#architecture)
-- [Non-goals](#non-goals)
-- [Documentation map](#documentation-map)
-
----
-
-## Acknowledgments
-
-This project began with a conversation between [@SIGKITTEN](https://x.com/SIGKITTEN) and [@badlogicgames](https://x.com/badlogicgames) on [X/Twitter](https://x.com/SIGKITTEN/status/2026755645592961160).
-
----
+- **Dual transport**: WebSocket (port 3141) + stdio (JSON lines)
+- **Session lifecycle**: Create, delete, list, switch sessions
+- **Command execution**: Deterministic lane serialization per session
+- **Idempotent replay**: Atomic outcome storage with free replay lookups
+- **Optimistic concurrency**: Session versioning for conflict detection
+- **Extension UI**: Full round-trip support for `select`, `confirm`, `input`, `editor`, `interview`
+- **Resource governance**: Rate limiting, session limits, message size limits
+- **Graceful shutdown**: Drain in-flight commands, notify clients
+- **Protocol versioning**: `serverVersion` + `protocolVersion` for compatibility checks
 
 ## Installation
 
 ```bash
-npm install
-npm run build
+npm install pi-app-server
 ```
 
----
-
-## Run
-
-```bash
-node dist/server.js
-```
-
-- Default WebSocket port: `3141`
-- Override with `PI_SERVER_PORT`
-
----
-
-## Protocol Overview
-
-All inbound commands and outbound responses/events are JSON objects sent as JSON Lines.
-
-For the normative wire contract, see **`PROTOCOL.md`**.
-
-### Command Envelope (optional causal fields)
-
-Any command may include:
-
-- `id: string` — command identity (strongly recommended)
-- `dependsOn: string[]` — command IDs that must succeed first
-- `ifSessionVersion: number` — optimistic concurrency precondition
-- `idempotencyKey: string` — replay-safe retry key
-
-Responses may include:
-
-- `sessionVersion: number` — monotonic per-session version after success
-- `replayed: true` — response served from replay cache/history
-
-### Replay and conflict semantics
-
-- Same `id`, same fingerprint → replay prior outcome.
-- Same `id`, different fingerprint → reject with conflict error.
-- Same `idempotencyKey`, different fingerprint → reject with conflict error.
-
-A “fingerprint” is semantic command equivalence (excluding retry identity).
-
----
-
-## Supported Commands
-
-### Server commands (session registry)
-
-| Command | Description |
-|---|---|
-| `{"type":"list_sessions"}` | List active sessions |
-| `{"type":"create_session","sessionId":"..."}` | Create session |
-| `{"type":"delete_session","sessionId":"..."}` | Delete session |
-| `{"type":"switch_session","sessionId":"..."}` | Subscribe caller to session events |
-| `{"type":"get_metrics"}` | Return governor/system metrics |
-| `{"type":"health_check"}` | Return health summary |
-
-### Session commands (AgentSession passthrough)
-
-| Command | Description |
-|---|---|
-| `{"type":"prompt","sessionId":"...","message":"..."}` | Prompt model |
-| `{"type":"steer","sessionId":"...","message":"..."}` | Queue steering input |
-| `{"type":"follow_up","sessionId":"...","message":"..."}` | Continue with follow-up |
-| `{"type":"abort","sessionId":"..."}` | Abort active operation |
-| `{"type":"get_state","sessionId":"..."}` | Session state snapshot |
-| `{"type":"get_messages","sessionId":"..."}` | Session transcript |
-| `{"type":"set_model","sessionId":"...","provider":"...","modelId":"..."}` | Switch model |
-| `{"type":"compact","sessionId":"..."}` | Compact context |
-| `...` | See `src/types.ts` for the full command surface |
-
----
-
-## Events
-
-### Session-scoped agent events
-
-Broadcast only to subscribers of that session:
-
-```json
-{"type":"event","sessionId":"my-session","event":{"type":"agent_start"}}
-{"type":"event","sessionId":"my-session","event":{"type":"message_update"}}
-{"type":"event","sessionId":"my-session","event":{"type":"agent_end"}}
-```
-
-### Global lifecycle events
-
-Broadcast for admitted commands:
-
-```json
-{"type":"command_accepted","data":{"commandId":"cmd-1","commandType":"prompt","sessionId":"s1"}}
-{"type":"command_started","data":{"commandId":"cmd-1","commandType":"prompt","sessionId":"s1"}}
-{"type":"command_finished","data":{"commandId":"cmd-1","commandType":"prompt","sessionId":"s1","success":true,"sessionVersion":12}}
-```
-
----
-
-## Ordering and Determinism Guarantees
-
-### 1) Admission gate
-
-`command_accepted` is emitted only after validation and shutdown checks pass.
-Commands rejected before admission do not emit lifecycle events.
-
-### 2) Per-request phase order
-
-For each admitted request:
-
-1. `command_accepted`
-2. `command_started` (if execution begins)
-3. `command_finished` (exactly once)
-
-### 3) Lane serialization
-
-Commands execute in deterministic lanes:
-
-- `session:<sessionId>` for session-targeted commands
-- `server` for server-level commands
-
-Within a lane, execution is serialized.
-Across lanes, event interleaving is allowed (no global total order).
-
-### 4) Replay shape
-
-Replay hits emit:
-
-- `command_accepted`
-- `command_finished` (`replayed: true`)
-
-Replay responses do not emit `command_started`.
-
-### 5) Timeout edge behavior
-
-A caller may receive timeout while underlying execution continues.
-A later duplicate-id replay returns the eventual terminal outcome.
-
----
-
-## Normative Client Contract (MUST/SHOULD)
-
-- Clients **MUST** treat `id` as unique per logical command intent.
-- Clients **MUST NOT** reuse an `id` for a semantically different payload.
-- Retrying clients **SHOULD** include both `id` and `idempotencyKey`.
-- Clients **MUST** handle conflict errors for fingerprint-mismatched `id`/`idempotencyKey` reuse.
-- Clients **MUST** treat `sessionVersion` as authoritative for concurrency control.
-- Clients issuing mutating session commands **SHOULD** use `ifSessionVersion`.
-- Clients **MUST NOT** assume global total ordering of lifecycle events across lanes.
-- Timeout responses **SHOULD** be treated as indeterminate completion and reconciled via replay/inspection.
-
----
-
-## Examples
+## Quick Start
 
 ### WebSocket
 
+```bash
+# Start server
+npx pi-server
+
+# Connect with wscat
+wscat -c ws://localhost:3141
+```
+
 ```js
-const ws = new WebSocket("ws://localhost:3141");
-
-ws.onopen = () => {
-  ws.send(JSON.stringify({ type: "create_session", sessionId: "test" }));
-  ws.send(JSON.stringify({ type: "switch_session", sessionId: "test" }));
-  ws.send(
-    JSON.stringify({
-      id: "cmd-1",
-      type: "prompt",
-      sessionId: "test",
-      message: "Hello!",
-    })
-  );
-};
-
-ws.onmessage = (event) => {
-  console.log(JSON.parse(event.data));
-};
+// Create and use a session
+ws> {"type":"create_session","sessionId":"my-session"}
+ws> {"type":"switch_session","sessionId":"my-session"}
+ws> {"id":"cmd-1","type":"prompt","sessionId":"my-session","message":"Hello!"}
 ```
 
 ### stdio
@@ -214,14 +47,12 @@ ws.onmessage = (event) => {
 ```bash
 echo '{"type":"create_session","sessionId":"test"}
 {"type":"switch_session","sessionId":"test"}
-{"id":"cmd-1","type":"prompt","sessionId":"test","message":"Hello!"}' | node dist/server.js
+{"id":"cmd-1","type":"prompt","sessionId":"test","message":"Hello!"}' | npx pi-server
 ```
-
----
 
 ## Architecture
 
-```text
+```
 src/
 ├── server.ts               # transports, connection lifecycle, routing glue
 ├── session-manager.ts      # orchestration: coordinates stores, engines, sessions
@@ -232,6 +63,7 @@ src/
 ├── command-execution-engine.ts # lane serialization, dependency waits, timeouts
 ├── resource-governor.ts    # limits, rate controls, health/metrics
 ├── extension-ui.ts         # pending UI request tracking
+├── server-ui-context.ts    # ExtensionUIContext for remote clients
 ├── validation.ts           # command validation
 └── types.ts                # wire protocol types + SessionResolver interface
 ```
@@ -251,32 +83,110 @@ src/
 - **`SessionVersionStore`** — Optimistic concurrency via version counters
 - **`CommandExecutionEngine`** — Deterministic lane serialization and timeout management
 
-See `ROADMAP.md` for phase tracking and next milestones.
+## Protocol
 
----
+See [PROTOCOL.md](./PROTOCOL.md) for the normative wire contract.
 
-## Non-goals
+### Command → Response
 
-Deliberately out of scope:
+Every command receives exactly one response:
 
-| Non-goal | Why |
-|---|---|
-| Authentication/authorization | Deployment boundary concern |
-| TLS termination | Better handled by edge proxy |
-| Horizontal clustering | Requires external session affinity design |
-| HTTP transport surface | WebSocket + stdio are sufficient for this layer |
-| Durable command journal/replay engine | Tracked as a future roadmap phase |
+```json
+{"id": "cmd-1", "type": "prompt", "sessionId": "s1", "message": "hello"}
+{"id": "cmd-1", "type": "response", "command": "prompt", "success": true}
+```
 
----
+### Event Broadcast
 
-## Documentation map
+Events flow session → subscribers:
 
-- `docs/quickstart.md` — shortest path from install to verified running server
-- `docs/client-guide.md` — practical integration and retry/concurrency guidance
-- `PROTOCOL.md` — normative wire contract (MUST/SHOULD semantics)
-- `ROADMAP.md` — execution plan, gates, and open decisions
+```json
+{"type": "event", "sessionId": "s1", "event": {"type": "agent_start", ...}}
+```
 
----
+### Extension UI Round-Trip
+
+1. Extension calls `ui.select()` → server creates pending request
+2. Server broadcasts `extension_ui_request` event with `requestId`
+3. Client sends `extension_ui_response` command with same `requestId`
+4. Server resolves pending promise → extension continues
+
+### Idempotency & Replay
+
+```json
+// First request with idempotency key
+{"id": "cmd-1", "type": "list_sessions", "idempotencyKey": "key-1"}
+{"id": "cmd-1", "type": "response", "command": "list_sessions", "success": true, ...}
+
+// Retry with same key → replayed (free, no rate limit charge)
+{"id": "cmd-2", "type": "list_sessions", "idempotencyKey": "key-1"}
+{"id": "cmd-2", "type": "response", "command": "list_sessions", "success": true, "replayed": true, ...}
+```
+
+### Timeout semantics (ADR-0001)
+
+- Timeout is a **terminal stored outcome** (`timedOut: true`), not an indeterminate placeholder.
+- Replay of the same command identity returns the **same timeout response**.
+- Late underlying completion does **not** overwrite the stored timeout outcome.
+
+## Development
+
+```bash
+# Install dependencies
+npm install
+
+# Build
+npm run build
+
+# Run tests
+npm test                    # Unit tests (83)
+npm run test:integration    # Integration tests (26)
+npm run test:fuzz           # Fuzz tests (17)
+
+# Module tests (141)
+node --experimental-vm-modules dist/test-command-classification.js
+node --experimental-vm-modules dist/test-session-version-store.js
+node --experimental-vm-modules dist/test-command-replay-store.js
+node --experimental-vm-modules dist/test-command-execution-engine.js
+
+# Type check + lint
+npm run check
+
+# Full CI
+npm run ci
+```
+
+## Release Process
+
+This project uses [release-please](https://github.com/googleapis/release-please) for automated versioning.
+
+### Automated Flow
+
+1. Push to `main` → release-please creates/updates a release PR
+2. Merge the release PR → Creates GitHub release + git tag
+3. Release published → GitHub Action publishes to npm with provenance
+
+### Manual Release Check
+
+```bash
+npm run release:check
+```
+
+This validates:
+- `package.json` has required fields
+- `dist/` exists with compiled files
+- Entry point has correct shebang
+- `npm pack` produces expected files
+- Full CI passes
+
+## Documentation
+
+| Document | Purpose |
+|----------|---------|
+| [AGENTS.md](./AGENTS.md) | Crystallized learnings, patterns, anti-patterns |
+| [PROTOCOL.md](./PROTOCOL.md) | Normative wire contract |
+| [ADR-0001](./docs/adr/0001-atomic-outcome-storage.md) | Atomic outcome storage decision |
+| [ROADMAP.md](./ROADMAP.md) | Phase tracking and milestones |
 
 ## License
 

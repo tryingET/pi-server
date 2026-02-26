@@ -33,10 +33,12 @@ When retrying due to network issues/timeouts, reuse:
 - the same `idempotencyKey`
 - the same semantic payload
 
-### Treat timeout as indeterminate completion
+### Treat timeout as terminal for that command identity
 
-A timeout response does not guarantee rollback.
-Reconcile by replaying the same command identity and inspecting terminal outcome.
+A timeout response (`timedOut: true`) is a stored terminal outcome for that command ID.
+Replay of the same identity will return the same timeout response.
+
+If you want a fresh execution attempt, issue a **new** command identity (`id`, optional `idempotencyKey`).
 
 ---
 
@@ -81,9 +83,11 @@ Important:
 
 1. Generate `id` + `idempotencyKey`.
 2. Send command.
-3. If transport fails or timeout occurs, retry with same identities and same payload.
-4. If response has `replayed: true`, treat as canonical prior result.
-5. If conflict error appears, stop retrying and escalate (identity misuse).
+3. If transport fails, retry with same identities and same payload.
+4. If timeout occurs, replay once with same identities to confirm canonical timeout outcome.
+5. If a fresh execution is needed after timeout, send a new command identity.
+6. If response has `replayed: true`, treat as canonical prior result.
+7. If conflict error appears, stop retrying and escalate (identity misuse).
 
 ---
 
@@ -109,7 +113,7 @@ Important:
 - **Conflict error for `idempotencyKey`** → key reused with changed payload.
 - **Version mismatch** → stale client state; refresh `sessionVersion`.
 - **Dependency unknown/failed** → upstream command missing or failed; repair chain.
-- **Timeout** → unknown completion; reconcile with replay.
+- **Timeout** → terminal for that command identity; replay confirms same timeout, use new ID for fresh attempt.
 
 ---
 

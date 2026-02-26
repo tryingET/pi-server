@@ -234,14 +234,16 @@ When present:
 
 ## 11. Timeout semantics
 
-A caller MAY receive timeout while underlying execution still completes.
+Timeout is a **terminal stored outcome**.
 
 Implications:
 
-- Timeout is caller-visible timeout, not guaranteed rollback.
-- Later duplicate-id replay SHOULD return eventual terminal outcome.
+- A timeout response is returned with `timedOut: true`.
+- The timeout response is stored as the command outcome before return.
+- Later duplicate-id replay MUST return the same timeout response.
+- Late underlying completion MUST NOT overwrite the stored timeout outcome.
 
-Clients SHOULD treat timeout as indeterminate completion and reconcile via replay/inspection.
+Clients SHOULD treat timeout as a deterministic failed outcome for that command identity and issue a new command identity if they want a fresh execution attempt.
 
 ---
 
@@ -275,7 +277,7 @@ Conformant clients:
 5. **MUST** treat `sessionVersion` as authoritative concurrency state.
 6. **SHOULD** use `ifSessionVersion` for mutating writes.
 7. **MUST NOT** assume total order across lanes.
-8. **SHOULD** reconcile timeout outcomes via replay/inspection.
+8. **MUST** treat timeout outcomes as terminal for that command identity.
 
 ---
 

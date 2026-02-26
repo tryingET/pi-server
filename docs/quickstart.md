@@ -55,9 +55,25 @@ echo '{"id":"1","type":"create_session","sessionId":"demo"}
 ## 5) Run tests
 
 ```bash
+npm run check
 npm test
 npm run test:integration
-npm run check
+npm run test:fuzz
+```
+
+Optional module tests:
+
+```bash
+node --experimental-vm-modules dist/test-command-classification.js
+node --experimental-vm-modules dist/test-session-version-store.js
+node --experimental-vm-modules dist/test-command-replay-store.js
+node --experimental-vm-modules dist/test-command-execution-engine.js
+```
+
+Release validation:
+
+```bash
+npm run release:check
 ```
 
 ---

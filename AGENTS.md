@@ -100,6 +100,7 @@ if (!this.governor.canExecuteCommand(sessionId)) {
 | `command-execution-engine.ts` | Lane serialization, dependency waits, timeouts | Storage |
 | `extension-ui.ts` | Pending UI request tracking | Command handling, transport |
 | `types.ts` | Protocol definitions | Implementation |
+| `validation.ts` | Command validation, reserved ID enforcement | Execution logic |
 
 ---
 
@@ -169,7 +170,7 @@ Events flow one direction: session → subscribers with sessionId prepended:
 { type: "agent_start", ... }
 
 // Broadcast to subscribers
-{ type: "event", sessionId: "s1", event: { type: "agent_start", ... } }
+{ type: "event", "sessionId": "s1", "event": { type: "agent_start", ... } }
 ```
 
 ### Extension UI Round-Trip
@@ -225,12 +226,12 @@ Custom handlers override defaults for the same command type. This enables:
 
 ### Synthetic Command IDs
 
-When clients omit `id`, the server generates synthetic IDs: `anon:<sequence>`
+When clients omit `id`, the server generates synthetic IDs: `anon:<timestamp>:<sequence>`
 
-**Why no timestamp?**
-1. Sequence alone guarantees uniqueness within process lifetime
-2. Timestamps are misleading — they don't provide ordering across restarts
-3. Simpler format is easier to debug and log
+**Why timestamp + sequence?**
+1. Timestamp distinguishes IDs across server restarts
+2. Sequence guarantees uniqueness within a process lifetime
+3. Clear() doesn't reset sequence — timestamp prevents collisions
 
 ---
 
@@ -332,10 +333,10 @@ cat /tmp/test.jsonl | timeout 5 node dist/server.js | jq .
 | ~~No input validation~~ | validation.ts | **FIXED** |
 | ~~No command timeout~~ | command-execution-engine.ts | **FIXED** |
 | ~~Extension UI not wired~~ | session-manager.ts | **FIXED** |
-| ~~Unbounded in-flight commands~~ | command-replay-store.ts | **FIXED** - bounded with eviction |
+| ~~Unbounded in-flight commands~~ | command-replay-store.ts | **FIXED** - bounded with rejection |
 | ~~Lane tail memory leak~~ | command-execution-engine.ts | **FIXED** - correct promise comparison |
 | ~~No reserved ID validation~~ | validation.ts | **FIXED** - `anon:` prefix rejected |
-| ~~No store metrics~~ | All stores | **FIXED** - `getStats()` added |
+| ~~No store metrics~~ | All stores | **FIXED** - `getStats()` added + wired to `get_metrics` |
 
 ---
 
@@ -408,31 +409,17 @@ Fuzz test coverage:
 - Dependency chain timeout handling
 - Replay semantics under concurrent access
 
-### Key Test Patterns
+### Running All Tests
 
-1. **Mock SessionResolver for unit tests:**
-```typescript
-function createMockSessionResolver(sessions: Map<string, Partial<AgentSession>>): SessionResolver {
-  return {
-    getSession(sessionId: string) {
-      return sessions.get(sessionId) as AgentSession | undefined;
-    },
-  };
-}
-```
-
-2. **Test replay semantics with fingerprint edge cases:**
-```typescript
-// Same semantic command, different retry identity → should replay, not conflict
-const cmd1 = { id: "cmd-1", type: "get_state", sessionId: "s1" };
-const cmd2 = { id: "cmd-1", type: "get_state", sessionId: "s1", idempotencyKey: "retry" };
-assert.strictEqual(store.getCommandFingerprint(cmd1), store.getCommandFingerprint(cmd2));
-```
-
-3. **Test lane serialization:**
-```typescript
-// Commands in same lane execute sequentially
-// Commands in different lanes execute concurrently
+```bash
+npm test                    # 83 unit tests
+npm run test:integration   # 26 integration tests
+npm run test:fuzz          # 17 fuzz tests
+# Module tests (141 total)
+node --experimental-vm-modules dist/test-command-classification.js
+node --experimental-vm-modules dist/test-session-version-store.js
+node --experimental-vm-modules dist/test-command-replay-store.js
+node --experimental-vm-modules dist/test-command-execution-engine.js
 ```
 
 ---
@@ -452,6 +439,54 @@ echo '{"type":"list_sessions"}' | node dist/server.js 2>/dev/null | jq .
 # See all events
 echo '{"type":"create_session","sessionId":"test"}' | timeout 5 node dist/server.js 2>&1 | jq .
 ```
+
+---
+
+## Release Process
+
+pi-server uses [release-please](https://github.com/googleapis/release-please) for automated versioning and [npm trusted publishing](https://docs.npmjs.com/generating-provenance-statements) for secure releases.
+
+### Automated Release Flow
+
+```
+Push to main → release-please creates/updates release PR
+Merge release PR → Creates GitHub release + tag (vX.Y.Z)
+Release published → publish.yml triggers → npm publish --provenance
+```
+
+### Release Commands
+
+```bash
+# Pre-release validation
+npm run release:check
+
+# Manual publish (if needed)
+npm publish --provenance --access public
+```
+
+### What `release:check` Validates
+
+1. `package.json` has required fields (`repository`, `files`)
+2. `dist/` exists with compiled files
+3. Entry point has correct shebang (`#!/usr/bin/env node`)
+4. `npm pack --dry-run` produces expected file list
+5. `npm publish --dry-run` succeeds
+6. Full CI passes (typecheck, lint, build, test)
+
+### GitHub Workflows
+
+| Workflow | Trigger | Purpose |
+|----------|--------|---------|
+| `ci.yml` | Push/PR to main | Full CI (typecheck, lint, build, test) |
+| `release-please.yml` | Push to main | Creates/updates release PR |
+| `publish.yml` | Release published | Publishes to npm with provenance |
+
+### First-time Setup
+
+1. Configure OIDC trusted publishing in npm:
+   - Go to npm package settings → Trusted Publishing
+   - Add GitHub repository: `tryingET/pi-server`
+2. (Optional) Create `npm-publish` environment in GitHub for deployment protection
 
 ---
 
