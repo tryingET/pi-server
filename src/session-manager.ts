@@ -950,7 +950,10 @@ export class PiSessionManager {
           return conflict;
         }
 
-        const replayed = this.cloneResponseForRequest({ ...completed.response, replayed: true }, id);
+        const replayed = this.cloneResponseForRequest(
+          { ...completed.response, replayed: true },
+          id
+        );
         this.broadcastCommandLifecycle("command_finished", {
           commandId,
           commandType,

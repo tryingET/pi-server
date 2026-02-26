@@ -921,14 +921,24 @@ async function testSessionManager() {
       return originalExecuteInternal(command, id, commandType);
     };
 
-    const first = await localManager.executeCommand({ id: "timeout-replay", type: "list_sessions" });
+    const first = await localManager.executeCommand({
+      id: "timeout-replay",
+      type: "list_sessions",
+    });
     assert.strictEqual(first.success, false, "Initial caller should time out");
     assert(first.error?.includes("timed out"), `Expected timeout error, got: ${first.error}`);
 
     await new Promise((resolve) => setTimeout(resolve, 70));
 
-    const second = await localManager.executeCommand({ id: "timeout-replay", type: "list_sessions" });
-    assert.strictEqual(second.success, true, "Replay should reflect eventual successful completion");
+    const second = await localManager.executeCommand({
+      id: "timeout-replay",
+      type: "list_sessions",
+    });
+    assert.strictEqual(
+      second.success,
+      true,
+      "Replay should reflect eventual successful completion"
+    );
     assert.strictEqual(second.replayed, true, "Second response should be replayed");
   });
 
@@ -1013,7 +1023,10 @@ async function testSessionManager() {
 
   // Test: Switch session
   await test("session-manager: switches session", async () => {
-    const created = await manager.executeCommand({ type: "create_session", sessionId: "switch-test" });
+    const created = await manager.executeCommand({
+      type: "create_session",
+      sessionId: "switch-test",
+    });
     assert.strictEqual(created.success, true, "Create should succeed");
     assert.strictEqual(created.sessionVersion, 0, "New session should start at version 0");
 
@@ -1023,7 +1036,11 @@ async function testSessionManager() {
     });
     assert.strictEqual(response.success, true, "Should succeed");
     assert.strictEqual((response as any).data.sessionInfo.sessionId, "switch-test");
-    assert.strictEqual(response.sessionVersion, 0, "switch_session should not mutate session version");
+    assert.strictEqual(
+      response.sessionVersion,
+      0,
+      "switch_session should not mutate session version"
+    );
 
     // Cleanup
     await manager.executeCommand({ type: "delete_session", sessionId: "switch-test" });
