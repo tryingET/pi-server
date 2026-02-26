@@ -1,0 +1,56 @@
+name: Publish to npm
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+jobs:
+  publish-npm:
+    # Only run for version tags (v0.1.0), not prerelease tags
+    if: startsWith(github.event.release.tag_name, 'v') && !contains(github.event.release.tag_name, '-')
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Upgrade npm for trusted publishing
+        run: npm install --global npm@^11.5.1
+
+      - name: Validate release tag matches package version
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must match vX.Y.Z format." >&2
+            exit 1
+          fi
+
+          PKG_VERSION="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
+          if [[ "v${PKG_VERSION}" != "$TAG_NAME" ]]; then
+            echo "package.json version (${PKG_VERSION}) does not match release tag (${TAG_NAME})." >&2
+            exit 1
+          fi
+
+      - name: Build
+        run: npm ci
+
+      - name: Run release checks
+        run: npm run release:check
+
+      - name: Publish to npm (OIDC + provenance)
+        run: npm publish --provenance --access public
