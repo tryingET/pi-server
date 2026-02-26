@@ -223,10 +223,17 @@ echo '{"type":"create_session","sessionId":"test"}
 
 ```text
 src/
-├── server.ts            # transports, connection lifecycle, routing glue
-├── session-manager.ts   # execution, ordering, replay, lifecycle events
-├── resource-governor.ts # limits, rate controls, health/metrics
-└── types.ts             # wire protocol types
+├── server.ts               # transports, connection lifecycle, routing glue
+├── session-manager.ts      # orchestration: coordinates stores, engines, sessions
+├── command-router.ts       # session command handlers, routing
+├── command-classification.ts  # pure command classification (timeout, mutation)
+├── command-replay-store.ts    # idempotency, duplicate detection, outcome history
+├── session-version-store.ts   # monotonic version counters per session
+├── command-execution-engine.ts # lane serialization, dependency waits, timeouts
+├── resource-governor.ts    # limits, rate controls, health/metrics
+├── extension-ui.ts         # pending UI request tracking
+├── validation.ts           # command validation
+└── types.ts                # wire protocol types + SessionResolver interface
 ```
 
 ### Core invariants
@@ -235,6 +242,14 @@ src/
 - For each session ID, there is at most one live `AgentSession`.
 - Subscriber session sets are always a subset of active sessions.
 - Session version is monotonic and mutation-sensitive.
+- Fingerprint excludes retry identity (`id`, `idempotencyKey`) for semantic equivalence.
+
+### Key abstractions
+
+- **`SessionResolver`** — Interface for session access (enables test doubles, future clustering)
+- **`CommandReplayStore`** — Idempotency and duplicate detection
+- **`SessionVersionStore`** — Optimistic concurrency via version counters
+- **`CommandExecutionEngine`** — Deterministic lane serialization and timeout management
 
 See `ROADMAP.md` for phase tracking and next milestones.
 

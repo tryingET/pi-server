@@ -10,6 +10,80 @@ This document captures patterns, anti-patterns, and gotchas discovered during de
 2. **Server should be thin** — AgentSession does the work, we just multiplex
 3. **Pass-through pattern** — Session commands are thin wrappers around AgentSession methods
 4. **Handler map > switch** — `Record<string, CommandHandler>` for O(1) dispatch, easy extension
+5. **Extract to stores** — State with independent lifecycle gets its own module
+6. **SessionResolver is the NEXUS seam** — Interface for session access enables test doubles
+
+---
+
+## ADR-0001: Atomic Outcome Storage
+
+**Status:** Accepted (2026-02-22)
+
+Full ADR: `docs/adr/0001-atomic-outcome-storage.md`
+
+### The Invariant
+
+> Same command ID must ALWAYS return the same response. Not "usually." Not "after the callback completes." ALWAYS.
+
+### Three Critical Rules
+
+1. **Store BEFORE return** — Outcomes are stored before the response is returned, not in async callbacks
+2. **Timeout IS a response** — Timeout responses are stored as valid outcomes (with `timedOut: true`)
+3. **Replay is FREE** — Replay operations are O(1) lookups, exempt from rate limiting
+
+### Code Pattern
+
+```typescript
+// WRONG: Async callback creates race condition
+commandExecution.then((response) => {
+  this.storeOutcome(commandId, response);  // After return
+});
+return withTimeout(commandExecution, ...);
+
+// CORRECT: Atomic storage before return
+let response: RpcResponse;
+try {
+  response = await executeWithTimeout(commandExecution, ...);
+} catch (error) {
+  response = { success: false, error: error.message, timedOut: true };
+}
+this.storeOutcome(commandId, response);  // BEFORE return
+return response;
+```
+
+### Reject, Don't Evict
+
+When in-flight command limit is reached, **reject new commands** instead of evicting old ones. Eviction breaks dependency chains.
+
+```typescript
+// WRONG: Eviction breaks dependencies
+if (this.inFlight.size >= max) {
+  const oldest = this.order.shift();
+  this.inFlight.delete(oldest);  // Dependent commands fail!
+}
+
+// CORRECT: Reject preserves dependencies
+if (this.inFlight.size >= max) {
+  return { success: false, error: "Server busy - please retry" };
+}
+```
+
+### Free Replay
+
+Replay reads from stored outcomes — no execution cost. Rate limiting applies only to NEW executions.
+
+```typescript
+// Check replay FIRST (free)
+const replayResult = this.replayStore.checkReplay(command, fingerprint);
+if (replayResult.found) {
+  return replayResult.response;  // No rate limit charge
+}
+
+// THEN rate limit (only for new executions)
+if (!this.governor.canExecuteCommand(sessionId)) {
+  return { success: false, error: "Rate limit exceeded" };
+}
+```
 
 ---
 
@@ -18,8 +92,12 @@ This document captures patterns, anti-patterns, and gotchas discovered during de
 | File | Responsibility | Don't Put Here |
 |------|----------------|----------------|
 | `server.ts` | Transports (WebSocket, stdio) only | Command logic, session lifecycle |
-| `session-manager.ts` | Session lifecycle, subscribers, server commands | Transport details, individual command implementations |
+| `session-manager.ts` | Orchestration: coordinates stores, engines, sessions | Direct state mutation (delegate to stores) |
 | `command-router.ts` | Session command handlers, routing | Session lifecycle, broadcast |
+| `command-classification.ts` | Pure command classification (timeout, mutation) | State, side effects |
+| `command-replay-store.ts` | Idempotency, duplicate detection, outcome history | Execution logic |
+| `session-version-store.ts` | Monotonic version counters per session | Replay semantics |
+| `command-execution-engine.ts` | Lane serialization, dependency waits, timeouts | Storage |
 | `extension-ui.ts` | Pending UI request tracking | Command handling, transport |
 | `types.ts` | Protocol definitions | Implementation |
 
@@ -100,6 +178,59 @@ Events flow one direction: session → subscribers with sessionId prepended:
 2. Server broadcasts `extension_ui_request` event with `requestId`
 3. Client sends `extension_ui_response` command with same `requestId`
 4. Server resolves pending promise → extension continues
+
+### Fingerprint Semantics (Critical)
+
+The fingerprint determines semantic equivalence for replay. **Exclude ALL retry identity fields:**
+
+```typescript
+// CORRECT: Excludes both id and idempotencyKey
+getCommandFingerprint(command: RpcCommand): string {
+  const { id: _id, idempotencyKey: _key, ...rest } = command;
+  return JSON.stringify(rest);
+}
+```
+
+**Why:** Two commands with identical semantic content but different retry identity should replay, not conflict:
+
+```typescript
+// These are SEMANTICALLY IDENTICAL (same fingerprint)
+{ id: "cmd-1", type: "get_state", sessionId: "s1" }
+{ id: "cmd-2", type: "get_state", sessionId: "s1", idempotencyKey: "retry-1" }
+
+// Both should replay the same cached outcome for the same command ID
+```
+
+**Gotcha:** If you only exclude `id` but not `idempotencyKey`, commands with different idempotency keys will have different fingerprints → conflict instead of replay.
+
+### Custom Abort Handlers
+
+The `CommandExecutionEngine` accepts custom abort handlers via options:
+
+```typescript
+const engine = new CommandExecutionEngine(replayStore, versionStore, resolver, {
+  abortHandlers: {
+    // Override default handler for prompt
+    prompt: (session) => session.abort(),
+    // Add handler for custom command type
+    custom_command: (session) => session.someAbortMethod(),
+  },
+});
+```
+
+Custom handlers override defaults for the same command type. This enables:
+- Test doubles without real AgentSession methods
+- Custom command types with specific abort behavior
+- Future extensibility for plugin commands
+
+### Synthetic Command IDs
+
+When clients omit `id`, the server generates synthetic IDs: `anon:<sequence>`
+
+**Why no timestamp?**
+1. Sequence alone guarantees uniqueness within process lifetime
+2. Timestamps are misleading — they don't provide ordering across restarts
+3. Simpler format is easier to debug and log
 
 ---
 
@@ -194,25 +325,74 @@ cat /tmp/test.jsonl | timeout 5 node dist/server.js | jq .
 
 ## Known Issues
 
-| Issue | Location | Workaround |
-|-------|----------|------------|
+| Issue | Location | Status |
+|-------|----------|--------|
 | `set_model` uses internal API | command-router.ts:67 | Document risk, investigate public API |
 | Windows path handling | command-router.ts:175 | Use `path.basename()` |
-| No input validation | All entry points | Add validation layer |
-| No command timeout | executeCommand | Add timeout wrapper |
-| Extension UI not wired | session-manager.ts | Phase 3 pending |
+| ~~No input validation~~ | validation.ts | **FIXED** |
+| ~~No command timeout~~ | command-execution-engine.ts | **FIXED** |
+| ~~Extension UI not wired~~ | session-manager.ts | **FIXED** |
+| ~~Unbounded in-flight commands~~ | command-replay-store.ts | **FIXED** - bounded with eviction |
+| ~~Lane tail memory leak~~ | command-execution-engine.ts | **FIXED** - correct promise comparison |
+| ~~No reserved ID validation~~ | validation.ts | **FIXED** - `anon:` prefix rejected |
+| ~~No store metrics~~ | All stores | **FIXED** - `getStats()` added |
+
+---
+
+## Resource Bounds
+
+All stores have bounded memory:
+
+| Store | Bound | Config |
+|-------|-------|--------|
+| `commandInFlightById` | 10,000 entries | `maxInFlightCommands` |
+| `commandOutcomes` | 2,000 entries | `maxCommandOutcomes` |
+| `idempotencyCache` | TTL-based | `idempotencyTtlMs` (10 min) |
+| `laneTails` | Auto-cleanup | Tasks delete on completion |
 
 ---
 
 ## Testing
 
-No tests exist yet. When adding tests:
+Comprehensive test suite exists. Run with `npm test`.
 
-1. Test each handler in isolation (mock AgentSession)
-2. Test session lifecycle (create/delete/list)
-3. Test subscriber management
-4. Test broadcast routing
-5. Test extension UI round-trip
+### Test Structure
+
+| File | What it tests |
+|------|---------------|
+| `test.ts` | Main test runner, validation, governor, session-manager integration |
+| `test-command-classification.ts` | Timeout/mutation classification logic |
+| `test-command-replay-store.ts` | Idempotency, fingerprinting, replay semantics |
+| `test-session-version-store.ts` | Version counters, mutation detection |
+| `test-command-execution-engine.ts` | Lane serialization, dependency waits, timeouts |
+| `test-integration.ts` | Full server tests with real WebSocket/stdio |
+
+### Key Test Patterns
+
+1. **Mock SessionResolver for unit tests:**
+```typescript
+function createMockSessionResolver(sessions: Map<string, Partial<AgentSession>>): SessionResolver {
+  return {
+    getSession(sessionId: string) {
+      return sessions.get(sessionId) as AgentSession | undefined;
+    },
+  };
+}
+```
+
+2. **Test replay semantics with fingerprint edge cases:**
+```typescript
+// Same semantic command, different retry identity → should replay, not conflict
+const cmd1 = { id: "cmd-1", type: "get_state", sessionId: "s1" };
+const cmd2 = { id: "cmd-1", type: "get_state", sessionId: "s1", idempotencyKey: "retry" };
+assert.strictEqual(store.getCommandFingerprint(cmd1), store.getCommandFingerprint(cmd2));
+```
+
+3. **Test lane serialization:**
+```typescript
+// Commands in same lane execute sequentially
+// Commands in different lanes execute concurrently
+```
 
 ---
 
