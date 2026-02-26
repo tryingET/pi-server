@@ -246,6 +246,27 @@ async function testValidation() {
     );
   });
 
+  // Test: Reserved ID prefix
+  await test("validation: rejects reserved ID prefix", () => {
+    const errors = validateCommand({
+      type: "list_sessions",
+      id: "anon:123",
+    });
+    assert(
+      errors.some((e) => e.field === "id" && e.message.includes("reserved prefix")),
+      "Should reject reserved 'anon:' prefix"
+    );
+  });
+
+  // Test: Valid custom ID (not using reserved prefix)
+  await test("validation: accepts custom ID without reserved prefix", () => {
+    const errors = validateCommand({
+      type: "list_sessions",
+      id: "my-custom-id-123",
+    });
+    assert.strictEqual(errors.length, 0, "Should have no errors");
+  });
+
   // Test: Format validation errors
   await test("validation: formatValidationErrors works", () => {
     const formatted = formatValidationErrors([
@@ -852,7 +873,7 @@ async function testSessionManager() {
     const never = new Promise<any>(() => {});
 
     // Simulate a dependency currently in-flight on a different lane.
-    (localManager as any).commandInFlightById.set("dep-stuck", {
+    (localManager as any).replayStore.commandInFlightById.set("dep-stuck", {
       commandType: "get_state",
       laneKey: "session:other",
       fingerprint: "dep-stuck-fingerprint",
@@ -942,7 +963,7 @@ async function testSessionManager() {
     assert.strictEqual(second.replayed, true, "Second response should be replayed");
   });
 
-  await test("session-manager: refunds rate limit for failed session command", async () => {
+  await test("session-manager: failed commands consume rate limit (no refund)", async () => {
     const governor = new ResourceGovernor({
       ...DEFAULT_CONFIG,
       maxCommandsPerMinute: 1,
@@ -954,10 +975,51 @@ async function testSessionManager() {
     assert.strictEqual(r1.success, false);
     assert(r1.error?.includes("not found"));
 
-    // Should not be rate limited because first failed command is refunded
+    // Second command should be rate limited (quota consumed, no refund on failure)
+    // This prevents gaming the rate limit by sending commands that will fail
     const r2 = await testManager.executeCommand({ type: "get_state", sessionId: "missing" });
     assert.strictEqual(r2.success, false);
-    assert(r2.error?.includes("not found"), "Expected not-found, not rate-limit");
+    assert(r2.error?.includes("Rate limit"), `Expected rate limit error, got: ${r2.error}`);
+  });
+
+  await test("session-manager: replay operations are FREE (ADR-0001)", async () => {
+    const governor = new ResourceGovernor({
+      ...DEFAULT_CONFIG,
+      maxCommandsPerMinute: 1, // Only 1 NEW execution allowed
+      maxGlobalCommandsPerMinute: 100,
+    });
+    const testManager = new PiSessionManager(governor);
+
+    // First command with idempotency key (consumes the 1 quota)
+    const r1 = await testManager.executeCommand({
+      type: "list_sessions",
+      idempotencyKey: "replay-test-key",
+    } as any);
+    assert.strictEqual(r1.success, true);
+
+    // First replay should work (ADR-0001: replay is FREE)
+    const r2 = await testManager.executeCommand({
+      type: "list_sessions",
+      idempotencyKey: "replay-test-key",
+    } as any);
+    assert.strictEqual(r2.success, true);
+    assert.strictEqual(r2.replayed, true, "Should be replayed");
+
+    // Second replay should ALSO work (replay is still FREE)
+    const r3 = await testManager.executeCommand({
+      type: "list_sessions",
+      idempotencyKey: "replay-test-key",
+    } as any);
+    assert.strictEqual(r3.success, true);
+    assert.strictEqual(r3.replayed, true, "Should be replayed");
+
+    // But a NEW command should be rate limited (quota exhausted)
+    const r4 = await testManager.executeCommand({
+      type: "list_sessions",
+      idempotencyKey: "different-key",
+    } as any);
+    assert.strictEqual(r4.success, false);
+    assert(r4.error?.includes("Rate limit"), `Expected rate limit error, got: ${r4.error}`);
   });
 
   // Test: Create and delete session (integration test)
