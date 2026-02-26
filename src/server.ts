@@ -170,6 +170,21 @@ export class PiServer {
         subscribedSessions: new Set(),
       };
 
+      // Send server_ready to new connection
+      const readyEvent: RpcBroadcast = {
+        type: "server_ready",
+        data: {
+          serverVersion: SERVER_VERSION,
+          protocolVersion: PROTOCOL_VERSION,
+          transports: ["websocket", "stdio"],
+        },
+      };
+      try {
+        ws.send(JSON.stringify(readyEvent));
+      } catch {
+        // Send failed, connection will be cleaned up
+      }
+
       this.sessionManager.addSubscriber(subscriber);
 
       ws.on("message", async (data: Buffer) => {

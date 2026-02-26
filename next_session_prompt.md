@@ -28,11 +28,12 @@ src/
 ├── extension-ui.ts      (4.0kb) — pending UI request tracking + type guards
 ├── server-ui-context.ts (5.8kb) — ExtensionUIContext for remote clients
 ├── validation.ts        (5.1kb) — input validation for commands
-├── types.ts             (34b) — protocol types
-└── test.ts              (25.3kb) — 52 tests
+├── types.ts             (8.5kb) — protocol types + accessors
+├── test.ts              (25.3kb) — 52 unit tests
+└── test-integration.ts  (17.5kb) — 16 integration tests
 
-Total: ~3700 lines, 9 files
-Commits: 14
+Total: ~4100 lines, 10 files
+Commits: 19
 Repo: https://github.com/tryingET/pi-server
 ```
 
@@ -46,6 +47,7 @@ Repo: https://github.com/tryingET/pi-server
 - ✅ Phase 6: Graceful shutdown (in-flight tracking, drain, client notification)
 - ✅ Phase 6.5: Security hardening (session ID validation, CWD validation, connection limits)
 - ✅ Phase 7: Protocol versioning (serverVersion + protocolVersion in server_ready)
+- ✅ Phase 8: Integration tests (16 WebSocket protocol tests)
 
 **Working:**
 - Session lifecycle (create/delete/list/switch)
@@ -120,6 +122,7 @@ In this case: static was correct, dynamic was dead code.
 | **Protocol versioning** | Separate software version from wire format | `serverVersion` vs `protocolVersion` |
 | **Track errors, don't mask** | Count negative-count errors instead of silent reset | `doubleUnregisterErrors` |
 | **Subscribe after success** | Subscribe to session only after command succeeds | `switch_session` handler |
+| **Server ready on connect** | Send server_ready to each new WebSocket connection | `setupWebSocket()` |
 
 ---
 
@@ -152,6 +155,7 @@ In this case: static was correct, dynamic was dead code.
 8. **Number.isFinite() for size validation** — catches NaN, Infinity, -Infinity
 9. **Subscribe before success = zombie subscription** — only subscribe after command succeeds
 10. **Zombie detection ≠ zombie cleanup** — must explicitly call `cleanupZombieSessions()`
+11. **server_ready must be sent per-connection** — new clients need version info, not just startup broadcast
 
 ---
 
@@ -194,7 +198,8 @@ Optional future enhancements:
 
 **Run tests:**
 ```bash
-npm test
+npm test                    # 52 unit tests
+npm run test:integration    # 16 integration tests (WebSocket protocol)
 ```
 
 **Start server:**
@@ -210,7 +215,7 @@ node dist/server.js
 3. Add handler to `command-router.ts`
 4. Add to `sessionCommandHandlers` map
 5. Add validation to `validation.ts`
-6. Add test
+6. Add test to `test.ts` + `test-integration.ts`
 
 ---
 
