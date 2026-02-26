@@ -69,9 +69,8 @@ Repo: https://github.com/tryingET/pi-server
 
 | Rank | Issue | Severity | Notes |
 |------|-------|----------|-------|
-| 1 | `(command as any).*` 12+ times | MEDIUM | Typed accessor pattern needed |
-| 2 | Protocol versioning | LOW | Add version to server_ready |
-| 3 | No biome rule for redundant dynamic imports | LOW | Found `await import()` when static import exists |
+| 1 | Protocol versioning | LOW | Add version to server_ready |
+| 2 | No biome rule for redundant dynamic imports | LOW | Found `await import()` when static import exists |
 
 ---
 
@@ -116,6 +115,7 @@ In this case: static was correct, dynamic was dead code.
 | **Single shutdown flag** | One source of truth for shutdown state | `isInShutdown()` |
 | **Threshold-based cleanup** | Cleanup when data exceeds size instead of timer | `if (length > THRESHOLD)` |
 | **Validate all inputs** | Session IDs, CWD paths, message sizes | `validateSessionId()` |
+| **Typed accessors** | Eliminate `as any` with type-safe property access | `getSessionId()`, `isCreateSessionResponse()` |
 
 ---
 
@@ -125,7 +125,7 @@ In this case: static was correct, dynamic was dead code.
 |--------------|----------------|-----|
 | Silent catch | Hides bugs, prevents observability | Always log |
 | Set iteration without snapshot | Works 99.9% of time, fails under load | Snapshot first |
-| `(command as any)` | Type safety escape hatch | Typed accessor |
+| `(command as any)` | Type safety escape hatch | Typed accessor functions |
 | WebSocket send without try/catch | State can change between check and send | Always wrap |
 | Check-then-act without atomicity | Race window between check and action | Atomic check-and-reserve |
 | Rate limit before validation | Invalid commands exhaust quota | Validate first |
@@ -168,16 +168,15 @@ In this case: static was correct, dynamic was dead code.
 | No health check | ✅ PAID |
 | No metrics command | ✅ PAID |
 | Redundant dynamic import | ✅ PAID |
-| `(command as any).*` | Pending |
+| `(command as any).*` typed accessors | ✅ PAID |
 | Protocol versioning | Pending |
 
 ---
 
 ## NEXT STEPS
 
-1. **Commit the test fix** (remove redundant dynamic import)
-2. **Consider biome rule** for redundant dynamic imports
-3. **Phase 7:** Protocol versioning (add version to server_ready)
+1. **Phase 7:** Protocol versioning (add version to server_ready)
+2. **Consider biome rule** for redundant dynamic imports (optional)
 
 ---
 
@@ -205,4 +204,4 @@ node dist/server.js
 
 ---
 
-**Start here:** Commit the redundant dynamic import fix, then consider biome configuration or move to Phase 7 (protocol versioning).
+**Start here:** Implement Phase 7 (protocol versioning) — add version field to `server_ready` event for client compatibility detection.

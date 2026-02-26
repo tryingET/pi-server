@@ -11,6 +11,7 @@ import {
   type AgentSessionEvent,
 } from "@mariozechner/pi-coding-agent";
 import type { SessionInfo, RpcCommand, RpcResponse, RpcEvent, Subscriber } from "./types.js";
+import { getCommandId, getCommandType, getSessionId } from "./types.js";
 import { routeSessionCommand } from "./command-router.js";
 import { ExtensionUIManager } from "./extension-ui.js";
 import { createServerUIContext } from "./server-ui-context.js";
@@ -445,8 +446,8 @@ export class PiSessionManager {
   // ==========================================================================
 
   async executeCommand(command: RpcCommand): Promise<RpcResponse> {
-    const id = (command as any).id;
-    const commandType = (command as any).type as string;
+    const id = getCommandId(command);
+    const commandType = getCommandType(command);
 
     // Check for shutdown - reject new commands during shutdown
     if (this.isShuttingDown) {
@@ -490,7 +491,7 @@ export class PiSessionManager {
         : DEFAULT_COMMAND_TIMEOUT_MS;
 
       // Rate limiting AFTER validation - use sessionId for session commands, "_server_" for server commands
-      const rateLimitKey = (command as any).sessionId ?? "_server_";
+      const rateLimitKey = getSessionId(command) ?? "_server_";
       const rateLimitResult = this.governor.canExecuteCommand(rateLimitKey);
       if (!rateLimitResult.allowed) {
         return {
@@ -503,9 +504,9 @@ export class PiSessionManager {
       }
 
       // Record heartbeat for session activity
-      const sessionId = (command as any).sessionId;
-      if (sessionId) {
-        this.governor.recordHeartbeat(sessionId);
+      const cmdSessionId = getSessionId(command);
+      if (cmdSessionId) {
+        this.governor.recordHeartbeat(cmdSessionId);
       }
 
       // Server commands (lifecycle management)
@@ -591,15 +592,15 @@ export class PiSessionManager {
       }
 
       // Session commands - get the session first
-      // sessionId is already defined above for heartbeat recording
-      const session = this.sessions.get(sessionId);
+      // cmdSessionId is already defined above for heartbeat recording
+      const session = this.sessions.get(cmdSessionId!);
       if (!session) {
         return {
           id,
           type: "response",
           command: commandType,
           success: false,
-          error: `Session ${sessionId} not found`,
+          error: `Session ${cmdSessionId} not found`,
         };
       }
 

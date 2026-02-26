@@ -303,3 +303,56 @@ export interface Subscriber {
   send: (data: string) => void;
   subscribedSessions: Set<string>;
 }
+
+// ============================================================================
+// TYPE GUARDS & ACCESSORS
+// Eliminates (command as any).* and (response as any).* casts
+// ============================================================================
+
+/**
+ * Get the optional command ID from any RpcCommand.
+ */
+export function getCommandId(cmd: RpcCommand): string | undefined {
+  return cmd.id;
+}
+
+/**
+ * Get the command type as a string.
+ */
+export function getCommandType(cmd: RpcCommand): string {
+  return cmd.type;
+}
+
+/**
+ * Get the sessionId from a command, if present.
+ * Returns undefined for server commands that don't have sessionId.
+ */
+export function getSessionId(cmd: RpcCommand): string | undefined {
+  if ("sessionId" in cmd) return cmd.sessionId;
+  return undefined;
+}
+
+/**
+ * Type guard: true if command targets a session (has sessionId).
+ */
+export function isSessionCommand(cmd: RpcCommand): cmd is SessionCommand {
+  return "sessionId" in cmd;
+}
+
+/**
+ * Type guard: true if response is a successful create_session response.
+ */
+export function isCreateSessionResponse(
+  response: RpcResponse
+): response is RpcResponseBase & { command: "create_session"; success: true; data: { sessionId: string; sessionInfo: SessionInfo } } {
+  return response.success && response.command === "create_session";
+}
+
+/**
+ * Type guard: true if response is a successful switch_session response.
+ */
+export function isSwitchSessionResponse(
+  response: RpcResponse
+): response is RpcResponseBase & { command: "switch_session"; success: true; data: { sessionInfo: SessionInfo } } {
+  return response.success && response.command === "switch_session";
+}

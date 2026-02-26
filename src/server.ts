@@ -13,6 +13,10 @@ import * as readline from "readline";
 import { WebSocketServer, WebSocket } from "ws";
 import { PiSessionManager } from "./session-manager.js";
 import type { RpcCommand, RpcResponse, Subscriber, RpcBroadcast } from "./types.js";
+import {
+  getSessionId as getSessionIdFromCmd,
+  isCreateSessionResponse,
+} from "./types.js";
 
 // ============================================================================
 // CONSTANTS
@@ -304,7 +308,7 @@ export class PiServer {
   ): Promise<void> {
     // Handle subscription commands
     if (command.type === "switch_session") {
-      const sessionId = (command as any).sessionId;
+      const sessionId = getSessionIdFromCmd(command);
       if (sessionId) {
         this.sessionManager.subscribeToSession(subscriber, sessionId);
       }
@@ -315,19 +319,19 @@ export class PiServer {
     respond(response);
 
     // Broadcast session lifecycle events
-    if (command.type === "create_session" && response.success) {
+    if (command.type === "create_session" && isCreateSessionResponse(response)) {
       const broadcast: RpcBroadcast = {
         type: "session_created",
         data: {
-          sessionId: (response as any).data.sessionId,
-          sessionInfo: (response as any).data.sessionInfo,
+          sessionId: response.data.sessionId,
+          sessionInfo: response.data.sessionInfo,
         },
       };
       this.sessionManager.broadcast(JSON.stringify(broadcast));
     } else if (command.type === "delete_session" && response.success) {
       const broadcast: RpcBroadcast = {
         type: "session_deleted",
-        data: { sessionId: (command as any).sessionId },
+        data: { sessionId: getSessionIdFromCmd(command)! },
       };
       this.sessionManager.broadcast(JSON.stringify(broadcast));
     }
