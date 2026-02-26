@@ -388,7 +388,25 @@ Comprehensive test suite exists. Run with `npm test`.
 | `test-command-replay-store.ts` | Idempotency, fingerprinting, replay semantics |
 | `test-session-version-store.ts` | Version counters, mutation detection |
 | `test-command-execution-engine.ts` | Lane serialization, dependency waits, timeouts |
+| `test-fuzz.ts` | Concurrent stress tests, race condition detection |
 | `test-integration.ts` | Full server tests with real WebSocket/stdio |
+
+### Fuzz Tests
+
+Run fuzz tests to surface race conditions that only appear under concurrent load:
+
+```bash
+npm run test:fuzz
+```
+
+Fuzz test coverage:
+- Lane serialization under stress (100+ concurrent commands)
+- In-flight tracking races
+- Outcome storage concurrent writes
+- Fingerprint uniqueness
+- Synthetic ID generation uniqueness
+- Dependency chain timeout handling
+- Replay semantics under concurrent access
 
 ### Key Test Patterns
 
