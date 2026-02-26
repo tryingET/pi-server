@@ -280,7 +280,14 @@ export interface RpcEvent {
 
 export interface ServerEvent {
   type: "server_ready";
-  data: { version: string; transports: string[] };
+  data: { 
+    /** Server software version (semver) */
+    serverVersion: string; 
+    /** Protocol version for wire compatibility (semver) */
+    protocolVersion: string;
+    /** Available transports */
+    transports: string[] 
+  };
 }
 
 export interface ServerShutdownEvent {

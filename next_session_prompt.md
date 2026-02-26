@@ -45,6 +45,7 @@ Repo: https://github.com/tryingET/pi-server
 - ✅ Phase 5.5: Deep review fixes (atomic reservation, global rate limit)
 - ✅ Phase 6: Graceful shutdown (in-flight tracking, drain, client notification)
 - ✅ Phase 6.5: Security hardening (session ID validation, CWD validation, connection limits)
+- ✅ Phase 7: Protocol versioning (serverVersion + protocolVersion in server_ready)
 
 **Working:**
 - Session lifecycle (create/delete/list/switch)
@@ -62,6 +63,7 @@ Repo: https://github.com/tryingET/pi-server
 - Session ID validation (alphanumeric, dash, underscore, dot)
 - CWD validation (blocks path traversal)
 - Health check + metrics commands
+- Protocol versioning (clients can detect incompatibility)
 
 ---
 
@@ -69,8 +71,7 @@ Repo: https://github.com/tryingET/pi-server
 
 | Rank | Issue | Severity | Notes |
 |------|-------|----------|-------|
-| 1 | Protocol versioning | LOW | Add version to server_ready |
-| 2 | No biome rule for redundant dynamic imports | LOW | Found `await import()` when static import exists |
+| 1 | No biome rule for redundant dynamic imports | LOW | Found `await import()` when static import exists |
 
 ---
 
@@ -116,6 +117,7 @@ In this case: static was correct, dynamic was dead code.
 | **Threshold-based cleanup** | Cleanup when data exceeds size instead of timer | `if (length > THRESHOLD)` |
 | **Validate all inputs** | Session IDs, CWD paths, message sizes | `validateSessionId()` |
 | **Typed accessors** | Eliminate `as any` with type-safe property access | `getSessionId()`, `isCreateSessionResponse()` |
+| **Protocol versioning** | Separate software version from wire format | `serverVersion` vs `protocolVersion` |
 
 ---
 
@@ -169,14 +171,18 @@ In this case: static was correct, dynamic was dead code.
 | No metrics command | ✅ PAID |
 | Redundant dynamic import | ✅ PAID |
 | `(command as any).*` typed accessors | ✅ PAID |
-| Protocol versioning | Pending |
+| Protocol versioning | ✅ PAID |
 
 ---
 
 ## NEXT STEPS
 
-1. **Phase 7:** Protocol versioning (add version to server_ready)
-2. **Consider biome rule** for redundant dynamic imports (optional)
+**All planned phases complete.** pi-server is feature-complete for its stated purpose.
+
+Optional future enhancements:
+1. Add biome rule for redundant dynamic imports
+2. Add integration tests for WebSocket transport
+3. Add client library for common languages
 
 ---
 
@@ -204,4 +210,19 @@ node dist/server.js
 
 ---
 
-**Start here:** Implement Phase 7 (protocol versioning) — add version field to `server_ready` event for client compatibility detection.
+**Status:** Feature-complete. All debt paid. Ready for production use.
+
+The protocol versioning enables clients to detect incompatibility:
+```typescript
+// server_ready event now includes:
+{
+  type: "server_ready",
+  data: {
+    serverVersion: "0.1.0",      // Software version
+    protocolVersion: "1.0.0",    // Wire protocol version
+    transports: ["websocket", "stdio"]
+  }
+}
+```
+
+Clients should check `protocolVersion` before sending commands.

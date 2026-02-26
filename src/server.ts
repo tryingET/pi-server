@@ -22,7 +22,8 @@ import {
 // CONSTANTS
 // ============================================================================
 
-const VERSION = "0.1.0";
+const SERVER_VERSION = "0.1.0";
+const PROTOCOL_VERSION = "1.0.0";
 const DEFAULT_PORT = 3141;
 
 /** Default graceful shutdown timeout (30 seconds) */
@@ -48,11 +49,15 @@ export class PiServer {
     // Broadcast server_ready
     const readyEvent: RpcBroadcast = {
       type: "server_ready",
-      data: { version: VERSION, transports: ["websocket", "stdio"] },
+      data: { 
+        serverVersion: SERVER_VERSION, 
+        protocolVersion: PROTOCOL_VERSION,
+        transports: ["websocket", "stdio"] 
+      },
     };
     this.sessionManager.broadcast(JSON.stringify(readyEvent));
 
-    console.error(`pi-app-server v${VERSION} listening on port ${port} and stdio`);
+    console.error(`pi-app-server v${SERVER_VERSION} (protocol v${PROTOCOL_VERSION}) listening on port ${port} and stdio`);
   }
 
   /**
