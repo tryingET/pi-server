@@ -10,7 +10,7 @@
   },
   "scripts": {
     "build": "npm run build:js && npm run build:types",
-    "build:js": "esbuild src/server.ts src/session-manager.ts src/command-router.ts src/extension-ui.ts src/server-ui-context.ts src/validation.ts src/types.ts src/resource-governor.ts src/test.ts src/test-integration.ts --outdir=dist --format=esm --platform=node --target=node20 --sourcemap",
+    "build:js": "esbuild src/server.ts src/session-manager.ts src/command-router.ts src/extension-ui.ts src/server-ui-context.ts src/validation.ts src/types.ts src/resource-governor.ts src/command-classification.ts src/command-replay-store.ts src/session-version-store.ts src/command-execution-engine.ts src/test.ts src/test-command-classification.ts src/test-session-version-store.ts src/test-command-replay-store.ts src/test-command-execution-engine.ts src/test-integration.ts --outdir=dist --format=esm --platform=node --target=node20 --sourcemap",
     "build:types": "tsc --emitDeclarationOnly --declaration --declarationMap",
     "typecheck": "tsgo -config tsconfig.json",
     "lint": "biome lint src",
