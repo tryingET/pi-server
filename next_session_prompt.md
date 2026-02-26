@@ -118,6 +118,8 @@ In this case: static was correct, dynamic was dead code.
 | **Validate all inputs** | Session IDs, CWD paths, message sizes | `validateSessionId()` |
 | **Typed accessors** | Eliminate `as any` with type-safe property access | `getSessionId()`, `isCreateSessionResponse()` |
 | **Protocol versioning** | Separate software version from wire format | `serverVersion` vs `protocolVersion` |
+| **Track errors, don't mask** | Count negative-count errors instead of silent reset | `doubleUnregisterErrors` |
+| **Subscribe after success** | Subscribe to session only after command succeeds | `switch_session` handler |
 
 ---
 
@@ -133,7 +135,7 @@ In this case: static was correct, dynamic was dead code.
 | Rate limit before validation | Invalid commands exhaust quota | Validate first |
 | Methods that exist but never called | Dead code hiding in plain sight | Call from related operation |
 | **Redundant dynamic import** | `await import()` when static import exists | Use static import |
-| **Defensive Math.max(0, ...)** | Masks bugs (double-unregister) | Log warning instead |
+| **Defensive Math.max(0, ...)** | Masks bugs (double-unregister) | Track error metric, then reset |
 | **No input validation** | Path traversal, injection attacks | Validate session IDs, CWD |
 
 ---
@@ -148,6 +150,8 @@ In this case: static was correct, dynamic was dead code.
 6. **Idempotent shutdown is essential** — orchestrators may send multiple SIGTERM
 7. **Threshold-based auto-cleanup** — better than periodic timers
 8. **Number.isFinite() for size validation** — catches NaN, Infinity, -Infinity
+9. **Subscribe before success = zombie subscription** — only subscribe after command succeeds
+10. **Zombie detection ≠ zombie cleanup** — must explicitly call `cleanupZombieSessions()`
 
 ---
 

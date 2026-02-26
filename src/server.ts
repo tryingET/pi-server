@@ -311,17 +311,17 @@ export class PiServer {
     subscriber: Subscriber,
     respond: (response: RpcResponse) => void
   ): Promise<void> {
-    // Handle subscription commands
-    if (command.type === "switch_session") {
+    // Execute command
+    const response = await this.sessionManager.executeCommand(command);
+    respond(response);
+
+    // Handle subscription AFTER successful switch_session
+    if (command.type === "switch_session" && response.success) {
       const sessionId = getSessionIdFromCmd(command);
       if (sessionId) {
         this.sessionManager.subscribeToSession(subscriber, sessionId);
       }
     }
-
-    // Execute command
-    const response = await this.sessionManager.executeCommand(command);
-    respond(response);
 
     // Broadcast session lifecycle events
     if (command.type === "create_session" && isCreateSessionResponse(response)) {

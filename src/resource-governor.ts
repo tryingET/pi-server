@@ -59,6 +59,8 @@ export interface GovernorMetrics {
   };
   zombieSessionsDetected: number;
   zombieSessionsCleaned: number;
+  /** Count of double-unregister errors (session or connection unregistered twice) */
+  doubleUnregisterErrors: number;
   rateLimitUsage: {
     globalCount: number;
     globalLimit: number;
@@ -127,6 +129,7 @@ export class ResourceGovernor {
   };
   private zombieSessionsDetected = 0;
   private zombieSessionsCleaned = 0;
+  private doubleUnregisterErrors = 0;
 
   constructor(private config: ResourceGovernorConfig = DEFAULT_CONFIG) {}
 
@@ -198,19 +201,20 @@ export class ResourceGovernor {
 
   /**
    * Release a reserved session slot (used if session creation fails after reservation).
-   * Asserts that count doesn't go negative in development.
+   * Tracks double-unregister as error metric instead of silently masking.
    */
   releaseSessionSlot(): void {
     this.sessionCount--;
     if (this.sessionCount < 0) {
-      console.error("[ResourceGovernor] WARNING: sessionCount went negative, resetting to 0");
+      this.doubleUnregisterErrors++;
       this.sessionCount = 0;
+      console.error("[ResourceGovernor] ERROR: releaseSessionSlot called with no active slots (double-unregister)");
     }
   }
 
   /**
    * Check if a new session can be created.
-   * @deprecated Use tryReserveSessionSlot for atomic operation
+   * @deprecated Use tryReserveSessionSlot for atomic operation. Will be removed in v2.0.0.
    */
   canCreateSession(): GovernorResult {
     if (this.sessionCount >= this.config.maxSessions) {
@@ -225,7 +229,7 @@ export class ResourceGovernor {
 
   /**
    * Register a new session.
-   * @deprecated Use tryReserveSessionSlot for atomic operation
+   * @deprecated Use tryReserveSessionSlot for atomic operation. Will be removed in v2.0.0.
    */
   registerSession(sessionId: string): void {
     this.sessionCount++;
@@ -234,12 +238,14 @@ export class ResourceGovernor {
 
   /**
    * Unregister a session. Call AFTER session is deleted.
+   * Also cleans up rate limit timestamps for this session.
    */
   unregisterSession(sessionId: string): void {
     this.sessionCount--;
     if (this.sessionCount < 0) {
-      console.error("[ResourceGovernor] WARNING: sessionCount went negative, resetting to 0");
+      this.doubleUnregisterErrors++;
       this.sessionCount = 0;
+      console.error(`[ResourceGovernor] ERROR: unregisterSession('${sessionId}') called with no active slots (double-unregister)`);
     }
     this.lastHeartbeat.delete(sessionId);
     this.commandTimestamps.delete(sessionId);
@@ -279,12 +285,14 @@ export class ResourceGovernor {
 
   /**
    * Unregister a connection.
+   * Tracks double-unregister as error metric instead of silently masking.
    */
   unregisterConnection(): void {
     this.connectionCount--;
     if (this.connectionCount < 0) {
-      console.error("[ResourceGovernor] WARNING: connectionCount went negative, resetting to 0");
+      this.doubleUnregisterErrors++;
       this.connectionCount = 0;
+      console.error("[ResourceGovernor] ERROR: unregisterConnection called with no active connections (double-unregister)");
     }
   }
 
@@ -466,6 +474,7 @@ export class ResourceGovernor {
       commandsRejected: { ...this.commandsRejected },
       zombieSessionsDetected: this.zombieSessionsDetected,
       zombieSessionsCleaned: this.zombieSessionsCleaned,
+      doubleUnregisterErrors: this.doubleUnregisterErrors,
       rateLimitUsage: {
         globalCount,
         globalLimit: this.config.maxGlobalCommandsPerMinute,

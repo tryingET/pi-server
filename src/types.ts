@@ -148,6 +148,7 @@ export type ServerResponse =
         };
         zombieSessionsDetected: number;
         zombieSessionsCleaned: number;
+        doubleUnregisterErrors: number;
         rateLimitUsage: {
           globalCount: number;
           globalLimit: number;
