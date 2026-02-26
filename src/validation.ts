@@ -13,6 +13,27 @@ export interface ValidationError {
   message: string;
 }
 
+const MAX_PROMPT_MESSAGE_LENGTH = 200_000;
+const MAX_BASH_COMMAND_LENGTH = 20_000;
+const MAX_SESSION_NAME_LENGTH = 256;
+
+function hasControlCharacters(value: string): boolean {
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code <= 31 || code === 127) return true;
+  }
+  return false;
+}
+
+const EXTENSION_UI_RESPONSE_METHODS = new Set([
+  "select",
+  "confirm",
+  "input",
+  "editor",
+  "interview",
+  "cancelled",
+]);
+
 // Session commands that require sessionId
 const SESSION_COMMANDS = new Set([
   "extension_ui_response",
@@ -59,6 +80,8 @@ const SERVER_COMMANDS = new Set([
   "health_check",
 ]);
 
+const ALL_COMMANDS = new Set([...SESSION_COMMANDS, ...SERVER_COMMANDS]);
+
 /**
  * Validate a command has required fields.
  * Returns array of errors (empty if valid).
@@ -78,9 +101,13 @@ export function validateCommand(command: unknown): ValidationError[] {
     errors.push({ field: "type", message: "Command must have a string 'type' field" });
   }
 
+  if (typeof cmd.type === "string" && !ALL_COMMANDS.has(cmd.type)) {
+    errors.push({ field: "type", message: `Unknown command type '${cmd.type}'` });
+  }
+
   // If it's a session command, sessionId is required
   if (typeof cmd.type === "string" && SESSION_COMMANDS.has(cmd.type)) {
-    if (!("sessionId" in cmd) || typeof cmd.sessionId !== "string" || !cmd.sessionId) {
+    if (!("sessionId" in cmd) || typeof cmd.sessionId !== "string" || cmd.sessionId.trim().length === 0) {
       errors.push({
         field: "sessionId",
         message: "Session commands must have a non-empty string 'sessionId'",
@@ -104,8 +131,8 @@ function validateCommandByType(type: string, cmd: Record<string, unknown>): Vali
 
   switch (type) {
     case "create_session":
-      if ("sessionId" in cmd && typeof cmd.sessionId !== "string") {
-        errors.push({ field: "sessionId", message: "Must be a string if provided" });
+      if ("sessionId" in cmd && (typeof cmd.sessionId !== "string" || cmd.sessionId.trim().length === 0)) {
+        errors.push({ field: "sessionId", message: "Must be a non-empty string if provided" });
       }
       if ("cwd" in cmd && typeof cmd.cwd !== "string") {
         errors.push({ field: "cwd", message: "Must be a string if provided" });
@@ -114,14 +141,16 @@ function validateCommandByType(type: string, cmd: Record<string, unknown>): Vali
 
     case "delete_session":
     case "switch_session":
-      if (!cmd.sessionId) {
-        errors.push({ field: "sessionId", message: "Required" });
+      if (typeof cmd.sessionId !== "string" || cmd.sessionId.trim().length === 0) {
+        errors.push({ field: "sessionId", message: "Required non-empty string" });
       }
       break;
 
     case "prompt":
       if (!cmd.message || typeof cmd.message !== "string") {
         errors.push({ field: "message", message: "Required string" });
+      } else if (cmd.message.length > MAX_PROMPT_MESSAGE_LENGTH) {
+        errors.push({ field: "message", message: `Too long (max ${MAX_PROMPT_MESSAGE_LENGTH} chars)` });
       }
       break;
 
@@ -129,6 +158,8 @@ function validateCommandByType(type: string, cmd: Record<string, unknown>): Vali
     case "follow_up":
       if (!cmd.message || typeof cmd.message !== "string") {
         errors.push({ field: "message", message: "Required string" });
+      } else if (cmd.message.length > MAX_PROMPT_MESSAGE_LENGTH) {
+        errors.push({ field: "message", message: `Too long (max ${MAX_PROMPT_MESSAGE_LENGTH} chars)` });
       }
       break;
 
@@ -150,6 +181,8 @@ function validateCommandByType(type: string, cmd: Record<string, unknown>): Vali
     case "bash":
       if (!cmd.command || typeof cmd.command !== "string") {
         errors.push({ field: "command", message: "Required string" });
+      } else if (cmd.command.length > MAX_BASH_COMMAND_LENGTH) {
+        errors.push({ field: "command", message: `Too long (max ${MAX_BASH_COMMAND_LENGTH} chars)` });
       }
       break;
 
@@ -165,6 +198,14 @@ function validateCommandByType(type: string, cmd: Record<string, unknown>): Vali
       }
       if (!cmd.response || typeof cmd.response !== "object") {
         errors.push({ field: "response", message: "Required object" });
+      } else {
+        const response = cmd.response as Record<string, unknown>;
+        if (typeof response.method !== "string" || !EXTENSION_UI_RESPONSE_METHODS.has(response.method)) {
+          errors.push({
+            field: "response.method",
+            message: "Must be one of: select, confirm, input, editor, interview, cancelled",
+          });
+        }
       }
       break;
 
@@ -183,6 +224,10 @@ function validateCommandByType(type: string, cmd: Record<string, unknown>): Vali
     case "set_session_name":
       if (!cmd.name || typeof cmd.name !== "string") {
         errors.push({ field: "name", message: "Required string" });
+      } else if (cmd.name.length > MAX_SESSION_NAME_LENGTH) {
+        errors.push({ field: "name", message: `Too long (max ${MAX_SESSION_NAME_LENGTH} chars)` });
+      } else if (hasControlCharacters(cmd.name)) {
+        errors.push({ field: "name", message: "Must not contain control characters" });
       }
       break;
 

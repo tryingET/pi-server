@@ -95,6 +95,9 @@ const RATE_WINDOW_MS = 60000;
 /** Session ID max length */
 const SESSION_ID_MAX_LENGTH = 256;
 
+/** CWD max length */
+const CWD_MAX_LENGTH = 4096;
+
 /** Valid session ID pattern (alphanumeric, dash, underscore, dot) */
 const SESSION_ID_PATTERN = /^[a-zA-Z0-9_.-]+$/;
 
@@ -173,6 +176,9 @@ export class ResourceGovernor {
   validateCwd(cwd: string): string | null {
     if (!cwd || typeof cwd !== "string") {
       return "CWD must be a non-empty string";
+    }
+    if (cwd.length > CWD_MAX_LENGTH) {
+      return `CWD too long (max ${CWD_MAX_LENGTH} characters)`;
     }
     for (const pattern of DANGEROUS_PATH_PATTERNS) {
       if (pattern.test(cwd)) {
@@ -383,6 +389,30 @@ export class ResourceGovernor {
     this.totalCommandsExecuted++;
 
     return { allowed: true };
+  }
+
+  /**
+   * Refund a previously counted command (e.g. command failed before execution).
+   */
+  refundCommand(sessionId: string): void {
+    const sessionTimestamps = this.commandTimestamps.get(sessionId);
+    if (!sessionTimestamps || sessionTimestamps.length === 0) {
+      return;
+    }
+
+    const refundedTimestamp = sessionTimestamps.pop()!;
+    if (sessionTimestamps.length === 0) {
+      this.commandTimestamps.delete(sessionId);
+    }
+
+    const globalIdx = this.globalCommandTimestamps.lastIndexOf(refundedTimestamp);
+    if (globalIdx !== -1) {
+      this.globalCommandTimestamps.splice(globalIdx, 1);
+    }
+
+    if (this.totalCommandsExecuted > 0) {
+      this.totalCommandsExecuted--;
+    }
   }
 
   /**

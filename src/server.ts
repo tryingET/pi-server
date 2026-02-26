@@ -43,21 +43,41 @@ export class PiServer {
     this.wss = new WebSocketServer({ port });
     this.setupWebSocket(this.wss);
 
+    await new Promise<void>((resolve, reject) => {
+      const onListening = () => {
+        this.wss?.off("error", onError);
+        resolve();
+      };
+      const onError = (error: Error) => {
+        this.wss?.off("listening", onListening);
+        reject(error);
+      };
+
+      this.wss?.once("listening", onListening);
+      this.wss?.once("error", onError);
+    }).catch((error) => {
+      throw new Error(
+        `Failed to start WebSocket server on port ${port}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    });
+
     // Setup stdio transport
     this.stdinInterface = this.setupStdio();
 
     // Broadcast server_ready
     const readyEvent: RpcBroadcast = {
       type: "server_ready",
-      data: { 
-        serverVersion: SERVER_VERSION, 
+      data: {
+        serverVersion: SERVER_VERSION,
         protocolVersion: PROTOCOL_VERSION,
-        transports: ["websocket", "stdio"] 
+        transports: ["websocket", "stdio"],
       },
     };
     this.sessionManager.broadcast(JSON.stringify(readyEvent));
 
-    console.error(`pi-app-server v${SERVER_VERSION} (protocol v${PROTOCOL_VERSION}) listening on port ${port} and stdio`);
+    console.error(
+      `pi-app-server v${SERVER_VERSION} (protocol v${PROTOCOL_VERSION}) listening on port ${port} and stdio`
+    );
   }
 
   /**
@@ -84,6 +104,10 @@ export class PiServer {
    * 6. Dispose all sessions
    */
   async stop(timeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<void> {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      timeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS;
+    }
+
     // Check via session manager (single source of truth)
     if (this.sessionManager.isInShutdown()) {
       return; // Already shutting down
@@ -187,6 +211,14 @@ export class PiServer {
 
       this.sessionManager.addSubscriber(subscriber);
 
+      let cleanedUp = false;
+      const cleanupConnection = () => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        this.sessionManager.removeSubscriber(subscriber);
+        this.sessionManager.getGovernor().unregisterConnection();
+      };
+
       ws.on("message", async (data: Buffer) => {
         // Check message size limit
         const sizeResult = this.sessionManager.getGovernor().canAcceptMessage(data.length);
@@ -232,14 +264,12 @@ export class PiServer {
       });
 
       ws.on("close", () => {
-        this.sessionManager.removeSubscriber(subscriber);
-        this.sessionManager.getGovernor().unregisterConnection();
+        cleanupConnection();
       });
 
       ws.on("error", (error) => {
         console.error(`[WebSocket] Connection error:`, error);
-        this.sessionManager.removeSubscriber(subscriber);
-        this.sessionManager.getGovernor().unregisterConnection();
+        cleanupConnection();
       });
     });
   }
@@ -367,7 +397,7 @@ async function main(): Promise<void> {
   const portEnv = process.env.PI_SERVER_PORT;
   const port = portEnv ? parseInt(portEnv, 10) : DEFAULT_PORT;
   
-  if (isNaN(port) || port < 1 || port > 65535) {
+  if (Number.isNaN(port) || port < 1 || port > 65535) {
     console.error(`Invalid PI_SERVER_PORT: "${portEnv}". Must be 1-65535.`);
     process.exit(1);
     return; // TypeScript needs this
@@ -387,7 +417,9 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => handleShutdown("SIGTERM"));
 }
 
-main().catch((error) => {
-  console.error("Fatal error:", error);
-  process.exit(1);
-});
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((error) => {
+    console.error("Fatal error:", error);
+    process.exit(1);
+  });
+}

@@ -8,6 +8,8 @@
  */
 
 import assert from "assert";
+import { spawn } from "child_process";
+import * as readline from "readline";
 import { WebSocket } from "ws";
 import getPort from "get-port";
 import { PiServer } from "./server.js";
@@ -90,6 +92,34 @@ async function waitForServerReady(port: number, maxAttempts = 10): Promise<void>
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForJsonLine(
+  lines: readline.Interface,
+  predicate: (obj: Record<string, unknown>) => boolean,
+  timeoutMs = 5000
+): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      lines.off("line", onLine);
+      reject(new Error("Timed out waiting for JSON line"));
+    }, timeoutMs);
+
+    const onLine = (line: string) => {
+      try {
+        const obj = JSON.parse(line) as Record<string, unknown>;
+        if (predicate(obj)) {
+          clearTimeout(timer);
+          lines.off("line", onLine);
+          resolve(obj);
+        }
+      } catch {
+        // ignore non-JSON lines
+      }
+    };
+
+    lines.on("line", onLine);
+  });
 }
 
 // =============================================================================
@@ -253,25 +283,6 @@ class TestClient {
       this.ws.close();
       this.ws = null;
     }
-  }
-}
-
-// =============================================================================
-// CLEANUP HELPER
-// =============================================================================
-
-/**
- * Clean up all sessions on a server.
- */
-async function cleanupAllSessions(client: TestClient): Promise<void> {
-  await client.send({ type: "list_sessions" });
-  const response = await client.waitForMessage(
-    (msg) => msg.type === "response" && msg.command === "list_sessions"
-  );
-  for (const session of response.data?.sessions || []) {
-    const sid = (session as { sessionId: string }).sessionId;
-    await client.send({ type: "delete_session", sessionId: sid });
-    await client.waitForMessage((msg) => msg.command === "delete_session");
   }
 }
 
@@ -659,6 +670,170 @@ async function testCommandId() {
   });
 }
 
+async function testPortConflictHandling() {
+  console.log("\n=== Port Conflict Tests ===\n");
+
+  await test("integration: start fails with clear error on used port", async () => {
+    const port = await getPort();
+    const server1 = new PiServer();
+    await server1.start(port);
+
+    const server2 = new PiServer();
+    let threw = false;
+    try {
+      await server2.start(port);
+    } catch (error) {
+      threw = true;
+      assert(
+        String(error).includes("Failed to start WebSocket server"),
+        "Should include startup error context"
+      );
+    } finally {
+      await server1.stop(1000);
+    }
+
+    assert.strictEqual(threw, true, "Second server should fail to start on same port");
+  });
+}
+
+async function testConcurrentClients() {
+  console.log("\n=== Concurrent Client Tests ===\n");
+
+  await withFreshServer(async (ctx) => {
+    await test("integration: handles concurrent clients", async () => {
+      const clients = await Promise.all(
+        Array.from({ length: 5 }, async () => {
+          const c = new TestClient();
+          await c.connect(ctx.port);
+          c.clearMessages();
+          return c;
+        })
+      );
+
+      await Promise.all(clients.map((c) => c.send({ type: "list_sessions" })));
+
+      const responses = await Promise.all(
+        clients.map((c) =>
+          c.waitForMessage((msg) => msg.type === "response" && msg.command === "list_sessions")
+        )
+      );
+
+      for (const r of responses) {
+        assert.strictEqual(r.success, true);
+      }
+
+      for (const c of clients) c.close();
+    });
+  });
+}
+
+async function testSessionEventSubscription() {
+  console.log("\n=== Session Event Subscription Tests ===\n");
+
+  await withFreshServer(async (ctx) => {
+    await test("integration: broadcasts session events only to subscribers", async () => {
+      const clientA = new TestClient();
+      const clientB = new TestClient();
+      await clientA.connect(ctx.port);
+      await clientB.connect(ctx.port);
+      clientA.clearMessages();
+      clientB.clearMessages();
+
+      await clientA.send({ type: "create_session", sessionId: "evt-1" });
+      await clientA.waitForMessage((msg) => msg.command === "create_session");
+
+      await clientA.send({ type: "switch_session", sessionId: "evt-1" });
+      await clientA.waitForMessage((msg) => msg.command === "switch_session");
+
+      // Inject a synthetic event through internal manager to test subscription filtering.
+      (ctx.server.getSessionManager() as any).broadcastEvent("evt-1", { type: "test_event" });
+
+      const eventA = await clientA.waitForMessage((msg) => msg.type === "event", 2000);
+      assert.strictEqual((eventA as any).sessionId, "evt-1");
+
+      // clientB is not subscribed to evt-1; should not receive event
+      await sleep(300);
+      const bEvents = clientB.getMessages().filter((m) => m.type === "event");
+      assert.strictEqual(bEvents.length, 0, "Unsubscribed client should not receive session events");
+
+      await clientA.send({ type: "delete_session", sessionId: "evt-1" });
+      clientA.close();
+      clientB.close();
+    });
+  });
+}
+
+async function testRateLimitingUnderLoad() {
+  console.log("\n=== Rate Limiting Tests ===\n");
+
+  await withFreshServer(async (ctx) => {
+    await test("integration: enforces rate limit under load", async () => {
+      const client = new TestClient();
+      await client.connect(ctx.port);
+      client.clearMessages();
+
+      await client.send({ type: "create_session", sessionId: "rl-1" });
+      await client.waitForMessage((msg) => msg.command === "create_session");
+      client.clearMessages();
+
+      for (let i = 0; i < 120; i++) {
+        await client.send({ type: "get_state", sessionId: "rl-1", id: `r${i}` });
+      }
+
+      let gotRateLimit = false;
+      const deadline = Date.now() + 10000;
+      while (Date.now() < deadline) {
+        try {
+          const msg = await client.waitForMessage((m) => m.type === "response", 250);
+          if (!msg.success && String(msg.error).includes("Rate limit")) {
+            gotRateLimit = true;
+            break;
+          }
+        } catch {
+          // ignore polling timeout
+        }
+      }
+
+      assert.strictEqual(gotRateLimit, true, "Expected at least one rate-limit rejection");
+
+      await client.send({ type: "delete_session", sessionId: "rl-1" });
+      client.close();
+    });
+  });
+}
+
+async function testStdioTransport() {
+  console.log("\n=== Stdio Transport Tests ===\n");
+
+  await test("integration: stdio accepts commands and returns responses", async () => {
+    const port = await getPort();
+    const child = spawn("node", ["dist/server.js"], {
+      cwd: process.cwd(),
+      env: { ...process.env, PI_SERVER_PORT: String(port) },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    try {
+      const stdoutLines = readline.createInterface({ input: child.stdout! });
+
+      const ready = await waitForJsonLine(stdoutLines, (obj) => obj.type === "server_ready", 8000);
+      assert.strictEqual(ready.type, "server_ready");
+
+      child.stdin!.write(JSON.stringify({ id: "stdio-1", type: "list_sessions" }) + "\n");
+
+      const response = await waitForJsonLine(
+        stdoutLines,
+        (obj) => obj.type === "response" && obj.id === "stdio-1",
+        8000
+      );
+
+      assert.strictEqual(response.success, true);
+    } finally {
+      child.kill("SIGTERM");
+    }
+  });
+}
+
 // =============================================================================
 // RUN ALL TESTS
 // =============================================================================
@@ -677,6 +852,11 @@ async function main() {
     await testHealthCheck();
     await testCommandId();
     await testGracefulShutdown();
+    await testPortConflictHandling();
+    await testConcurrentClients();
+    await testSessionEventSubscription();
+    await testRateLimitingUnderLoad();
+    await testStdioTransport();
 
     console.log("\n" + "=".repeat(50));
     console.log(`Results: ${testsPassed} passed, ${testsFailed} failed`);

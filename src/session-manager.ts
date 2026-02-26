@@ -112,6 +112,10 @@ export class PiSessionManager {
    * Idempotent: calling multiple times returns the same result.
    */
   async initiateShutdown(timeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<{ drained: number; timedOut: boolean }> {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      timeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS;
+    }
+
     // Idempotent check - only initiate once
     if (this.isShuttingDown) {
       // Return current state - how many commands are still in flight
@@ -275,6 +279,12 @@ export class PiSessionManager {
         ),
       });
 
+      // Re-check duplicate after async creation to close race window
+      if (this.sessions.has(sessionId)) {
+        session.dispose();
+        throw new Error(`Session ${sessionId} already exists`);
+      }
+
       this.sessions.set(sessionId, session);
       this.sessionCreatedAt.set(sessionId, new Date());
       // Record heartbeat (session count already incremented by tryReserveSessionSlot)
@@ -343,7 +353,12 @@ export class PiSessionManager {
     const session = this.sessions.get(sessionId);
     if (!session) return undefined;
 
-    const createdAt = this.sessionCreatedAt.get(sessionId) ?? new Date();
+    const createdAt = this.sessionCreatedAt.get(sessionId);
+    if (!createdAt) {
+      // Invariant violation: session exists but createdAt is missing
+      console.error(`[getSessionInfo] Missing createdAt for session ${sessionId}`);
+      return undefined;
+    }
 
     return {
       sessionId,
@@ -484,6 +499,23 @@ export class PiSessionManager {
     id: string | undefined,
     commandType: string
   ): Promise<RpcResponse> {
+    const rateLimitKey = getSessionId(command) ?? "_server_";
+    let rateLimitCharged = false;
+
+    const failResponse = (error: string, responseCommand = commandType): RpcResponse => {
+      if (rateLimitCharged) {
+        this.governor.refundCommand(rateLimitKey);
+        rateLimitCharged = false;
+      }
+      return {
+        id,
+        type: "response",
+        command: responseCommand,
+        success: false,
+        error,
+      };
+    };
+
     try {
       // Determine timeout for this command type
       const timeoutMs = SHORT_TIMEOUT_COMMANDS.has(commandType)
@@ -491,7 +523,6 @@ export class PiSessionManager {
         : DEFAULT_COMMAND_TIMEOUT_MS;
 
       // Rate limiting AFTER validation - use sessionId for session commands, "_server_" for server commands
-      const rateLimitKey = getSessionId(command) ?? "_server_";
       const rateLimitResult = this.governor.canExecuteCommand(rateLimitKey);
       if (!rateLimitResult.allowed) {
         return {
@@ -502,12 +533,7 @@ export class PiSessionManager {
           error: rateLimitResult.reason,
         };
       }
-
-      // Record heartbeat for session activity
-      const cmdSessionId = getSessionId(command);
-      if (cmdSessionId) {
-        this.governor.recordHeartbeat(cmdSessionId);
-      }
+      rateLimitCharged = true;
 
       // Server commands (lifecycle management)
       switch (commandType) {
@@ -553,13 +579,7 @@ export class PiSessionManager {
           const cmd = command as { sessionId: string };
           const sessionInfo = this.getSessionInfo(cmd.sessionId);
           if (!sessionInfo) {
-            return {
-              id,
-              type: "response",
-              command: "switch_session",
-              success: false,
-              error: `Session ${cmd.sessionId} not found`,
-            };
+            return failResponse(`Session ${cmd.sessionId} not found`, "switch_session");
           }
           return {
             id,
@@ -592,17 +612,14 @@ export class PiSessionManager {
       }
 
       // Session commands - get the session first
-      // cmdSessionId is already defined above for heartbeat recording
+      const cmdSessionId = getSessionId(command);
       const session = this.sessions.get(cmdSessionId!);
       if (!session) {
-        return {
-          id,
-          type: "response",
-          command: commandType,
-          success: false,
-          error: `Session ${cmdSessionId} not found`,
-        };
+        return failResponse(`Session ${cmdSessionId} not found`);
       }
+
+      // Record heartbeat for valid session activity
+      this.governor.recordHeartbeat(cmdSessionId!);
 
       // Special handling for extension_ui_response (doesn't operate on session directly)
       if (commandType === "extension_ui_response") {
@@ -621,42 +638,23 @@ export class PiSessionManager {
             command: "extension_ui_response",
             success: true,
           };
-        } else {
-          return {
-            id,
-            type: "response",
-            command: "extension_ui_response",
-            success: false,
-            error: result.error ?? "Unknown error",
-          };
         }
+        return failResponse(result.error ?? "Unknown error", "extension_ui_response");
       }
 
       // Route to command handler
-      const result = routeSessionCommand(session, command, (sid) => this.getSessionInfo(sid));
-      if (result === undefined) {
-        return {
-          id,
-          type: "response",
-          command: commandType,
-          success: false,
-          error: `Unknown command type: ${commandType}`,
-        };
+      const routed = routeSessionCommand(session, command, (sid) => this.getSessionInfo(sid));
+      if (routed === undefined) {
+        return failResponse(`Unknown command type: ${commandType}`);
       }
 
-      // Wrap async handlers with timeout
-      if (result instanceof Promise) {
-        return withTimeout(result, timeoutMs, commandType);
+      const response = routed instanceof Promise ? await withTimeout(routed, timeoutMs, commandType) : routed;
+      if (!response.success) {
+        return failResponse(response.error ?? "Unknown error", response.command);
       }
-      return result;
+      return response;
     } catch (error) {
-      return {
-        id,
-        type: "response",
-        command: commandType,
-        success: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
+      return failResponse(error instanceof Error ? error.message : String(error));
     }
   }
 

@@ -158,6 +158,39 @@ async function testValidation() {
     );
   });
 
+  await test("validation: rejects extension_ui_response with invalid method", () => {
+    const errors = validateCommand({
+      type: "extension_ui_response",
+      sessionId: "test",
+      requestId: "req1",
+      response: { method: "bad_method" },
+    });
+    assert(errors.some((e) => e.field === "response.method"), "Should have response.method error");
+  });
+
+  await test("validation: rejects unknown command type", () => {
+    const errors = validateCommand({ type: "totally_unknown", sessionId: "x" });
+    assert(errors.some((e) => e.field === "type"), "Should reject unknown command type");
+  });
+
+  await test("validation: rejects overly long prompt message", () => {
+    const errors = validateCommand({
+      type: "prompt",
+      sessionId: "test",
+      message: "x".repeat(210_000),
+    });
+    assert(errors.some((e) => e.field === "message"), "Should reject long message");
+  });
+
+  await test("validation: rejects session name with control chars", () => {
+    const errors = validateCommand({
+      type: "set_session_name",
+      sessionId: "test",
+      name: "bad\nname",
+    });
+    assert(errors.some((e) => e.field === "name"), "Should reject control chars");
+  });
+
   // Test: Format validation errors
   await test("validation: formatValidationErrors works", () => {
     const formatted = formatValidationErrors([
@@ -431,6 +464,26 @@ async function testResourceGovernor() {
     assert(governor.validateCwd(null as any)?.includes("non-empty"));
   });
 
+  await test("governor: rejects overly long CWD", () => {
+    const governor = new ResourceGovernor();
+    const tooLong = "a".repeat(5000);
+    assert(governor.validateCwd(tooLong)?.includes("too long"));
+  });
+
+  await test("governor: refundCommand restores counters", () => {
+    const governor = new ResourceGovernor({ ...DEFAULT_CONFIG, maxCommandsPerMinute: 2 });
+    assert.strictEqual(governor.canExecuteCommand("s1").allowed, true);
+    assert.strictEqual(governor.canExecuteCommand("s1").allowed, true);
+
+    let metrics = governor.getMetrics();
+    assert.strictEqual(metrics.totalCommandsExecuted, 2);
+
+    governor.refundCommand("s1");
+    metrics = governor.getMetrics();
+    assert.strictEqual(metrics.totalCommandsExecuted, 1);
+    assert.strictEqual(governor.getRateLimitUsage("s1").session, 1);
+  });
+
   // Test: Connection limits
   await test("governor: enforces connection limit", () => {
     const governor = new ResourceGovernor({ ...DEFAULT_CONFIG, maxConnections: 2 });
@@ -490,11 +543,21 @@ async function testResourceGovernor() {
     const governor = new ResourceGovernor();
     governor.registerConnection();
     governor.registerConnection();
-    
+
     const metrics = governor.getMetrics();
     assert.strictEqual(metrics.connectionCount, 2);
     assert.strictEqual(typeof metrics.commandsRejected.connectionLimit, "number");
     assert.strictEqual(typeof metrics.zombieSessionsCleaned, "number");
+  });
+
+  await test("governor: tracks double-unregister errors", () => {
+    const governor = new ResourceGovernor();
+    governor.registerConnection();
+    governor.unregisterConnection();
+    governor.unregisterConnection(); // double-unregister
+
+    const metrics = governor.getMetrics();
+    assert.strictEqual(metrics.doubleUnregisterErrors, 1);
   });
 }
 
@@ -523,7 +586,7 @@ async function testSessionManager() {
       sessionId: "test",
     } as any);
     assert.strictEqual(response.success, false, "Should fail");
-    assert(response.error?.includes("Session test not found"), "Should mention session not found");
+    assert(response.error?.includes("Unknown command type"), "Should mention unknown command type");
   });
 
   // Test: List sessions when empty
@@ -531,6 +594,24 @@ async function testSessionManager() {
     const response = await manager.executeCommand({ type: "list_sessions" });
     assert.strictEqual(response.success, true, "Should succeed");
     assert.deepStrictEqual((response as any).data.sessions, [], "Should be empty array");
+  });
+
+  await test("session-manager: refunds rate limit for failed session command", async () => {
+    const governor = new ResourceGovernor({
+      ...DEFAULT_CONFIG,
+      maxCommandsPerMinute: 1,
+      maxGlobalCommandsPerMinute: 100,
+    });
+    const testManager = new PiSessionManager(governor);
+
+    const r1 = await testManager.executeCommand({ type: "get_state", sessionId: "missing" });
+    assert.strictEqual(r1.success, false);
+    assert(r1.error?.includes("not found"));
+
+    // Should not be rate limited because first failed command is refunded
+    const r2 = await testManager.executeCommand({ type: "get_state", sessionId: "missing" });
+    assert.strictEqual(r2.success, false);
+    assert(r2.error?.includes("not found"), "Expected not-found, not rate-limit");
   });
 
   // Test: Create and delete session (integration test)
@@ -662,6 +743,12 @@ async function testSessionManager() {
     const result = await manager.initiateShutdown(1000);
     assert.strictEqual(result.drained, 0, "Should drain 0 commands");
     assert.strictEqual(result.timedOut, false, "Should not timeout");
+  });
+
+  await test("session-manager: sanitizes invalid shutdown timeout", async () => {
+    const localManager = new PiSessionManager();
+    const result = await localManager.initiateShutdown(-1 as any);
+    assert.strictEqual(result.timedOut, false);
   });
 
   // Test: In-flight count tracking
