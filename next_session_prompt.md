@@ -77,18 +77,27 @@ Repo: https://github.com/tryingET/pi-server
 
 ## OPEN QUESTIONS
 
-### 1. Should biome catch redundant dynamic imports?
+### 1. Import discipline: static vs dynamic
 
 Found in test.ts:
 ```typescript
-// File already has: import { ResourceGovernor } from "./resource-governor.js";
-// But then later inside a test:
-const { ResourceGovernor } = await import("./resource-governor.js"); // REDUNDANT
+// At top of file:
+import { ResourceGovernor, DEFAULT_CONFIG } from "./resource-governor.js";
+
+// Later, inside ONE test function:
+const { ResourceGovernor } = await import("./resource-governor.js"); // WRONG
 ```
 
-This is dead code - the static import is already available. Should biome have a rule for this?
+**The real question:** Why was it imported at the top if it should be imported inside a function?
 
-**Fix applied:** Removed redundant dynamic import, use static import instead.
+**Answer:** It SHOULD be imported at the top. The static import is used by 20+ tests. The dynamic import was accidental cruft (debugging leftover or copy-paste).
+
+**Rule:**
+- Static import = module is a file-level dependency
+- Dynamic import = module is conditionally/optionally needed
+- **Both for same module = one is wrong**
+
+In this case: static was correct, dynamic was dead code.
 
 ---
 
