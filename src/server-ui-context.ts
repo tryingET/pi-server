@@ -11,7 +11,7 @@
  */
 
 import type { ExtensionUIContext, TerminalInputHandler } from "@mariozechner/pi-coding-agent";
-import type { ExtensionUIManager, } from "./extension-ui.js";
+import type { ExtensionUIManager } from "./extension-ui.js";
 import {
   isSelectResponse,
   isConfirmResponse,

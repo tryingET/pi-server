@@ -165,12 +165,61 @@ async function testValidation() {
       requestId: "req1",
       response: { method: "bad_method" },
     });
-    assert(errors.some((e) => e.field === "response.method"), "Should have response.method error");
+    assert(
+      errors.some((e) => e.field === "response.method"),
+      "Should have response.method error"
+    );
   });
 
   await test("validation: rejects unknown command type", () => {
     const errors = validateCommand({ type: "totally_unknown", sessionId: "x" });
-    assert(errors.some((e) => e.field === "type"), "Should reject unknown command type");
+    assert(
+      errors.some((e) => e.field === "type"),
+      "Should reject unknown command type"
+    );
+  });
+
+  await test("validation: dependsOn requires command id", () => {
+    const errors = validateCommand({ type: "list_sessions", dependsOn: ["abc"] });
+    assert(
+      errors.some((e) => e.field === "id"),
+      "Should require id when dependsOn is present"
+    );
+  });
+
+  await test("validation: validates idempotency key type", () => {
+    const errors = validateCommand({
+      type: "list_sessions",
+      id: "x",
+      idempotencyKey: 42,
+    } as any);
+    assert(
+      errors.some((e) => e.field === "idempotencyKey"),
+      "Should reject invalid idempotencyKey type"
+    );
+  });
+
+  await test("validation: validates ifSessionVersion", () => {
+    const errors = validateCommand({
+      type: "get_state",
+      sessionId: "test",
+      ifSessionVersion: -1,
+    });
+    assert(
+      errors.some((e) => e.field === "ifSessionVersion"),
+      "Should reject negative version"
+    );
+  });
+
+  await test("validation: rejects ifSessionVersion on non-session command", () => {
+    const errors = validateCommand({
+      type: "list_sessions",
+      ifSessionVersion: 1,
+    });
+    assert(
+      errors.some((e) => e.field === "ifSessionVersion"),
+      "Should reject ifSessionVersion for non-session commands"
+    );
   });
 
   await test("validation: rejects overly long prompt message", () => {
@@ -179,7 +228,10 @@ async function testValidation() {
       sessionId: "test",
       message: "x".repeat(210_000),
     });
-    assert(errors.some((e) => e.field === "message"), "Should reject long message");
+    assert(
+      errors.some((e) => e.field === "message"),
+      "Should reject long message"
+    );
   });
 
   await test("validation: rejects session name with control chars", () => {
@@ -188,7 +240,10 @@ async function testValidation() {
       sessionId: "test",
       name: "bad\nname",
     });
-    assert(errors.some((e) => e.field === "name"), "Should reject control chars");
+    assert(
+      errors.some((e) => e.field === "name"),
+      "Should reject control chars"
+    );
   });
 
   // Test: Format validation errors
@@ -227,6 +282,7 @@ async function testCommandRouter() {
 // =============================================================================
 
 import { ResourceGovernor, DEFAULT_CONFIG } from "./resource-governor.js";
+import { ExtensionUIManager } from "./extension-ui.js";
 
 async function testResourceGovernor() {
   console.log("\n=== Resource Governor Tests ===\n");
@@ -236,9 +292,21 @@ async function testResourceGovernor() {
     const governor = new ResourceGovernor();
     const config = governor.getConfig();
     assert.strictEqual(config.maxSessions, 100, "Default maxSessions should be 100");
-    assert.strictEqual(config.maxMessageSizeBytes, 10 * 1024 * 1024, "Default maxMessageSizeBytes should be 10MB");
-    assert.strictEqual(config.maxCommandsPerMinute, 100, "Default maxCommandsPerMinute should be 100");
-    assert.strictEqual(config.maxGlobalCommandsPerMinute, 1000, "Default maxGlobalCommandsPerMinute should be 1000");
+    assert.strictEqual(
+      config.maxMessageSizeBytes,
+      10 * 1024 * 1024,
+      "Default maxMessageSizeBytes should be 10MB"
+    );
+    assert.strictEqual(
+      config.maxCommandsPerMinute,
+      100,
+      "Default maxCommandsPerMinute should be 100"
+    );
+    assert.strictEqual(
+      config.maxGlobalCommandsPerMinute,
+      1000,
+      "Default maxGlobalCommandsPerMinute should be 1000"
+    );
   });
 
   // Test: Custom config
@@ -270,9 +338,17 @@ async function testResourceGovernor() {
   // Test: Legacy session limit API (deprecated but still works)
   await test("governor: enforces session limit (legacy API)", () => {
     const governor = new ResourceGovernor({ ...DEFAULT_CONFIG, maxSessions: 2 });
-    assert.strictEqual(governor.canCreateSession().allowed, true, "First session should be allowed");
+    assert.strictEqual(
+      governor.canCreateSession().allowed,
+      true,
+      "First session should be allowed"
+    );
     governor.registerSession("s1");
-    assert.strictEqual(governor.canCreateSession().allowed, true, "Second session should be allowed");
+    assert.strictEqual(
+      governor.canCreateSession().allowed,
+      true,
+      "Second session should be allowed"
+    );
     governor.registerSession("s2");
     const result = governor.canCreateSession();
     assert.strictEqual(result.allowed, false, "Third session should be rejected");
@@ -303,21 +379,25 @@ async function testResourceGovernor() {
   // Test: Invalid message sizes (negative, NaN, Infinity)
   await test("governor: rejects invalid message sizes", () => {
     const governor = new ResourceGovernor();
-    
+
     const negResult = governor.canAcceptMessage(-1);
     assert.strictEqual(negResult.allowed, false, "Negative size should be rejected");
     assert(negResult.reason?.includes("Invalid"), "Should mention Invalid");
-    
+
     const nanResult = governor.canAcceptMessage(NaN);
     assert.strictEqual(nanResult.allowed, false, "NaN should be rejected");
-    
+
     const infResult = governor.canAcceptMessage(Infinity);
     assert.strictEqual(infResult.allowed, false, "Infinity should be rejected");
   });
 
   // Test: Per-session rate limiting
   await test("governor: enforces per-session rate limit", () => {
-    const governor = new ResourceGovernor({ ...DEFAULT_CONFIG, maxCommandsPerMinute: 3, maxGlobalCommandsPerMinute: 100 });
+    const governor = new ResourceGovernor({
+      ...DEFAULT_CONFIG,
+      maxCommandsPerMinute: 3,
+      maxGlobalCommandsPerMinute: 100,
+    });
     assert.strictEqual(governor.canExecuteCommand("s1").allowed, true, "1st command allowed");
     assert.strictEqual(governor.canExecuteCommand("s1").allowed, true, "2nd command allowed");
     assert.strictEqual(governor.canExecuteCommand("s1").allowed, true, "3rd command allowed");
@@ -328,18 +408,38 @@ async function testResourceGovernor() {
 
   // Test: Rate limiting is per-session
   await test("governor: rate limit is per session", () => {
-    const governor = new ResourceGovernor({ ...DEFAULT_CONFIG, maxCommandsPerMinute: 2, maxGlobalCommandsPerMinute: 100 });
+    const governor = new ResourceGovernor({
+      ...DEFAULT_CONFIG,
+      maxCommandsPerMinute: 2,
+      maxGlobalCommandsPerMinute: 100,
+    });
     assert.strictEqual(governor.canExecuteCommand("s1").allowed, true);
     assert.strictEqual(governor.canExecuteCommand("s1").allowed, true);
-    assert.strictEqual(governor.canExecuteCommand("s1").allowed, false, "s1 should be rate limited");
-    assert.strictEqual(governor.canExecuteCommand("s2").allowed, true, "s2 should still be allowed");
+    assert.strictEqual(
+      governor.canExecuteCommand("s1").allowed,
+      false,
+      "s1 should be rate limited"
+    );
+    assert.strictEqual(
+      governor.canExecuteCommand("s2").allowed,
+      true,
+      "s2 should still be allowed"
+    );
     assert.strictEqual(governor.canExecuteCommand("s2").allowed, true);
-    assert.strictEqual(governor.canExecuteCommand("s2").allowed, false, "s2 should now be rate limited");
+    assert.strictEqual(
+      governor.canExecuteCommand("s2").allowed,
+      false,
+      "s2 should now be rate limited"
+    );
   });
 
   // Test: Global rate limiting
   await test("governor: enforces global rate limit", () => {
-    const governor = new ResourceGovernor({ ...DEFAULT_CONFIG, maxCommandsPerMinute: 100, maxGlobalCommandsPerMinute: 3 });
+    const governor = new ResourceGovernor({
+      ...DEFAULT_CONFIG,
+      maxCommandsPerMinute: 100,
+      maxGlobalCommandsPerMinute: 3,
+    });
     assert.strictEqual(governor.canExecuteCommand("s1").allowed, true, "1st global command");
     assert.strictEqual(governor.canExecuteCommand("s2").allowed, true, "2nd global command");
     assert.strictEqual(governor.canExecuteCommand("s3").allowed, true, "3rd global command");
@@ -350,7 +450,11 @@ async function testResourceGovernor() {
 
   // Test: Rate limit usage tracking
   await test("governor: tracks rate limit usage", () => {
-    const governor = new ResourceGovernor({ ...DEFAULT_CONFIG, maxCommandsPerMinute: 5, maxGlobalCommandsPerMinute: 10 });
+    const governor = new ResourceGovernor({
+      ...DEFAULT_CONFIG,
+      maxCommandsPerMinute: 5,
+      maxGlobalCommandsPerMinute: 10,
+    });
     governor.canExecuteCommand("s1");
     governor.canExecuteCommand("s1");
     governor.canExecuteCommand("s2");
@@ -378,10 +482,10 @@ async function testResourceGovernor() {
     });
     governor.registerSession("s1");
     assert.strictEqual(governor.getZombieSessions().length, 0, "Fresh session is not zombie");
-    
+
     // Wait for zombie timeout
     await new Promise((resolve) => setTimeout(resolve, 150));
-    
+
     const zombies = governor.getZombieSessions();
     assert.strictEqual(zombies.length, 1, "Should detect zombie");
     assert.strictEqual(zombies[0], "s1", "Zombie should be s1");
@@ -395,7 +499,11 @@ async function testResourceGovernor() {
     const metrics = governor.getMetrics();
     assert.strictEqual(metrics.rateLimitUsage.globalCount, 2, "Should have 2 global commands");
     assert.strictEqual(metrics.rateLimitUsage.globalLimit, 5, "Should have limit 5");
-    assert.strictEqual(typeof metrics.commandsRejected.globalRateLimit, "number", "Should track global rejections");
+    assert.strictEqual(
+      typeof metrics.commandsRejected.globalRateLimit,
+      "number",
+      "Should track global rejections"
+    );
   });
 
   // Test: Cleanup stale timestamps
@@ -403,14 +511,14 @@ async function testResourceGovernor() {
     const governor = new ResourceGovernor();
     governor.canExecuteCommand("s1");
     governor.canExecuteCommand("s1");
-    
+
     // Timestamps should exist
     const usageBefore = governor.getRateLimitUsage("s1");
     assert.strictEqual(usageBefore.session, 2, "Should have 2 timestamps");
-    
+
     // Cleanup (won't remove recent ones)
     governor.cleanupStaleTimestamps();
-    
+
     const usageAfter = governor.getRateLimitUsage("s1");
     assert.strictEqual(usageAfter.session, 2, "Recent timestamps still there");
   });
@@ -422,25 +530,29 @@ async function testResourceGovernor() {
     governor.registerSession("s2");
     governor.canExecuteCommand("s2");
     governor.unregisterSession("s2");
-    
+
     // s2 is unregistered but may still have rate limit data
     // Clean up with only s1 active
     governor.cleanupStaleData(new Set(["s1"]));
-    
+
     // s2's data should be cleaned
-    assert.strictEqual(governor.getLastHeartbeat("s2"), undefined, "s2 heartbeat should be cleaned");
+    assert.strictEqual(
+      governor.getLastHeartbeat("s2"),
+      undefined,
+      "s2 heartbeat should be cleaned"
+    );
   });
 
   // Test: Session ID validation
   await test("governor: validates session IDs", () => {
     const governor = new ResourceGovernor();
-    
+
     // Valid IDs
     assert.strictEqual(governor.validateSessionId("test-1"), null);
     assert.strictEqual(governor.validateSessionId("my_session"), null);
     assert.strictEqual(governor.validateSessionId("session.1"), null);
     assert.strictEqual(governor.validateSessionId("a"), null);
-    
+
     // Invalid IDs
     assert(governor.validateSessionId("")?.includes("non-empty"));
     assert(governor.validateSessionId("test session")?.includes("alphanumeric"));
@@ -452,11 +564,11 @@ async function testResourceGovernor() {
   // Test: CWD validation
   await test("governor: validates CWD paths", () => {
     const governor = new ResourceGovernor();
-    
-    // Valid paths (relative, no traversal)
-    // Note: CWD validation is strict - only blocks dangerous patterns
-    assert(governor.validateCwd("/absolute/path")?.includes("dangerous")); // starts with /
-    
+
+    // Valid paths (absolute and relative)
+    assert.strictEqual(governor.validateCwd("/absolute/path"), null);
+    assert.strictEqual(governor.validateCwd("relative/path"), null);
+
     // Invalid paths
     assert(governor.validateCwd("../../../etc")?.includes("dangerous"));
     assert(governor.validateCwd("~/home")?.includes("dangerous"));
@@ -487,19 +599,19 @@ async function testResourceGovernor() {
   // Test: Connection limits
   await test("governor: enforces connection limit", () => {
     const governor = new ResourceGovernor({ ...DEFAULT_CONFIG, maxConnections: 2 });
-    
+
     assert.strictEqual(governor.canAcceptConnection().allowed, true);
     governor.registerConnection();
     assert.strictEqual(governor.getConnectionCount(), 1);
-    
+
     assert.strictEqual(governor.canAcceptConnection().allowed, true);
     governor.registerConnection();
     assert.strictEqual(governor.getConnectionCount(), 2);
-    
+
     const result = governor.canAcceptConnection();
     assert.strictEqual(result.allowed, false);
     assert(result.reason?.includes("Connection limit"));
-    
+
     // Unregister
     governor.unregisterConnection();
     assert.strictEqual(governor.getConnectionCount(), 1);
@@ -508,10 +620,27 @@ async function testResourceGovernor() {
   // Test: Health check
   await test("governor: health check works", () => {
     const governor = new ResourceGovernor();
-    
+
     const healthy = governor.isHealthy();
     assert.strictEqual(healthy.healthy, true);
     assert.deepStrictEqual(healthy.issues, []);
+  });
+
+  await test("governor: health_check does not inflate zombie detection metrics", async () => {
+    const governor = new ResourceGovernor({
+      ...DEFAULT_CONFIG,
+      zombieTimeoutMs: 50,
+    });
+
+    governor.registerSession("zombie-metric");
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const before = governor.getMetrics().zombieSessionsDetected;
+    governor.isHealthy();
+    governor.isHealthy();
+    const after = governor.getMetrics().zombieSessionsDetected;
+
+    assert.strictEqual(after, before, "isHealthy() should not mutate detection metrics");
   });
 
   // Test: Zombie cleanup
@@ -520,19 +649,19 @@ async function testResourceGovernor() {
       ...DEFAULT_CONFIG,
       zombieTimeoutMs: 100,
     });
-    
+
     governor.registerSession("zombie1");
     governor.registerSession("zombie2");
-    
+
     // Wait for timeout
     await new Promise((resolve) => setTimeout(resolve, 150));
-    
+
     // Cleanup
     const cleaned = governor.cleanupZombieSessions();
     assert.strictEqual(cleaned.length, 2, "Should clean 2 zombies");
     assert(cleaned.includes("zombie1"));
     assert(cleaned.includes("zombie2"));
-    
+
     // Verify cleaned
     assert.strictEqual(governor.getLastHeartbeat("zombie1"), undefined);
     assert.strictEqual(governor.getLastHeartbeat("zombie2"), undefined);
@@ -558,6 +687,28 @@ async function testResourceGovernor() {
 
     const metrics = governor.getMetrics();
     assert.strictEqual(metrics.doubleUnregisterErrors, 1);
+  });
+}
+
+// =============================================================================
+// EXTENSION UI TESTS
+// =============================================================================
+
+async function testExtensionUI() {
+  console.log("\n=== Extension UI Tests ===\n");
+
+  await test("extension-ui: honors per-request timeout", async () => {
+    const ui = new ExtensionUIManager(() => {}, 500);
+    const start = Date.now();
+
+    const { promise } = ui.createPendingRequest("s1", "input", { timeout: 50 });
+
+    await assert.rejects(promise, (error: Error) => {
+      const elapsed = Date.now() - start;
+      assert(elapsed < 300, `Expected timeout near request timeout, got ${elapsed}ms`);
+      assert(error.message.includes("50ms"), "Error should report request-scoped timeout");
+      return true;
+    });
   });
 }
 
@@ -594,6 +745,191 @@ async function testSessionManager() {
     const response = await manager.executeCommand({ type: "list_sessions" });
     assert.strictEqual(response.success, true, "Should succeed");
     assert.deepStrictEqual((response as any).data.sessions, [], "Should be empty array");
+  });
+
+  await test("session-manager: enforces dependsOn command dependencies", async () => {
+    const first = await manager.executeCommand({ id: "dep-a", type: "list_sessions" });
+    assert.strictEqual(first.success, true);
+
+    const second = await manager.executeCommand({
+      id: "dep-b",
+      type: "list_sessions",
+      dependsOn: ["dep-a"],
+    } as any);
+    assert.strictEqual(second.success, true, "Dependent command should succeed");
+  });
+
+  await test("session-manager: rejects unknown dependency", async () => {
+    const response = await manager.executeCommand({
+      id: "dep-missing",
+      type: "list_sessions",
+      dependsOn: ["missing-command"],
+    } as any);
+
+    assert.strictEqual(response.success, false);
+    assert(response.error?.includes("Dependency 'missing-command'"));
+  });
+
+  await test("session-manager: replays idempotent commands", async () => {
+    const first = await manager.executeCommand({
+      id: "idem-1",
+      type: "list_sessions",
+      idempotencyKey: "same-key",
+    } as any);
+    const second = await manager.executeCommand({
+      id: "idem-2",
+      type: "list_sessions",
+      idempotencyKey: "same-key",
+    } as any);
+
+    assert.strictEqual(first.success, true);
+    assert.strictEqual(second.success, true);
+    assert.strictEqual(second.replayed, true, "Second response should come from replay cache");
+  });
+
+  await test("session-manager: rejects conflicting duplicate command IDs", async () => {
+    const first = await manager.executeCommand({ id: "dup-id", type: "list_sessions" } as any);
+    assert.strictEqual(first.success, true);
+
+    const second = await manager.executeCommand({ id: "dup-id", type: "health_check" } as any);
+    assert.strictEqual(second.success, false, "Conflicting duplicate ID should fail");
+    assert(second.error?.includes("Conflicting id 'dup-id'"));
+  });
+
+  await test("session-manager: rejects conflicting idempotency keys", async () => {
+    const first = await manager.executeCommand({
+      id: "idem-conflict-1",
+      type: "list_sessions",
+      idempotencyKey: "idem-conflict",
+    } as any);
+    assert.strictEqual(first.success, true);
+
+    const second = await manager.executeCommand({
+      id: "idem-conflict-2",
+      type: "health_check",
+      idempotencyKey: "idem-conflict",
+    } as any);
+    assert.strictEqual(second.success, false, "Conflicting idempotency key should fail");
+    assert(second.error?.includes("Conflicting idempotencyKey 'idem-conflict'"));
+  });
+
+  await test("session-manager: strips stale response IDs when replaying without request id", async () => {
+    const first = await manager.executeCommand({
+      id: "idem-strip-1",
+      type: "list_sessions",
+      idempotencyKey: "idem-strip",
+    } as any);
+    assert.strictEqual(first.success, true);
+
+    const second = await manager.executeCommand({
+      type: "list_sessions",
+      idempotencyKey: "idem-strip",
+    } as any);
+    assert.strictEqual(second.success, true);
+    assert.strictEqual(second.id, undefined, "Replay without request ID should not leak old ID");
+  });
+
+  await test("session-manager: fails fast for same-lane dependency inversion", async () => {
+    const startedAt = Date.now();
+    const [a, b] = await Promise.all([
+      manager.executeCommand({
+        id: "dep-invert-a",
+        type: "list_sessions",
+        dependsOn: ["dep-invert-b"],
+      } as any),
+      manager.executeCommand({ id: "dep-invert-b", type: "list_sessions" } as any),
+    ]);
+
+    const elapsed = Date.now() - startedAt;
+    assert(elapsed < 5000, `Expected fast failure, got ${elapsed}ms`);
+    assert.strictEqual(a.success, false, "Inverted dependency should fail");
+    assert(a.error?.includes("same lane"));
+    assert.strictEqual(b.success, true, "Independent command should still run");
+  });
+
+  await test("session-manager: dependency wait timeout is enforced", async () => {
+    const localManager = new PiSessionManager(undefined, { dependencyWaitTimeoutMs: 40 });
+    const never = new Promise<any>(() => {});
+
+    // Simulate a dependency currently in-flight on a different lane.
+    (localManager as any).commandInFlightById.set("dep-stuck", {
+      commandType: "get_state",
+      laneKey: "session:other",
+      fingerprint: "dep-stuck-fingerprint",
+      promise: never,
+    });
+
+    const startedAt = Date.now();
+    const response = await localManager.executeCommand({
+      id: "dep-timeout",
+      type: "list_sessions",
+      dependsOn: ["dep-stuck"],
+    } as any);
+
+    const elapsed = Date.now() - startedAt;
+    assert.strictEqual(response.success, false);
+    assert(response.error?.includes("timed out"), `Unexpected error: ${response.error}`);
+    assert(elapsed < 2000, `Dependency timeout should be fast in test, got ${elapsed}ms`);
+  });
+
+  await test("session-manager: idempotency cache expires by TTL", async () => {
+    const localManager = new PiSessionManager(undefined, { idempotencyTtlMs: 40 });
+
+    const first = await localManager.executeCommand({
+      id: "idem-ttl-1",
+      type: "list_sessions",
+      idempotencyKey: "ttl-key",
+    } as any);
+    assert.strictEqual(first.success, true);
+
+    await new Promise((resolve) => setTimeout(resolve, 70));
+
+    const second = await localManager.executeCommand({
+      id: "idem-ttl-2",
+      type: "list_sessions",
+      idempotencyKey: "ttl-key",
+    } as any);
+
+    assert.strictEqual(second.success, true);
+    assert.notStrictEqual(second.replayed, true, "Expired idempotency entry should not replay");
+  });
+
+  await test("session-manager: replay after timeout reflects eventual command result", async () => {
+    const localManager = new PiSessionManager(undefined, {
+      defaultCommandTimeoutMs: 10,
+      shortCommandTimeoutMs: 10,
+    });
+
+    const managerAny = localManager as any;
+    const originalExecuteInternal = managerAny.executeCommandInternal.bind(localManager);
+
+    managerAny.executeCommandInternal = async (
+      command: any,
+      id: string | undefined,
+      commandType: string
+    ) => {
+      if (commandType === "list_sessions") {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        return {
+          id,
+          type: "response",
+          command: "list_sessions",
+          success: true,
+          data: { sessions: [] },
+        };
+      }
+      return originalExecuteInternal(command, id, commandType);
+    };
+
+    const first = await localManager.executeCommand({ id: "timeout-replay", type: "list_sessions" });
+    assert.strictEqual(first.success, false, "Initial caller should time out");
+    assert(first.error?.includes("timed out"), `Expected timeout error, got: ${first.error}`);
+
+    await new Promise((resolve) => setTimeout(resolve, 70));
+
+    const second = await localManager.executeCommand({ id: "timeout-replay", type: "list_sessions" });
+    assert.strictEqual(second.success, true, "Replay should reflect eventual successful completion");
+    assert.strictEqual(second.replayed, true, "Second response should be replayed");
   });
 
   await test("session-manager: refunds rate limit for failed session command", async () => {
@@ -677,13 +1013,17 @@ async function testSessionManager() {
 
   // Test: Switch session
   await test("session-manager: switches session", async () => {
-    await manager.executeCommand({ type: "create_session", sessionId: "switch-test" });
+    const created = await manager.executeCommand({ type: "create_session", sessionId: "switch-test" });
+    assert.strictEqual(created.success, true, "Create should succeed");
+    assert.strictEqual(created.sessionVersion, 0, "New session should start at version 0");
+
     const response = await manager.executeCommand({
       type: "switch_session",
       sessionId: "switch-test",
     });
     assert.strictEqual(response.success, true, "Should succeed");
     assert.strictEqual((response as any).data.sessionInfo.sessionId, "switch-test");
+    assert.strictEqual(response.sessionVersion, 0, "switch_session should not mutate session version");
 
     // Cleanup
     await manager.executeCommand({ type: "delete_session", sessionId: "switch-test" });
@@ -717,21 +1057,21 @@ async function testSessionManager() {
   // Test: Graceful shutdown rejects new commands
   await test("session-manager: rejects commands during shutdown", async () => {
     const manager = new PiSessionManager();
-    
+
     // Create a session first
     await manager.executeCommand({ type: "create_session", sessionId: "shutdown-test" });
-    
+
     // Initiate shutdown (don't await yet)
     const shutdownPromise = manager.initiateShutdown(1000);
-    
+
     // Try to execute a command - should be rejected
     const response = await manager.executeCommand({ type: "list_sessions" });
     assert.strictEqual(response.success, false, "Should reject during shutdown");
     assert(response.error?.includes("shutting down"), "Should mention shutting down");
-    
+
     // Wait for shutdown to complete
     await shutdownPromise;
-    
+
     // Cleanup
     // Note: session is still there, just can't execute commands
   });
@@ -739,7 +1079,7 @@ async function testSessionManager() {
   // Test: Shutdown with no in-flight commands
   await test("session-manager: shutdown with no in-flight commands", async () => {
     const manager = new PiSessionManager();
-    
+
     const result = await manager.initiateShutdown(1000);
     assert.strictEqual(result.drained, 0, "Should drain 0 commands");
     assert.strictEqual(result.timedOut, false, "Should not timeout");
@@ -754,13 +1094,13 @@ async function testSessionManager() {
   // Test: In-flight count tracking
   await test("session-manager: tracks in-flight commands", async () => {
     const manager = new PiSessionManager();
-    
+
     // Create a session
     await manager.executeCommand({ type: "create_session", sessionId: "inflight-test" });
-    
+
     // After command completes, in-flight should be 0
     assert.strictEqual(manager.getInFlightCount(), 0, "No in-flight after completion");
-    
+
     // Cleanup
     await manager.executeCommand({ type: "delete_session", sessionId: "inflight-test" });
   });
@@ -768,11 +1108,11 @@ async function testSessionManager() {
   // Test: Idempotent shutdown
   await test("session-manager: shutdown is idempotent", async () => {
     const manager = new PiSessionManager();
-    
+
     // First shutdown
     const result1 = await manager.initiateShutdown(1000);
     assert.strictEqual(result1.timedOut, false, "First shutdown should succeed");
-    
+
     // Second shutdown should return immediately without error
     const result2 = await manager.initiateShutdown(1000);
     assert.strictEqual(result2.timedOut, false, "Second shutdown should be idempotent");
@@ -782,31 +1122,31 @@ async function testSessionManager() {
   // Test: isInShutdown reflects state
   await test("session-manager: isInShutdown reflects state", async () => {
     const manager = new PiSessionManager();
-    
+
     assert.strictEqual(manager.isInShutdown(), false, "Not in shutdown initially");
-    
+
     await manager.initiateShutdown(1000);
-    
+
     assert.strictEqual(manager.isInShutdown(), true, "In shutdown after initiateShutdown");
   });
 
   // Test: disposeAllSessions
   await test("session-manager: disposeAllSessions cleans up", async () => {
     const manager = new PiSessionManager();
-    
+
     // Create sessions
     await manager.executeCommand({ type: "create_session", sessionId: "dispose1" });
     await manager.executeCommand({ type: "create_session", sessionId: "dispose2" });
-    
+
     // Verify sessions exist
     const listBefore = await manager.executeCommand({ type: "list_sessions" });
     assert.strictEqual((listBefore as any).data.sessions.length, 2, "Should have 2 sessions");
-    
+
     // Dispose all
     const result = manager.disposeAllSessions();
     assert.strictEqual(result.disposed, 2, "Should dispose 2 sessions");
     assert.strictEqual(result.failed, 0, "Should have 0 failures");
-    
+
     // Verify sessions are gone
     const listAfter = await manager.executeCommand({ type: "list_sessions" });
     assert.strictEqual((listAfter as any).data.sessions.length, 0, "Should have 0 sessions");
@@ -823,6 +1163,7 @@ async function main() {
   await testValidation();
   await testCommandRouter();
   await testResourceGovernor();
+  await testExtensionUI();
   await testSessionManager();
 
   console.log("\n" + "=".repeat(50));

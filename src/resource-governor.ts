@@ -102,7 +102,7 @@ const CWD_MAX_LENGTH = 4096;
 const SESSION_ID_PATTERN = /^[a-zA-Z0-9_.-]+$/;
 
 /** Dangerous path patterns */
-const DANGEROUS_PATH_PATTERNS = [/\.\./, /^\//, /^~/, /^\//];
+const DANGEROUS_PATH_PATTERNS = [/\.\./, /^~/];
 
 // ============================================================================
 // GOVERNOR CLASS
@@ -110,7 +110,7 @@ const DANGEROUS_PATH_PATTERNS = [/\.\./, /^\//, /^~/, /^\//];
 
 /**
  * ResourceGovernor enforces resource limits for the server.
- * 
+ *
  * Memory management:
  * - Rate limit timestamps are cleaned up when they exceed a threshold
  * - Session-specific data is cleaned up when sessions are deleted
@@ -214,7 +214,9 @@ export class ResourceGovernor {
     if (this.sessionCount < 0) {
       this.doubleUnregisterErrors++;
       this.sessionCount = 0;
-      console.error("[ResourceGovernor] ERROR: releaseSessionSlot called with no active slots (double-unregister)");
+      console.error(
+        "[ResourceGovernor] ERROR: releaseSessionSlot called with no active slots (double-unregister)"
+      );
     }
   }
 
@@ -251,7 +253,9 @@ export class ResourceGovernor {
     if (this.sessionCount < 0) {
       this.doubleUnregisterErrors++;
       this.sessionCount = 0;
-      console.error(`[ResourceGovernor] ERROR: unregisterSession('${sessionId}') called with no active slots (double-unregister)`);
+      console.error(
+        `[ResourceGovernor] ERROR: unregisterSession('${sessionId}') called with no active slots (double-unregister)`
+      );
     }
     this.lastHeartbeat.delete(sessionId);
     this.commandTimestamps.delete(sessionId);
@@ -298,7 +302,9 @@ export class ResourceGovernor {
     if (this.connectionCount < 0) {
       this.doubleUnregisterErrors++;
       this.connectionCount = 0;
-      console.error("[ResourceGovernor] ERROR: unregisterConnection called with no active connections (double-unregister)");
+      console.error(
+        "[ResourceGovernor] ERROR: unregisterConnection called with no active connections (double-unregister)"
+      );
     }
   }
 
@@ -325,7 +331,7 @@ export class ResourceGovernor {
         reason: `Invalid message size: ${sizeBytes}`,
       };
     }
-    
+
     if (sizeBytes > this.config.maxMessageSizeBytes) {
       this.commandsRejected.messageSize++;
       return {
@@ -421,10 +427,11 @@ export class ResourceGovernor {
   getRateLimitUsage(sessionId: string): { session: number; global: number } {
     const now = Date.now();
     const windowStart = now - RATE_WINDOW_MS;
-    
-    const sessionTimestamps = this.commandTimestamps.get(sessionId)?.filter((t) => t > windowStart) ?? [];
+
+    const sessionTimestamps =
+      this.commandTimestamps.get(sessionId)?.filter((t) => t > windowStart) ?? [];
     const globalCount = this.globalCommandTimestamps.filter((t) => t > windowStart).length;
-    
+
     return {
       session: sessionTimestamps.length,
       global: globalCount,
@@ -444,8 +451,10 @@ export class ResourceGovernor {
 
   /**
    * Get list of zombie session IDs.
+   *
+   * @param recordDetection Whether to increment zombie detection metrics.
    */
-  getZombieSessions(): string[] {
+  getZombieSessions(recordDetection = true): string[] {
     const now = Date.now();
     const zombies: string[] = [];
 
@@ -455,7 +464,7 @@ export class ResourceGovernor {
       }
     }
 
-    if (zombies.length > 0) {
+    if (recordDetection && zombies.length > 0) {
       this.zombieSessionsDetected += zombies.length;
     }
 
@@ -496,7 +505,7 @@ export class ResourceGovernor {
     const now = Date.now();
     const windowStart = now - RATE_WINDOW_MS;
     const globalCount = this.globalCommandTimestamps.filter((t) => t > windowStart).length;
-    
+
     return {
       sessionCount: this.sessionCount,
       connectionCount: this.connectionCount,
@@ -517,19 +526,21 @@ export class ResourceGovernor {
    */
   isHealthy(): { healthy: boolean; issues: string[] } {
     const issues: string[] = [];
-    
+
     if (this.sessionCount >= this.config.maxSessions * 0.9) {
       issues.push(`Session count at ${this.sessionCount}/${this.config.maxSessions} (90%+)`);
     }
     if (this.connectionCount >= this.config.maxConnections * 0.9) {
-      issues.push(`Connection count at ${this.connectionCount}/${this.config.maxConnections} (90%+)`);
+      issues.push(
+        `Connection count at ${this.connectionCount}/${this.config.maxConnections} (90%+)`
+      );
     }
-    
-    const zombies = this.getZombieSessions();
+
+    const zombies = this.getZombieSessions(false);
     if (zombies.length > 0) {
       issues.push(`${zombies.length} zombie sessions detected`);
     }
-    
+
     return {
       healthy: issues.length === 0,
       issues,

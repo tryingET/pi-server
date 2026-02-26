@@ -100,7 +100,16 @@ export type SessionCommand =
 // UNION OF ALL COMMANDS
 // ============================================================================
 
-export type RpcCommand = ServerCommand | SessionCommand;
+export interface RpcCommandEnvelope {
+  /** Optional causal dependencies for command ordering. */
+  dependsOn?: string[];
+  /** Optional optimistic concurrency precondition for session-targeted commands. */
+  ifSessionVersion?: number;
+  /** Optional idempotency key for replay-safe retries. */
+  idempotencyKey?: string;
+}
+
+export type RpcCommand = (ServerCommand | SessionCommand) & RpcCommandEnvelope;
 
 // ============================================================================
 // RESPONSES
@@ -112,6 +121,10 @@ export interface RpcResponseBase {
   command: string;
   success: boolean;
   error?: string;
+  /** Monotonic per-session version after successful command execution. */
+  sessionVersion?: number;
+  /** True when response was replayed from idempotency/duplicate-command cache. */
+  replayed?: boolean;
 }
 
 // Server command responses
@@ -281,13 +294,13 @@ export interface RpcEvent {
 
 export interface ServerEvent {
   type: "server_ready";
-  data: { 
+  data: {
     /** Server software version (semver) */
-    serverVersion: string; 
+    serverVersion: string;
     /** Protocol version for wire compatibility (semver) */
     protocolVersion: string;
     /** Available transports */
-    transports: string[] 
+    transports: string[];
   };
 }
 
@@ -301,7 +314,28 @@ export interface SessionLifecycleEvent {
   data: { sessionId: string; sessionInfo?: SessionInfo };
 }
 
-export type RpcBroadcast = RpcEvent | ServerEvent | ServerShutdownEvent | SessionLifecycleEvent;
+export interface CommandLifecycleEvent {
+  type: "command_accepted" | "command_started" | "command_finished";
+  data: {
+    commandId: string;
+    commandType: string;
+    sessionId?: string;
+    dependsOn?: string[];
+    ifSessionVersion?: number;
+    idempotencyKey?: string;
+    success?: boolean;
+    error?: string;
+    sessionVersion?: number;
+    replayed?: boolean;
+  };
+}
+
+export type RpcBroadcast =
+  | RpcEvent
+  | ServerEvent
+  | ServerShutdownEvent
+  | SessionLifecycleEvent
+  | CommandLifecycleEvent;
 
 // ============================================================================
 // SUBSCRIBER
@@ -341,6 +375,29 @@ export function getSessionId(cmd: RpcCommand): string | undefined {
 }
 
 /**
+ * Optional causal dependencies for command ordering.
+ */
+export function getCommandDependsOn(cmd: RpcCommand): string[] | undefined {
+  return Array.isArray(cmd.dependsOn)
+    ? cmd.dependsOn.filter((value): value is string => typeof value === "string")
+    : undefined;
+}
+
+/**
+ * Optional optimistic concurrency precondition.
+ */
+export function getCommandIfSessionVersion(cmd: RpcCommand): number | undefined {
+  return typeof cmd.ifSessionVersion === "number" ? cmd.ifSessionVersion : undefined;
+}
+
+/**
+ * Optional idempotency key for replay-safe command retries.
+ */
+export function getCommandIdempotencyKey(cmd: RpcCommand): string | undefined {
+  return typeof cmd.idempotencyKey === "string" ? cmd.idempotencyKey : undefined;
+}
+
+/**
  * Type guard: true if command targets a session (has sessionId).
  */
 export function isSessionCommand(cmd: RpcCommand): cmd is SessionCommand {
@@ -350,17 +407,21 @@ export function isSessionCommand(cmd: RpcCommand): cmd is SessionCommand {
 /**
  * Type guard: true if response is a successful create_session response.
  */
-export function isCreateSessionResponse(
-  response: RpcResponse
-): response is RpcResponseBase & { command: "create_session"; success: true; data: { sessionId: string; sessionInfo: SessionInfo } } {
+export function isCreateSessionResponse(response: RpcResponse): response is RpcResponseBase & {
+  command: "create_session";
+  success: true;
+  data: { sessionId: string; sessionInfo: SessionInfo };
+} {
   return response.success && response.command === "create_session";
 }
 
 /**
  * Type guard: true if response is a successful switch_session response.
  */
-export function isSwitchSessionResponse(
-  response: RpcResponse
-): response is RpcResponseBase & { command: "switch_session"; success: true; data: { sessionInfo: SessionInfo } } {
+export function isSwitchSessionResponse(response: RpcResponse): response is RpcResponseBase & {
+  command: "switch_session";
+  success: true;
+  data: { sessionInfo: SessionInfo };
+} {
   return response.success && response.command === "switch_session";
 }

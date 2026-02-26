@@ -13,10 +13,7 @@ import * as readline from "readline";
 import { WebSocketServer, WebSocket } from "ws";
 import { PiSessionManager } from "./session-manager.js";
 import type { RpcCommand, RpcResponse, Subscriber, RpcBroadcast } from "./types.js";
-import {
-  getSessionId as getSessionIdFromCmd,
-  isCreateSessionResponse,
-} from "./types.js";
+import { getSessionId as getSessionIdFromCmd, isCreateSessionResponse } from "./types.js";
 
 // ============================================================================
 // CONSTANTS
@@ -131,9 +128,11 @@ export class PiServer {
 
     // Initiate session manager shutdown (broadcasts notification, drains commands)
     const result = await this.sessionManager.initiateShutdown(timeoutMs);
-    
+
     if (result.timedOut) {
-      console.error(`[shutdown] Timed out after ${timeoutMs}ms, ${result.drained} commands drained, ${this.sessionManager.getInFlightCount()} still pending`);
+      console.error(
+        `[shutdown] Timed out after ${timeoutMs}ms, ${result.drained} commands drained, ${this.sessionManager.getInFlightCount()} still pending`
+      );
     } else {
       console.error(`[shutdown] All ${result.drained} in-flight commands completed`);
     }
@@ -153,7 +152,9 @@ export class PiServer {
 
     // Dispose all sessions
     const disposeResult = this.sessionManager.disposeAllSessions();
-    console.error(`[shutdown] Disposed ${disposeResult.disposed} sessions (${disposeResult.failed} failed)`);
+    console.error(
+      `[shutdown] Disposed ${disposeResult.disposed} sessions (${disposeResult.failed} failed)`
+    );
 
     console.error("[shutdown] Complete");
   }
@@ -299,8 +300,9 @@ export class PiServer {
     this.sessionManager.addSubscriber(subscriber);
 
     rl.on("line", async (line: string) => {
-      // Check message size limit
-      const sizeResult = this.sessionManager.getGovernor().canAcceptMessage(line.length);
+      // Check message size limit (bytes, not UTF-16 code units)
+      const messageBytes = Buffer.byteLength(line, "utf8");
+      const sizeResult = this.sessionManager.getGovernor().canAcceptMessage(messageBytes);
       if (!sizeResult.allowed) {
         const errorResponse: RpcResponse = {
           type: "response",
@@ -396,7 +398,7 @@ async function main(): Promise<void> {
   // Parse port with validation
   const portEnv = process.env.PI_SERVER_PORT;
   const port = portEnv ? parseInt(portEnv, 10) : DEFAULT_PORT;
-  
+
   if (Number.isNaN(port) || port < 1 || port > 65535) {
     console.error(`Invalid PI_SERVER_PORT: "${portEnv}". Must be 1-65535.`);
     process.exit(1);

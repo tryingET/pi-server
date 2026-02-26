@@ -7,7 +7,6 @@
  * - Malformed requests
  */
 
-
 export interface ValidationError {
   field: string;
   message: string;
@@ -16,6 +15,9 @@ export interface ValidationError {
 const MAX_PROMPT_MESSAGE_LENGTH = 200_000;
 const MAX_BASH_COMMAND_LENGTH = 20_000;
 const MAX_SESSION_NAME_LENGTH = 256;
+const MAX_COMMAND_ID_LENGTH = 256;
+const MAX_IDEMPOTENCY_KEY_LENGTH = 256;
+const MAX_DEPENDENCIES = 32;
 
 function hasControlCharacters(value: string): boolean {
   for (let i = 0; i < value.length; i++) {
@@ -101,18 +103,86 @@ export function validateCommand(command: unknown): ValidationError[] {
     errors.push({ field: "type", message: "Command must have a string 'type' field" });
   }
 
+  if ("id" in cmd && (typeof cmd.id !== "string" || cmd.id.trim().length === 0)) {
+    errors.push({ field: "id", message: "Must be a non-empty string if provided" });
+  } else if (typeof cmd.id === "string" && cmd.id.length > MAX_COMMAND_ID_LENGTH) {
+    errors.push({ field: "id", message: `Too long (max ${MAX_COMMAND_ID_LENGTH} chars)` });
+  }
+
+  if ("idempotencyKey" in cmd) {
+    if (typeof cmd.idempotencyKey !== "string" || cmd.idempotencyKey.trim().length === 0) {
+      errors.push({ field: "idempotencyKey", message: "Must be a non-empty string if provided" });
+    } else if (cmd.idempotencyKey.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
+      errors.push({
+        field: "idempotencyKey",
+        message: `Too long (max ${MAX_IDEMPOTENCY_KEY_LENGTH} chars)`,
+      });
+    }
+  }
+
+  if ("dependsOn" in cmd) {
+    if (!Array.isArray(cmd.dependsOn)) {
+      errors.push({ field: "dependsOn", message: "Must be an array of command IDs" });
+    } else {
+      if (cmd.dependsOn.length > MAX_DEPENDENCIES) {
+        errors.push({
+          field: "dependsOn",
+          message: `Too many dependencies (max ${MAX_DEPENDENCIES})`,
+        });
+      }
+      for (let i = 0; i < cmd.dependsOn.length; i++) {
+        const dep = cmd.dependsOn[i];
+        if (typeof dep !== "string" || dep.trim().length === 0) {
+          errors.push({
+            field: `dependsOn[${i}]`,
+            message: "Must be a non-empty command ID string",
+          });
+        }
+      }
+      if (cmd.dependsOn.length > 0 && typeof cmd.id !== "string") {
+        errors.push({ field: "id", message: "Required when dependsOn is provided" });
+      }
+    }
+  }
+
+  if ("ifSessionVersion" in cmd) {
+    if (
+      typeof cmd.ifSessionVersion !== "number" ||
+      !Number.isInteger(cmd.ifSessionVersion) ||
+      cmd.ifSessionVersion < 0
+    ) {
+      errors.push({ field: "ifSessionVersion", message: "Must be a non-negative integer" });
+    }
+  }
+
   if (typeof cmd.type === "string" && !ALL_COMMANDS.has(cmd.type)) {
     errors.push({ field: "type", message: `Unknown command type '${cmd.type}'` });
   }
 
   // If it's a session command, sessionId is required
   if (typeof cmd.type === "string" && SESSION_COMMANDS.has(cmd.type)) {
-    if (!("sessionId" in cmd) || typeof cmd.sessionId !== "string" || cmd.sessionId.trim().length === 0) {
+    if (
+      !("sessionId" in cmd) ||
+      typeof cmd.sessionId !== "string" ||
+      cmd.sessionId.trim().length === 0
+    ) {
       errors.push({
         field: "sessionId",
         message: "Session commands must have a non-empty string 'sessionId'",
       });
     }
+  }
+
+  if (
+    "ifSessionVersion" in cmd &&
+    typeof cmd.type === "string" &&
+    !SESSION_COMMANDS.has(cmd.type) &&
+    cmd.type !== "delete_session"
+  ) {
+    errors.push({
+      field: "ifSessionVersion",
+      message: "Only supported for session-targeted commands",
+    });
   }
 
   // Type-specific validation
@@ -131,7 +201,10 @@ function validateCommandByType(type: string, cmd: Record<string, unknown>): Vali
 
   switch (type) {
     case "create_session":
-      if ("sessionId" in cmd && (typeof cmd.sessionId !== "string" || cmd.sessionId.trim().length === 0)) {
+      if (
+        "sessionId" in cmd &&
+        (typeof cmd.sessionId !== "string" || cmd.sessionId.trim().length === 0)
+      ) {
         errors.push({ field: "sessionId", message: "Must be a non-empty string if provided" });
       }
       if ("cwd" in cmd && typeof cmd.cwd !== "string") {
@@ -150,7 +223,10 @@ function validateCommandByType(type: string, cmd: Record<string, unknown>): Vali
       if (!cmd.message || typeof cmd.message !== "string") {
         errors.push({ field: "message", message: "Required string" });
       } else if (cmd.message.length > MAX_PROMPT_MESSAGE_LENGTH) {
-        errors.push({ field: "message", message: `Too long (max ${MAX_PROMPT_MESSAGE_LENGTH} chars)` });
+        errors.push({
+          field: "message",
+          message: `Too long (max ${MAX_PROMPT_MESSAGE_LENGTH} chars)`,
+        });
       }
       break;
 
@@ -159,7 +235,10 @@ function validateCommandByType(type: string, cmd: Record<string, unknown>): Vali
       if (!cmd.message || typeof cmd.message !== "string") {
         errors.push({ field: "message", message: "Required string" });
       } else if (cmd.message.length > MAX_PROMPT_MESSAGE_LENGTH) {
-        errors.push({ field: "message", message: `Too long (max ${MAX_PROMPT_MESSAGE_LENGTH} chars)` });
+        errors.push({
+          field: "message",
+          message: `Too long (max ${MAX_PROMPT_MESSAGE_LENGTH} chars)`,
+        });
       }
       break;
 
@@ -182,7 +261,10 @@ function validateCommandByType(type: string, cmd: Record<string, unknown>): Vali
       if (!cmd.command || typeof cmd.command !== "string") {
         errors.push({ field: "command", message: "Required string" });
       } else if (cmd.command.length > MAX_BASH_COMMAND_LENGTH) {
-        errors.push({ field: "command", message: `Too long (max ${MAX_BASH_COMMAND_LENGTH} chars)` });
+        errors.push({
+          field: "command",
+          message: `Too long (max ${MAX_BASH_COMMAND_LENGTH} chars)`,
+        });
       }
       break;
 
@@ -200,7 +282,10 @@ function validateCommandByType(type: string, cmd: Record<string, unknown>): Vali
         errors.push({ field: "response", message: "Required object" });
       } else {
         const response = cmd.response as Record<string, unknown>;
-        if (typeof response.method !== "string" || !EXTENSION_UI_RESPONSE_METHODS.has(response.method)) {
+        if (
+          typeof response.method !== "string" ||
+          !EXTENSION_UI_RESPONSE_METHODS.has(response.method)
+        ) {
           errors.push({
             field: "response.method",
             message: "Must be one of: select, confirm, input, editor, interview, cancelled",

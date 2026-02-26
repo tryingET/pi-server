@@ -47,19 +47,17 @@ interface TestContext {
  * Run a test suite with a fresh server instance.
  * Ensures proper isolation between test suites.
  */
-async function withFreshServer(
-  fn: (ctx: TestContext) => Promise<void>
-): Promise<void> {
+async function withFreshServer(fn: (ctx: TestContext) => Promise<void>): Promise<void> {
   // Get a free port
   const port = await getPort();
   const server = new PiServer();
-  
+
   try {
     await server.start(port);
-    
+
     // Wait for server to be ready (check that we can connect)
     await waitForServerReady(port);
-    
+
     await fn({ server, port });
   } finally {
     await server.stop(5000);
@@ -298,10 +296,7 @@ async function testServerReady() {
       const client = new TestClient();
       await client.connect(ctx.port);
 
-      const readyMsg = await client.waitForMessage(
-        (msg) => msg.type === "server_ready",
-        2000
-      );
+      const readyMsg = await client.waitForMessage((msg) => msg.type === "server_ready", 2000);
 
       assert.strictEqual(readyMsg.type, "server_ready");
       assert.ok(readyMsg.data, "Should have data");
@@ -317,9 +312,7 @@ async function testServerReady() {
       const client = new TestClient();
       await client.connect(ctx.port);
 
-      const readyMsg = await client.waitForMessage(
-        (msg) => msg.type === "server_ready"
-      );
+      const readyMsg = await client.waitForMessage((msg) => msg.type === "server_ready");
 
       assert.ok(readyMsg.data, "Should have data");
       assert.strictEqual(readyMsg.data!.protocolVersion, "1.0.0");
@@ -451,6 +444,103 @@ async function testCommandResponse() {
 
       client.close();
     });
+
+    await test("integration: serializes create -> steer -> follow_up on same session lane", async () => {
+      const client = new TestClient();
+      await client.connect(ctx.port);
+      client.clearMessages();
+
+      await client.send({ id: "burst-1", type: "create_session", sessionId: "burst-order" });
+      await client.send({
+        id: "burst-2",
+        type: "steer",
+        sessionId: "burst-order",
+        message: "left",
+      });
+      await client.send({
+        id: "burst-3",
+        type: "follow_up",
+        sessionId: "burst-order",
+        message: "next",
+      });
+
+      const createResp = await client.waitForMessage((msg) => msg.id === "burst-1", 15000);
+      const steerResp = await client.waitForMessage((msg) => msg.id === "burst-2", 15000);
+      const followResp = await client.waitForMessage((msg) => msg.id === "burst-3", 15000);
+
+      assert.strictEqual(createResp.success, true, "create_session should succeed");
+      assert.strictEqual(steerResp.success, true, "steer should execute after create");
+      assert.strictEqual(followResp.success, true, "follow_up should execute after create");
+
+      await client.send({ type: "delete_session", sessionId: "burst-order" });
+      client.close();
+    });
+
+    await test("integration: emits command lifecycle events", async () => {
+      const client = new TestClient();
+      await client.connect(ctx.port);
+      client.clearMessages();
+
+      await client.send({ id: "life-1", type: "list_sessions" });
+
+      const accepted = await client.waitForMessage(
+        (msg) => msg.type === "command_accepted" && (msg.data as any)?.commandId === "life-1",
+        8000
+      );
+      const started = await client.waitForMessage(
+        (msg) => msg.type === "command_started" && (msg.data as any)?.commandId === "life-1",
+        8000
+      );
+      const finished = await client.waitForMessage(
+        (msg) => msg.type === "command_finished" && (msg.data as any)?.commandId === "life-1",
+        8000
+      );
+
+      assert.strictEqual(accepted.type, "command_accepted");
+      assert.strictEqual(started.type, "command_started");
+      assert.strictEqual(finished.type, "command_finished");
+      assert.strictEqual((finished.data as any)?.success, true);
+
+      client.close();
+    });
+
+    await test("integration: rejects conflicting duplicate command IDs", async () => {
+      const client = new TestClient();
+      await client.connect(ctx.port);
+      client.clearMessages();
+
+      await client.send({ id: "dup-int", type: "list_sessions" });
+      await client.waitForMessage((msg) => msg.id === "dup-int" && msg.success === true, 8000);
+
+      await client.send({ id: "dup-int", type: "health_check" });
+      const conflict = await client.waitForMessage(
+        (msg) => msg.id === "dup-int" && msg.success === false,
+        8000
+      );
+
+      assert.strictEqual(conflict.success, false);
+      assert.ok(conflict.error?.includes("Conflicting id 'dup-int'"));
+      client.close();
+    });
+
+    await test("integration: rejects conflicting idempotency keys", async () => {
+      const client = new TestClient();
+      await client.connect(ctx.port);
+      client.clearMessages();
+
+      await client.send({ id: "idem-int-1", type: "list_sessions", idempotencyKey: "idem-int" });
+      await client.waitForMessage((msg) => msg.id === "idem-int-1" && msg.success === true, 8000);
+
+      await client.send({ id: "idem-int-2", type: "health_check", idempotencyKey: "idem-int" });
+      const conflict = await client.waitForMessage(
+        (msg) => msg.id === "idem-int-2" && msg.success === false,
+        8000
+      );
+
+      assert.strictEqual(conflict.success, false);
+      assert.ok(conflict.error?.includes("Conflicting idempotencyKey 'idem-int'"));
+      client.close();
+    });
   });
 }
 
@@ -469,9 +559,7 @@ async function testBroadcasts() {
       await client.waitForMessage((msg) => msg.command === "create_session");
 
       // Wait for broadcast
-      const broadcast = await client.waitForMessage(
-        (msg) => msg.type === "session_created"
-      );
+      const broadcast = await client.waitForMessage((msg) => msg.type === "session_created");
 
       assert.strictEqual(broadcast.type, "session_created");
       assert.strictEqual(broadcast.data?.sessionId, "broadcast-test-1");
@@ -494,9 +582,7 @@ async function testBroadcasts() {
       await client.waitForMessage((msg) => msg.command === "delete_session");
 
       // Wait for broadcast
-      const broadcast = await client.waitForMessage(
-        (msg) => msg.type === "session_deleted"
-      );
+      const broadcast = await client.waitForMessage((msg) => msg.type === "session_deleted");
 
       assert.strictEqual(broadcast.type, "session_deleted");
       assert.strictEqual(broadcast.data?.sessionId, "broadcast-test-2");
@@ -634,10 +720,7 @@ async function testGracefulShutdown() {
     const shutdownPromise = server.stop(1000);
 
     // Wait for shutdown broadcast
-    const broadcast = await client.waitForMessage(
-      (msg) => msg.type === "server_shutdown",
-      2000
-    );
+    const broadcast = await client.waitForMessage((msg) => msg.type === "server_shutdown", 2000);
 
     assert.strictEqual(broadcast.type, "server_shutdown");
     assert.ok(broadcast.data?.reason, "Should have reason");
@@ -754,7 +837,11 @@ async function testSessionEventSubscription() {
       // clientB is not subscribed to evt-1; should not receive event
       await sleep(300);
       const bEvents = clientB.getMessages().filter((m) => m.type === "event");
-      assert.strictEqual(bEvents.length, 0, "Unsubscribed client should not receive session events");
+      assert.strictEqual(
+        bEvents.length,
+        0,
+        "Unsubscribed client should not receive session events"
+      );
 
       await clientA.send({ type: "delete_session", sessionId: "evt-1" });
       clientA.close();
@@ -828,6 +915,43 @@ async function testStdioTransport() {
       );
 
       assert.strictEqual(response.success, true);
+    } finally {
+      child.kill("SIGTERM");
+    }
+  });
+
+  await test("integration: stdio enforces byte-size limits for multibyte payloads", async () => {
+    const port = await getPort();
+    const child = spawn("node", ["dist/server.js"], {
+      cwd: process.cwd(),
+      env: { ...process.env, PI_SERVER_PORT: String(port) },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    try {
+      const stdoutLines = readline.createInterface({ input: child.stdout! });
+      await waitForJsonLine(stdoutLines, (obj) => obj.type === "server_ready", 8000);
+
+      const oversizedMultibyte = "😀".repeat(2_800_000);
+      child.stdin!.write(
+        JSON.stringify({
+          id: "stdio-byte-limit",
+          type: "list_sessions",
+          payload: oversizedMultibyte,
+        }) + "\n"
+      );
+
+      const response = await waitForJsonLine(
+        stdoutLines,
+        (obj) =>
+          obj.type === "response" &&
+          obj.success === false &&
+          typeof obj.error === "string" &&
+          (obj.error.includes("size") || obj.error.includes("limit")),
+        12000
+      );
+
+      assert.strictEqual(response.success, false);
     } finally {
       child.kill("SIGTERM");
     }

@@ -104,17 +104,21 @@ export class ExtensionUIManager {
   createPendingRequest(
     sessionId: string,
     method: ExtensionUIMethod,
-    _requestData: Record<string, any>
+    requestData: Record<string, any>
   ): { requestId: string; promise: Promise<ExtensionUIResponseValue> } {
     const requestId = this.generateRequestId(sessionId);
+    const timeoutMs =
+      typeof requestData.timeout === "number" &&
+      Number.isFinite(requestData.timeout) &&
+      requestData.timeout > 0
+        ? requestData.timeout
+        : this.defaultTimeoutMs;
 
     const promise = new Promise<ExtensionUIResponseValue>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pendingRequests.delete(requestId);
-        reject(
-          new Error(`Extension UI request ${requestId} timed out after ${this.defaultTimeoutMs}ms`)
-        );
-      }, this.defaultTimeoutMs);
+        reject(new Error(`Extension UI request ${requestId} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
 
       this.pendingRequests.set(requestId, {
         sessionId,
