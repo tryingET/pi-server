@@ -1,12 +1,31 @@
 # pi-app-server
 
-A session multiplexer for [@mariozechner/pi-coding-agent](https://github.com/badlogic/pi-mono) that exposes N independent AgentSessions through dual transports—WebSocket on port 3141 and stdio.
+A deterministic session multiplexer for [@mariozechner/pi-coding-agent](https://github.com/badlogic/pi-mono).
+It exposes many independent `AgentSession`s through two transports:
 
-**The protocol IS the architecture.**
+- **WebSocket** (`ws://localhost:3141` by default)
+- **stdio** (JSON Lines on stdin/stdout)
+
+> **Design thesis:** the protocol is the architecture.
+
+### Quick navigation
+
+- [Run](#run)
+- [Protocol Overview](#protocol-overview)
+- [Supported Commands](#supported-commands)
+- [Ordering and Determinism Guarantees](#ordering-and-determinism-guarantees)
+- [Normative Client Contract (MUST/SHOULD)](#normative-client-contract-mustshould)
+- [Architecture](#architecture)
+- [Non-goals](#non-goals)
+- [Documentation map](#documentation-map)
+
+---
 
 ## Acknowledgments
 
-Born from a conversation between [@SIGKITTEN](https://x.com/SIGKITTEN) and [@badlogicgames](https://x.com/badlogicgames) on [X/Twitter](https://x.com/SIGKITTEN/status/2026755645592961160).
+This project began with a conversation between [@SIGKITTEN](https://x.com/SIGKITTEN) and [@badlogicgames](https://x.com/badlogicgames) on [X/Twitter](https://x.com/SIGKITTEN/status/2026755645592961160).
+
+---
 
 ## Installation
 
@@ -15,109 +34,234 @@ npm install
 npm run build
 ```
 
-## Usage
+---
 
-### Start the server
+## Run
 
 ```bash
 node dist/server.js
 ```
 
-The server listens on:
-- **WebSocket**: `ws://localhost:3141`
-- **Stdio**: JSON lines on stdin/stdout
+- Default WebSocket port: `3141`
+- Override with `PI_SERVER_PORT`
 
-Port can be changed via `PI_SERVER_PORT` environment variable.
+---
 
-### Protocol
+## Protocol Overview
 
-All commands are JSON objects. Responses and events are JSON lines.
+All inbound commands and outbound responses/events are JSON objects sent as JSON Lines.
 
-#### Server Commands (manage session registry)
+For the normative wire contract, see **`PROTOCOL.md`**.
+
+### Command Envelope (optional causal fields)
+
+Any command may include:
+
+- `id: string` — command identity (strongly recommended)
+- `dependsOn: string[]` — command IDs that must succeed first
+- `ifSessionVersion: number` — optimistic concurrency precondition
+- `idempotencyKey: string` — replay-safe retry key
+
+Responses may include:
+
+- `sessionVersion: number` — monotonic per-session version after success
+- `replayed: true` — response served from replay cache/history
+
+### Replay and conflict semantics
+
+- Same `id`, same fingerprint → replay prior outcome.
+- Same `id`, different fingerprint → reject with conflict error.
+- Same `idempotencyKey`, different fingerprint → reject with conflict error.
+
+A “fingerprint” is semantic command equivalence (excluding retry identity).
+
+---
+
+## Supported Commands
+
+### Server commands (session registry)
 
 | Command | Description |
-|---------|-------------|
-| `{"type": "list_sessions"}` | List all active sessions |
-| `{"type": "create_session", "sessionId": "..."}` | Create a new session |
-| `{"type": "delete_session", "sessionId": "..."}` | Delete a session |
-| `{"type": "switch_session", "sessionId": "..."}` | Subscribe to a session's events |
+|---|---|
+| `{"type":"list_sessions"}` | List active sessions |
+| `{"type":"create_session","sessionId":"..."}` | Create session |
+| `{"type":"delete_session","sessionId":"..."}` | Delete session |
+| `{"type":"switch_session","sessionId":"..."}` | Subscribe caller to session events |
+| `{"type":"get_metrics"}` | Return governor/system metrics |
+| `{"type":"health_check"}` | Return health summary |
 
-#### Session Commands (pass through to AgentSession)
+### Session commands (AgentSession passthrough)
 
 | Command | Description |
-|---------|-------------|
-| `{"type": "prompt", "sessionId": "...", "message": "..."}` | Send a prompt |
-| `{"type": "steer", "sessionId": "...", "message": "..."}` | Queue steering message |
-| `{"type": "abort", "sessionId": "..."}` | Abort current operation |
-| `{"type": "get_state", "sessionId": "..."}` | Get session state |
-| `{"type": "get_messages", "sessionId": "..."}` | Get all messages |
-| `{"type": "set_model", "sessionId": "...", "provider": "...", "modelId": "..."}` | Set model |
-| `{"type": "compact", "sessionId": "..."}` | Compact session context |
-| ... | (see `types.ts` for full list) |
+|---|---|
+| `{"type":"prompt","sessionId":"...","message":"..."}` | Prompt model |
+| `{"type":"steer","sessionId":"...","message":"..."}` | Queue steering input |
+| `{"type":"follow_up","sessionId":"...","message":"..."}` | Continue with follow-up |
+| `{"type":"abort","sessionId":"..."}` | Abort active operation |
+| `{"type":"get_state","sessionId":"..."}` | Session state snapshot |
+| `{"type":"get_messages","sessionId":"..."}` | Session transcript |
+| `{"type":"set_model","sessionId":"...","provider":"...","modelId":"..."}` | Switch model |
+| `{"type":"compact","sessionId":"..."}` | Compact context |
+| `...` | See `src/types.ts` for the full command surface |
 
-### Events
+---
 
-All events are broadcast to subscribers with `sessionId` prepended:
+## Events
+
+### Session-scoped agent events
+
+Broadcast only to subscribers of that session:
 
 ```json
-{"type": "event", "sessionId": "my-session", "event": {"type": "agent_start"}}
-{"type": "event", "sessionId": "my-session", "event": {"type": "message_update", ...}}
-{"type": "event", "sessionId": "my-session", "event": {"type": "agent_end", ...}}
+{"type":"event","sessionId":"my-session","event":{"type":"agent_start"}}
+{"type":"event","sessionId":"my-session","event":{"type":"message_update"}}
+{"type":"event","sessionId":"my-session","event":{"type":"agent_end"}}
 ```
 
-### Example: WebSocket
+### Global lifecycle events
 
-```javascript
-const ws = new WebSocket('ws://localhost:3141');
+Broadcast for admitted commands:
 
-ws.on('open', () => {
-  ws.send(JSON.stringify({type: 'create_session', sessionId: 'test'}));
-  ws.send(JSON.stringify({type: 'switch_session', sessionId: 'test'}));
-  ws.send(JSON.stringify({sessionId: 'test', type: 'prompt', message: 'Hello!'}));
-});
-
-ws.on('message', (data) => {
-  console.log(JSON.parse(data.toString()));
-});
+```json
+{"type":"command_accepted","data":{"commandId":"cmd-1","commandType":"prompt","sessionId":"s1"}}
+{"type":"command_started","data":{"commandId":"cmd-1","commandType":"prompt","sessionId":"s1"}}
+{"type":"command_finished","data":{"commandId":"cmd-1","commandType":"prompt","sessionId":"s1","success":true,"sessionVersion":12}}
 ```
 
-### Example: Stdio
+---
+
+## Ordering and Determinism Guarantees
+
+### 1) Admission gate
+
+`command_accepted` is emitted only after validation and shutdown checks pass.
+Commands rejected before admission do not emit lifecycle events.
+
+### 2) Per-request phase order
+
+For each admitted request:
+
+1. `command_accepted`
+2. `command_started` (if execution begins)
+3. `command_finished` (exactly once)
+
+### 3) Lane serialization
+
+Commands execute in deterministic lanes:
+
+- `session:<sessionId>` for session-targeted commands
+- `server` for server-level commands
+
+Within a lane, execution is serialized.
+Across lanes, event interleaving is allowed (no global total order).
+
+### 4) Replay shape
+
+Replay hits emit:
+
+- `command_accepted`
+- `command_finished` (`replayed: true`)
+
+Replay responses do not emit `command_started`.
+
+### 5) Timeout edge behavior
+
+A caller may receive timeout while underlying execution continues.
+A later duplicate-id replay returns the eventual terminal outcome.
+
+---
+
+## Normative Client Contract (MUST/SHOULD)
+
+- Clients **MUST** treat `id` as unique per logical command intent.
+- Clients **MUST NOT** reuse an `id` for a semantically different payload.
+- Retrying clients **SHOULD** include both `id` and `idempotencyKey`.
+- Clients **MUST** handle conflict errors for fingerprint-mismatched `id`/`idempotencyKey` reuse.
+- Clients **MUST** treat `sessionVersion` as authoritative for concurrency control.
+- Clients issuing mutating session commands **SHOULD** use `ifSessionVersion`.
+- Clients **MUST NOT** assume global total ordering of lifecycle events across lanes.
+- Timeout responses **SHOULD** be treated as indeterminate completion and reconciled via replay/inspection.
+
+---
+
+## Examples
+
+### WebSocket
+
+```js
+const ws = new WebSocket("ws://localhost:3141");
+
+ws.onopen = () => {
+  ws.send(JSON.stringify({ type: "create_session", sessionId: "test" }));
+  ws.send(JSON.stringify({ type: "switch_session", sessionId: "test" }));
+  ws.send(
+    JSON.stringify({
+      id: "cmd-1",
+      type: "prompt",
+      sessionId: "test",
+      message: "Hello!",
+    })
+  );
+};
+
+ws.onmessage = (event) => {
+  console.log(JSON.parse(event.data));
+};
+```
+
+### stdio
 
 ```bash
 echo '{"type":"create_session","sessionId":"test"}
 {"type":"switch_session","sessionId":"test"}
-{"sessionId":"test","type":"prompt","message":"Hello!"}' | node dist/server.js
+{"id":"cmd-1","type":"prompt","sessionId":"test","message":"Hello!"}' | node dist/server.js
 ```
+
+---
 
 ## Architecture
 
-```
+```text
 src/
-├── server.ts         # Transports, routing, broadcast
-├── session-manager.ts # Lifecycle, execution, subscribers
-└── types.ts          # Protocol: Command | Response | Event
+├── server.ts            # transports, connection lifecycle, routing glue
+├── session-manager.ts   # execution, ordering, replay, lifecycle events
+├── resource-governor.ts # limits, rate controls, health/metrics
+└── types.ts             # wire protocol types
 ```
 
-**Invariants:**
-- ∀ command → ∃! response (by id)
-- ∀ event → sessionId ∈ active_sessions
-- ∀ session → ∃! AgentSession (1:1)
-- ∀ connection → subscribedSessions ⊆ sessions
+### Core invariants
 
-## Non-Goals
+- For each admitted command, there is exactly one terminal response.
+- For each session ID, there is at most one live `AgentSession`.
+- Subscriber session sets are always a subset of active sessions.
+- Session version is monotonic and mutation-sensitive.
 
-These are out of scope by design:
+See `ROADMAP.md` for phase tracking and next milestones.
 
-| Non-Goal | Why Not Here |
-|----------|--------------|
-| Authentication | Security is orthogonal to multiplexing |
-| Rate Limiting | Throttling is a deployment concern |
-| Metrics | Observability is external |
-| TLS/SSL | Transport security is a proxy concern |
-| Clustering | Horizontal scaling requires session affinity |
-| HTTP Transport | Two transports is complete, three is scope creep |
+---
 
-The server does ONE thing—multiplex sessions over transports. Everything else is someone else's job.
+## Non-goals
+
+Deliberately out of scope:
+
+| Non-goal | Why |
+|---|---|
+| Authentication/authorization | Deployment boundary concern |
+| TLS termination | Better handled by edge proxy |
+| Horizontal clustering | Requires external session affinity design |
+| HTTP transport surface | WebSocket + stdio are sufficient for this layer |
+| Durable command journal/replay engine | Tracked as a future roadmap phase |
+
+---
+
+## Documentation map
+
+- `docs/quickstart.md` — shortest path from install to verified running server
+- `docs/client-guide.md` — practical integration and retry/concurrency guidance
+- `PROTOCOL.md` — normative wire contract (MUST/SHOULD semantics)
+- `ROADMAP.md` — execution plan, gates, and open decisions
+
+---
 
 ## License
 
