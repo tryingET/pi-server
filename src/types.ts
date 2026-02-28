@@ -199,9 +199,15 @@ export type ServerResponse =
             maxPendingRequests: number;
             rejectedCount: number;
           };
+          sessionStore: {
+            /** Count of metadata file resets due to corruption/oversize */
+            metadataResetCount: number;
+          };
         };
         /** Circuit breaker metrics per provider (ADR-0010) */
         circuitBreakers: CircuitBreakerMetrics[];
+        /** Metrics system data (ADR-0016) - optional, only if MemorySink is enabled */
+        metrics?: Record<string, unknown>;
       };
     })
   | (RpcResponseBase & {

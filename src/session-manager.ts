@@ -1,8 +1,16 @@
 /**
  * Session Manager - owns session lifecycle, command execution, and subscriber maps.
  *
- * Server commands handled here. Session commands delegated to command-router.
- * Extension UI requests tracked by ExtensionUIManager.
+ * RESPONSIBILITIES (per AGENTS.md):
+ * - Orchestration: coordinates stores, engines, sessions
+ * - Session lifecycle (create, delete, list, load)
+ * - Subscriber and event broadcast management
+ * - Command execution pipeline (tracking, rate limiting, replay)
+ *
+ * DOES NOT:
+ * - Handle server commands directly (delegates to server-command-handlers.ts)
+ * - Handle session commands directly (delegates to command-router.ts)
+ * - Mutate state directly (delegates to stores)
  */
 
 import {
@@ -28,6 +36,11 @@ import {
   getSessionId,
 } from "./types.js";
 import { routeSessionCommand } from "./command-router.js";
+import {
+  routeServerCommand,
+  executeLLMCommand,
+  type ServerCommandContext,
+} from "./server-command-handlers.js";
 import { ExtensionUIManager } from "./extension-ui.js";
 import { createServerUIContext } from "./server-ui-context.js";
 import { validateCommand, formatValidationErrors } from "./validation.js";
@@ -102,6 +115,9 @@ export class PiSessionManager implements SessionResolver {
     this.broadcastEvent(sessionId, event)
   );
 
+  /** Optional memory metrics provider (set by server for ADR-0016) */
+  private memoryMetricsProvider: (() => Record<string, unknown> | undefined) | null = null;
+
   constructor(governor?: ResourceGovernor, options: SessionManagerRuntimeOptions = {}) {
     this.governor = governor ?? new ResourceGovernor(DEFAULT_CONFIG);
     this.defaultCommandTimeoutMs =
@@ -161,6 +177,14 @@ export class PiSessionManager implements SessionResolver {
    */
   isInShutdown(): boolean {
     return this.isShuttingDown;
+  }
+
+  /**
+   * Set the memory metrics provider for ADR-0016 metrics system.
+   * Called by PiServer to provide access to MemorySink metrics.
+   */
+  setMemoryMetricsProvider(provider: () => Record<string, unknown> | undefined): void {
+    this.memoryMetricsProvider = provider;
   }
 
   /**
@@ -752,6 +776,108 @@ export class PiSessionManager implements SessionResolver {
   }
 
   // ==========================================================================
+  // COMMAND EXECUTION CONTEXT
+  // ==========================================================================
+
+  /**
+   * Create the command execution context for server command handlers.
+   * This is the NEXUS seam - provides everything handlers need without
+   * direct coupling to SessionManager internals.
+   */
+  private createCommandContext(): ServerCommandContext {
+    return {
+      getSession: (sessionId: string) => this.sessions.get(sessionId),
+      getSessionInfo: (sessionId: string) => this.getSessionInfo(sessionId),
+      listSessions: () => this.listSessions(),
+      createSession: (sessionId: string, cwd?: string) => this.createSession(sessionId, cwd),
+      deleteSession: (sessionId: string) => this.deleteSession(sessionId),
+      loadSession: (sessionId: string, sessionPath: string) =>
+        this.loadSession(sessionId, sessionPath),
+      listStoredSessions: () => this.listStoredSessions(),
+      getMetrics: () => this.buildMetricsResponse(),
+      getMemoryMetrics: () => this.memoryMetricsProvider?.(),
+      getHealth: () => this.buildHealthResponse(),
+      handleUIResponse: (command) =>
+        this.extensionUI.handleUIResponse({
+          id: command.id,
+          sessionId: command.sessionId,
+          type: "extension_ui_response",
+          requestId: command.requestId,
+          response: command.response,
+        }),
+      routeSessionCommand: (session, command, getSessionInfo) =>
+        routeSessionCommand(session, command, getSessionInfo),
+      generateSessionId: () => this.generateSessionId(),
+      recordHeartbeat: (sessionId: string) => this.governor.recordHeartbeat(sessionId),
+      getCircuitBreakers: () => ({
+        hasOpenCircuit: () => this.circuitBreakers.hasOpenCircuit(),
+        getBreaker: (provider: string) => {
+          const breaker = this.circuitBreakers.getBreaker(provider);
+          return {
+            canExecute: () => breaker.canExecute(),
+            recordSuccess: (elapsedMs: number) => breaker.recordSuccess(elapsedMs),
+            recordFailure: (type: "timeout" | "error") => breaker.recordFailure(type),
+          };
+        },
+      }),
+      getDefaultCommandTimeoutMs: () => this.defaultCommandTimeoutMs,
+    };
+  }
+
+  /**
+   * Build the metrics response (extracted for handler use).
+   */
+  private buildMetricsResponse(): RpcResponse {
+    const governorMetrics = this.governor.getMetrics();
+    const replayStats = this.replayStore.getStats();
+    const versionStats = this.versionStore.getStats();
+    const executionStats = this.executionEngine.getStats();
+    const lockStats = this.lockManager.getStats();
+    const extensionUIStats = this.extensionUI.getStats();
+    const circuitBreakerMetrics = this.circuitBreakers.getAllMetrics();
+    const sessionStoreStats = {
+      metadataResetCount: this.sessionStore.getMetadataResetCount(),
+    };
+    return {
+      type: "response",
+      command: "get_metrics",
+      success: true,
+      data: {
+        ...governorMetrics,
+        stores: {
+          replay: replayStats,
+          version: versionStats,
+          execution: executionStats,
+          lock: lockStats,
+          extensionUI: extensionUIStats,
+          sessionStore: sessionStoreStats,
+        },
+        circuitBreakers: circuitBreakerMetrics,
+      },
+    };
+  }
+
+  /**
+   * Build the health check response (extracted for handler use).
+   */
+  private buildHealthResponse(): RpcResponse {
+    const health = this.governor.isHealthy();
+    const hasOpenCircuit = this.circuitBreakers.hasOpenCircuit();
+    return {
+      type: "response",
+      command: "health_check",
+      success: true,
+      data: {
+        ...health,
+        hasOpenCircuit,
+        issues: hasOpenCircuit
+          ? [...health.issues, "One or more LLM provider circuits are open"]
+          : health.issues,
+      },
+    };
+  }
+
+  // ==========================================================================
   // COMMAND EXECUTION
   // ==========================================================================
 
@@ -1047,6 +1173,7 @@ export class PiSessionManager implements SessionResolver {
 
   /**
    * Internal command execution (called after tracking and rate limiting).
+   * Routes to server command handlers or session command handlers.
    */
   private async executeCommandInternal(
     command: RpcCommand,
@@ -1064,133 +1191,13 @@ export class PiSessionManager implements SessionResolver {
     };
 
     try {
-      // Server commands (lifecycle management)
-      switch (commandType) {
-        case "list_sessions":
-          return {
-            id,
-            type: "response",
-            command: "list_sessions",
-            success: true,
-            data: { sessions: this.listSessions() },
-          };
+      const context = this.createCommandContext();
 
-        case "create_session": {
-          const cmd = command as { sessionId?: string; cwd?: string };
-          const newSessionId = cmd.sessionId ?? this.generateSessionId();
-          const sessionInfo = await this.createSession(newSessionId, cmd.cwd);
-          return {
-            id,
-            type: "response",
-            command: "create_session",
-            success: true,
-            data: { sessionId: newSessionId, sessionInfo },
-          };
-        }
-
-        case "delete_session": {
-          const cmd = command as { sessionId: string };
-          await this.deleteSession(cmd.sessionId);
-          return {
-            id,
-            type: "response",
-            command: "delete_session",
-            success: true,
-            data: { deleted: true },
-          };
-        }
-
-        case "switch_session": {
-          const cmd = command as { sessionId: string };
-          const sessionInfo = this.getSessionInfo(cmd.sessionId);
-          if (!sessionInfo) {
-            return failResponse(`Session ${cmd.sessionId} not found`, "switch_session");
-          }
-          return {
-            id,
-            type: "response",
-            command: "switch_session",
-            success: true,
-            data: { sessionInfo },
-          };
-        }
-
-        case "get_metrics": {
-          const governorMetrics = this.governor.getMetrics();
-          const replayStats = this.replayStore.getStats();
-          const versionStats = this.versionStore.getStats();
-          const executionStats = this.executionEngine.getStats();
-          const lockStats = this.lockManager.getStats();
-          const extensionUIStats = this.extensionUI.getStats();
-          const circuitBreakerMetrics = this.circuitBreakers.getAllMetrics();
-          return {
-            id,
-            type: "response",
-            command: "get_metrics",
-            success: true,
-            data: {
-              ...governorMetrics,
-              stores: {
-                replay: replayStats,
-                version: versionStats,
-                execution: executionStats,
-                lock: lockStats,
-                extensionUI: extensionUIStats,
-              },
-              circuitBreakers: circuitBreakerMetrics,
-            },
-          };
-        }
-
-        case "health_check": {
-          const health = this.governor.isHealthy();
-          const hasOpenCircuit = this.circuitBreakers.hasOpenCircuit();
-          return {
-            id,
-            type: "response",
-            command: "health_check",
-            success: true,
-            data: {
-              ...health,
-              hasOpenCircuit,
-              issues: hasOpenCircuit
-                ? [...health.issues, "One or more LLM provider circuits are open"]
-                : health.issues,
-            },
-          };
-        }
-
-        // ADR-0007: Session persistence commands
-        case "list_stored_sessions": {
-          const storedSessions = await this.listStoredSessions();
-          return {
-            id,
-            type: "response",
-            command: "list_stored_sessions",
-            success: true,
-            data: { sessions: storedSessions },
-          };
-        }
-
-        case "load_session": {
-          const cmd = command as { sessionId?: string; sessionPath: string };
-          const sessionId = cmd.sessionId ?? this.generateSessionId();
-          try {
-            const sessionInfo = await this.loadSession(sessionId, cmd.sessionPath);
-            return {
-              id,
-              type: "response",
-              command: "load_session",
-              success: true,
-              data: { sessionId, sessionInfo },
-            };
-          } catch (error) {
-            return failResponse(
-              error instanceof Error ? error.message : String(error),
-              "load_session"
-            );
-          }
-        }
+      // Try server command handlers first
+      const serverResponse = routeServerCommand(command, context);
+      if (serverResponse !== undefined) {
+        const resolved = await Promise.resolve(serverResponse);
+        return { ...resolved, id };
       }
 
       // Session commands - get the session first
@@ -1203,86 +1210,16 @@ export class PiSessionManager implements SessionResolver {
       // Record heartbeat for valid session activity
       this.governor.recordHeartbeat(cmdSessionId!);
 
-      // Special handling for extension_ui_response (doesn't operate on session directly)
-      if (commandType === "extension_ui_response") {
-        const cmd = command as { sessionId: string; requestId: string; response: any };
-        const result = this.extensionUI.handleUIResponse({
-          id,
-          sessionId: cmd.sessionId,
-          type: "extension_ui_response",
-          requestId: cmd.requestId,
-          response: cmd.response,
-        });
-        if (result.success) {
-          return {
-            id,
-            type: "response",
-            command: "extension_ui_response",
-            success: true,
-          };
-        }
-        return failResponse(result.error ?? "Unknown error", "extension_ui_response");
-      }
-
       // ADR-0010: Circuit breaker for LLM commands
-      // These commands make LLM calls and should be protected
-      const LLM_COMMANDS = new Set(["prompt", "steer", "follow_up", "compact"]);
-      const provider = session.model?.provider;
-
-      if (LLM_COMMANDS.has(commandType) && provider) {
-        const breaker = this.circuitBreakers.getBreaker(provider);
-        const breakerCheck = breaker.canExecute();
-
-        if (!breakerCheck.allowed) {
-          return {
-            id,
-            type: "response",
-            command: commandType,
-            success: false,
-            error: breakerCheck.reason,
-          };
+      const llmResponse = await executeLLMCommand(command, session, context);
+      if (llmResponse !== undefined) {
+        if (!llmResponse.success) {
+          return { ...llmResponse, id };
         }
-
-        // Execute with circuit breaker tracking
-        const startTime = Date.now();
-        try {
-          const routed = routeSessionCommand(session, command, (sid) => this.getSessionInfo(sid));
-          if (routed === undefined) {
-            return failResponse(`Unknown command type: ${commandType}`);
-          }
-
-          const response = await Promise.resolve(routed);
-          const elapsedMs = Date.now() - startTime;
-
-          if (response.success) {
-            breaker.recordSuccess(elapsedMs);
-          } else {
-            // Distinguish between timeout and other errors
-            const errorMsg = response.error?.toLowerCase() ?? "";
-            if (errorMsg.includes("timeout") || errorMsg.includes("timed out")) {
-              breaker.recordFailure("timeout");
-            } else {
-              breaker.recordFailure("error");
-            }
-          }
-
-          if (!response.success) {
-            return failResponse(response.error ?? "Unknown error", response.command);
-          }
-          return response;
-        } catch (error) {
-          const elapsedMs = Date.now() - startTime;
-          const errorMsg = error instanceof Error ? error.message.toLowerCase() : "";
-          if (errorMsg.includes("timeout") || elapsedMs >= this.defaultCommandTimeoutMs) {
-            breaker.recordFailure("timeout");
-          } else {
-            breaker.recordFailure("error");
-          }
-          throw error;
-        }
+        return llmResponse;
       }
 
-      // Non-LLM commands: route without circuit breaker
+      // Non-LLM session commands: route without circuit breaker
       const routed = routeSessionCommand(session, command, (sid) => this.getSessionInfo(sid));
       if (routed === undefined) {
         return failResponse(`Unknown command type: ${commandType}`);
