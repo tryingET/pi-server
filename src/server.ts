@@ -14,6 +14,24 @@ import { WebSocketServer, WebSocket } from "ws";
 import { PiSessionManager } from "./session-manager.js";
 import type { RpcCommand, RpcResponse, Subscriber, RpcBroadcast } from "./types.js";
 import { getSessionId as getSessionIdFromCmd, isCreateSessionResponse } from "./types.js";
+import {
+  type AuthProvider,
+  type AuthContext,
+  AllowAllAuthProvider,
+} from "./auth.js";
+import {
+  MetricsEmitter,
+  type MetricsSink,
+  NoOpSink,
+  MemorySink,
+  CompositeSink,
+  MetricNames,
+} from "./metrics-index.js";
+import {
+  Logger,
+  ConsoleLogger,
+  type LogLevel,
+} from "./logger-index.js";
 
 // ============================================================================
 // CONSTANTS
@@ -31,6 +49,9 @@ const BACKPRESSURE_THRESHOLD_BYTES = 64 * 1024;
 
 /** WebSocket critical backpressure threshold (1MB). Beyond this, we close the connection. */
 const BACKPRESSURE_CRITICAL_BYTES = 1024 * 1024;
+
+/** Stdio backpressure threshold (256KB). Beyond this, we start dropping non-critical messages. */
+const STDIO_BACKPRESSURE_THRESHOLD_BYTES = 256 * 1024;
 
 /** WebSocket heartbeat interval (30 seconds). */
 const HEARTBEAT_INTERVAL_MS = 30 * 1000;
@@ -77,19 +98,18 @@ function sendWithBackpressure(
   data: string,
   options: { isCritical?: boolean } = {}
 ): SendResult {
+  const { isCritical = false } = options;
+
   if (ws.readyState !== WebSocket.OPEN) {
     return { ok: false, reason: "closed" };
   }
 
-  const bufferedAmount = ws.bufferedAmount;
+  const buffered = ws.bufferedAmount;
 
   // Critical backpressure: close connection to prevent OOM
-  if (bufferedAmount > BACKPRESSURE_CRITICAL_BYTES) {
-    console.error(
-      `[WebSocket] Critical backpressure (${bufferedAmount} bytes), closing connection`
-    );
+  if (buffered > BACKPRESSURE_CRITICAL_BYTES) {
     try {
-      ws.close(1013, "Backpressure limit exceeded");
+      ws.close(1011, "Server overloaded - backpressure critical");
     } catch {
       // Ignore close errors
     }
@@ -97,10 +117,7 @@ function sendWithBackpressure(
   }
 
   // Mild backpressure: drop non-critical messages
-  if (bufferedAmount > BACKPRESSURE_THRESHOLD_BYTES && !options.isCritical) {
-    console.error(
-      `[WebSocket] Backpressure warning (${bufferedAmount} bytes), dropping non-critical message`
-    );
+  if (buffered > BACKPRESSURE_THRESHOLD_BYTES && !isCritical) {
     return { ok: false, reason: "backpressure" };
   }
 
@@ -108,11 +125,59 @@ function sendWithBackpressure(
     ws.send(data);
     return { ok: true };
   } catch (error) {
-    return {
-      ok: false,
-      reason: "error",
-      error: error instanceof Error ? error : new Error(String(error)),
-    };
+    return { ok: false, reason: "error", error: error instanceof Error ? error : new Error(String(error)) };
+  }
+}
+
+/**
+ * Stdio state for backpressure tracking.
+ */
+interface StdioState {
+  /** Whether stdout has backpressure (last write returned false). */
+  hasBackpressure: boolean;
+  /** Count of dropped messages due to backpressure. */
+  droppedCount: number;
+  /** Whether drain handler is registered. */
+  drainHandlerRegistered: boolean;
+}
+
+/**
+ * Backpressure-aware stdio send.
+ *
+ * - Returns true if sent successfully
+ * - Returns false if dropped due to backpressure
+ * - Critical messages are always attempted
+ */
+function sendWithStdioBackpressure(
+  data: string,
+  state: StdioState,
+  options: { isCritical?: boolean } = {}
+): boolean {
+  const { isCritical = false } = options;
+
+  try {
+    const canWrite = process.stdout.write(data + "\n");
+
+    if (!canWrite) {
+      state.hasBackpressure = true;
+
+      // Register drain handler if not already registered
+      if (!state.drainHandlerRegistered) {
+        state.drainHandlerRegistered = true;
+        process.stdout.once("drain", () => {
+          state.hasBackpressure = false;
+        });
+      }
+    }
+
+    return true;
+  } catch (error) {
+    // If write throws, stdout is broken
+    if (isCritical) {
+      // For critical messages, try to log to stderr as fallback
+      console.error(`[stdio] Critical message failed:`, error);
+    }
+    return false;
   }
 }
 
@@ -195,10 +260,68 @@ function stopHeartbeat(state: WebSocketConnectionState): void {
 // SERVER
 // ============================================================================
 
+export interface PiServerOptions {
+  /** Authentication provider (default: AllowAllAuthProvider) */
+  authProvider?: AuthProvider;
+  /** Metrics sink(s) for observability. Can be a single sink or CompositeSink. */
+  metricsSink?: MetricsSink;
+  /** Include MemorySink automatically for get_metrics command (default: true) */
+  includeMemoryMetrics?: boolean;
+  /** Logger for structured logging (default: ConsoleLogger with 'info' level) */
+  logger?: Logger;
+  /** Log level for default ConsoleLogger (ignored if logger is provided) */
+  logLevel?: LogLevel;
+}
+
 export class PiServer {
   private sessionManager = new PiSessionManager();
   private wss: WebSocketServer | null = null;
   private stdinInterface: readline.Interface | null = null;
+  private authProvider: AuthProvider;
+  private serverStartTime = Date.now();
+  private metrics: MetricsEmitter;
+  private logger: Logger;
+  /** Memory sink for get_metrics command (if included) */
+  private memorySink: MemorySink | null = null;
+  /** Stdio backpressure state */
+  private stdioState: StdioState = {
+    hasBackpressure: false,
+    droppedCount: 0,
+    drainHandlerRegistered: false,
+  };
+
+  constructor(options: PiServerOptions = {}) {
+    this.authProvider = options.authProvider ?? new AllowAllAuthProvider();
+
+    // Setup logger
+    this.logger = options.logger ?? new ConsoleLogger({
+      level: options.logLevel ?? "info",
+      component: "pi-server",
+    });
+
+    // Setup metrics system
+    const includeMemory = options.includeMemoryMetrics ?? true;
+    const sinks: MetricsSink[] = [];
+
+    if (options.metricsSink) {
+      sinks.push(options.metricsSink);
+    }
+
+    if (includeMemory) {
+      this.memorySink = new MemorySink({ maxEvents: 1000 });
+      sinks.push(this.memorySink);
+    }
+
+    // Create emitter with composite sink (or no-op if no sinks)
+    this.metrics = new MetricsEmitter({
+      sink: sinks.length > 0 ? new CompositeSink(sinks) : new NoOpSink(),
+    });
+
+    // Wire memory metrics provider to session manager
+    if (this.memorySink) {
+      this.sessionManager.setMemoryMetricsProvider(() => this.memorySink!.getMetrics());
+    }
+  }
 
   async start(port: number = DEFAULT_PORT): Promise<void> {
     // Start WebSocket server
@@ -229,6 +352,9 @@ export class PiServer {
     // ADR-0007: Start periodic session metadata cleanup (every hour)
     this.sessionManager.startSessionCleanup(3600000);
 
+    // Start periodic rate limit timestamp cleanup (every 5 minutes)
+    this.sessionManager.getGovernor().startPeriodicCleanup(300000);
+
     // Broadcast server_ready
     const readyEvent: RpcBroadcast = {
       type: "server_ready",
@@ -240,9 +366,15 @@ export class PiServer {
     };
     this.sessionManager.broadcast(JSON.stringify(readyEvent));
 
-    console.error(
-      `pi-app-server v${SERVER_VERSION} (protocol v${PROTOCOL_VERSION}) listening on port ${port} and stdio`
-    );
+    // Record server start metric
+    this.metrics.event(MetricNames.EVENT_SESSION_CREATED, { event: "server_ready" });
+
+    this.logger.info("Server started", {
+      version: SERVER_VERSION,
+      protocol: PROTOCOL_VERSION,
+      port,
+      transports: ["websocket", "stdio"],
+    });
   }
 
   /**
@@ -257,6 +389,28 @@ export class PiServer {
    */
   getSessionManager(): PiSessionManager {
     return this.sessionManager;
+  }
+
+  /**
+   * Get metrics emitter for external access.
+   */
+  getMetrics(): MetricsEmitter {
+    return this.metrics;
+  }
+
+  /**
+   * Get logger for external access.
+   */
+  getLogger(): Logger {
+    return this.logger;
+  }
+
+  /**
+   * Get memory sink metrics (for get_metrics command).
+   * Returns undefined if includeMemoryMetrics was false.
+   */
+  getMemoryMetrics(): Record<string, unknown> | undefined {
+    return this.memorySink?.getMetrics();
   }
 
   /**
@@ -278,15 +432,27 @@ export class PiServer {
       return; // Already shutting down
     }
 
-    console.error("[shutdown] Initiating graceful shutdown...");
+    this.logger.info("Graceful shutdown initiated");
 
     // ADR-0007: Stop periodic cleanup
     this.sessionManager.stopSessionCleanup();
 
+    // Stop periodic rate limit timestamp cleanup
+    this.sessionManager.getGovernor().stopPeriodicCleanup();
+
+    // Dispose auth provider
+    if (this.authProvider.dispose) {
+      try {
+        await Promise.resolve(this.authProvider.dispose());
+      } catch (error) {
+        this.logger.logError("Auth provider dispose failed", error instanceof Error ? error : new Error(String(error)));
+      }
+    }
+
     // Stop accepting new WebSocket connections
     if (this.wss) {
       this.wss.close(() => {
-        console.error("[shutdown] WebSocket server closed (no new connections)");
+        this.logger.debug("WebSocket server closed (no new connections)");
       });
     }
 
@@ -294,24 +460,26 @@ export class PiServer {
     if (this.stdinInterface) {
       this.stdinInterface.close();
       this.stdinInterface = null;
-      console.error("[shutdown] Stdin closed");
+      this.logger.debug("Stdin closed");
     }
 
     // Initiate session manager shutdown (broadcasts notification, drains commands)
     const result = await this.sessionManager.initiateShutdown(timeoutMs);
 
     if (result.timedOut) {
-      console.error(
-        `[shutdown] Timed out after ${timeoutMs}ms, ${result.drained} commands drained, ${this.sessionManager.getInFlightCount()} still pending`
-      );
+      this.logger.warn("Shutdown timed out", {
+        timeoutMs,
+        drained: result.drained,
+        pending: this.sessionManager.getInFlightCount(),
+      });
     } else {
-      console.error(`[shutdown] All ${result.drained} in-flight commands completed`);
+      this.logger.info("All in-flight commands completed", { count: result.drained });
     }
 
     // Close all remaining WebSocket connections
     if (this.wss) {
       const clients = [...this.wss.clients];
-      console.error(`[shutdown] Closing ${clients.length} WebSocket connections...`);
+      this.logger.info("Closing WebSocket connections", { count: clients.length });
       for (const ws of clients) {
         try {
           ws.close(1001, "Server shutting down");
@@ -323,11 +491,19 @@ export class PiServer {
 
     // Dispose all sessions
     const disposeResult = this.sessionManager.disposeAllSessions();
-    console.error(
-      `[shutdown] Disposed ${disposeResult.disposed} sessions (${disposeResult.failed} failed)`
-    );
+    this.logger.info("Sessions disposed", {
+      disposed: disposeResult.disposed,
+      failed: disposeResult.failed,
+    });
 
-    console.error("[shutdown] Complete");
+    // Flush metrics before shutdown
+    await this.metrics.flush();
+
+    // Record uptime
+    const uptimeMs = Date.now() - this.serverStartTime;
+    this.metrics.gauge(MetricNames.SESSION_LIFETIME_SECONDS, Math.floor(uptimeMs / 1000));
+
+    this.logger.info("Shutdown complete", { uptimeMs });
   }
 
   // ==========================================================================
@@ -335,11 +511,11 @@ export class PiServer {
   // ==========================================================================
 
   private setupWebSocket(wss: WebSocketServer): void {
-    wss.on("connection", (ws: WebSocket) => {
+    wss.on("connection", async (ws: WebSocket, request: any) => {
       // Check connection limit
       const connResult = this.sessionManager.getGovernor().canAcceptConnection();
       if (!connResult.allowed) {
-        console.error(`[WebSocket] Connection rejected: ${connResult.reason}`);
+        this.logger.warn("Connection rejected", { reason: connResult.reason });
         try {
           ws.close(1013, connResult.reason);
         } catch {
@@ -348,8 +524,34 @@ export class PiServer {
         return;
       }
 
+      // Authenticate connection
+      const authContext: AuthContext = {
+        request,
+        websocket: {
+          remoteAddress: request.socket?.remoteAddress,
+          secure: request.socket?.encrypted ?? false,
+        },
+        serverStartTime: this.serverStartTime,
+        connectionCount: this.sessionManager.getGovernor().getConnectionCount(),
+      };
+
+      const authResult = await Promise.resolve(this.authProvider.authenticate(authContext));
+      if (!authResult.allowed) {
+        this.logger.warn("Authentication failed", { reason: authResult.reason });
+        try {
+          ws.close(1008, authResult.reason); // 1008 = Policy Violation
+        } catch {
+          // Ignore close errors
+        }
+        return;
+      }
+
       // Register connection
       this.sessionManager.getGovernor().registerConnection();
+
+      // Record connection metric
+      this.metrics.counter(MetricNames.CONNECTIONS_TOTAL, 1);
+      this.metrics.gauge(MetricNames.CONNECTIONS_ACTIVE, this.sessionManager.getGovernor().getConnectionCount());
 
       // Initialize heartbeat state
       const heartbeatState: WebSocketConnectionState = {
@@ -388,6 +590,8 @@ export class PiServer {
         stopHeartbeat(heartbeatState);
         this.sessionManager.removeSubscriber(subscriber);
         this.sessionManager.getGovernor().unregisterConnection();
+        // Update connection metrics
+        this.metrics.gauge(MetricNames.CONNECTIONS_ACTIVE, this.sessionManager.getGovernor().getConnectionCount());
       };
 
       // Start heartbeat monitoring
@@ -460,10 +664,9 @@ export class PiServer {
 
     const subscriber: Subscriber = {
       send: (data: string) => {
-        try {
-          process.stdout.write(data + "\n");
-        } catch (error) {
-          console.error(`[stdio] Failed to write to stdout:`, error);
+        // Use backpressure-aware write (non-critical - broadcasts can be dropped)
+        if (!sendWithStdioBackpressure(data, this.stdioState, { isCritical: false })) {
+          this.stdioState.droppedCount++;
         }
       },
       subscribedSessions: new Set(),
@@ -482,22 +685,16 @@ export class PiServer {
           success: false,
           error: sizeResult.reason,
         };
-        try {
-          process.stdout.write(JSON.stringify(errorResponse) + "\n");
-        } catch {
-          // Stdout broken
-        }
+        // Error responses are critical
+        sendWithStdioBackpressure(JSON.stringify(errorResponse), this.stdioState, { isCritical: true });
         return;
       }
 
       try {
         const command: RpcCommand = JSON.parse(line);
         await this.handleCommand(command, subscriber, (response: RpcResponse) => {
-          try {
-            process.stdout.write(JSON.stringify(response) + "\n");
-          } catch (error) {
-            console.error(`[stdio] Failed to write response:`, error);
-          }
+          // Command responses are critical
+          sendWithStdioBackpressure(JSON.stringify(response), this.stdioState, { isCritical: true });
         });
       } catch (error) {
         const errorResponse: RpcResponse = {
@@ -506,11 +703,7 @@ export class PiServer {
           success: false,
           error: error instanceof Error ? error.message : "Invalid JSON",
         };
-        try {
-          process.stdout.write(JSON.stringify(errorResponse) + "\n");
-        } catch {
-          // Stdout broken, nothing we can do
-        }
+        sendWithStdioBackpressure(JSON.stringify(errorResponse), this.stdioState, { isCritical: true });
       }
     });
 
