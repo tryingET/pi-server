@@ -1,169 +1,282 @@
 # pi-server: Next Session Prompt
 
-**Operating mode:** Architecture gap discovered - session persistence bridge needed.
+**Operating mode:** Bug fixes complete - all issues resolved
+**Phase:** VALIDATION
+**Formalization Level:** 2 (Bounded Run)
 
 ---
 
-## COMPLETED IN PREVIOUS SESSIONS
+## COMPLETED THIS SESSION
 
-### ✅ Release preparation
+### ✅ Deep Review (Full Adversarial Stack)
 
-- Package excludes test artifacts
-- ADR-0001 timeout semantics consistent across docs
-- Release automation validated
-- CI workflow runs full test suite
-
-### ✅ pi-web client (NEW)
-
-Created `~/programming/pi-web/` - minimal web client:
-
-- **1,568 lines** TypeScript/CSS/HTML
-- Zero runtime dependencies
-- Production build: ~22KB (gzipped: ~6KB)
-- Session list + switching
-- Streaming responses
-- Tool execution visualization
-- Mobile-responsive
+Applied comprehensive adversarial review using the trigger methodology from `~/steve/prompts/triggers/`:
+- **INVERSION** - Shadow analysis of bugs hiding in success, self-healing races, missing validation
+- **TELESCOPIC** - Micro (atomic bugs) and macro (architectural issues) analysis
+- **NEXUS** - Identified highest-leverage interventions
+- **AUDIT** - Quality tetrahedron (bugs, debt, smells, gaps)
+- **BLAST RADIUS** - Change impact mapping
+- **ESCAPE HATCH** - Rollback design
+- **KNOWLEDGE CRYSTALLIZATION** - Pattern extraction and documentation
 
 ---
 
-## DISCOVERED: Session Persistence Gap
+## BUGS FIXED THIS SESSION
 
-### The Problem
+### 1. Resource Leak: File Descriptor (MEDIUM → FIXED)
 
-```
-pi CLI                    pi-server
-    │                         │
-    ▼                         ▼
-SessionManager          In-memory Map
-.create(cwd)            <string, AgentSession>
-    │                         │
-    ▼                         ▼
-~/.pi/agent/sessions/   RAM only (lost on restart)
-```
+**Location:** `src/session-store.ts:readSessionFileMetadata()`
 
-**pi-server creates ephemeral sessions:**
+**Problem:** If `fd.read()` threw an I/O error, the file descriptor was never closed, causing a resource leak.
+
+**Fix:** Added `try/finally` block to ensure file descriptor is always closed.
+
+**Pattern genus:** Missing RAII pattern in async resource management
+
+---
+
+### 2. UTF-8 Truncation Edge Case (LOW → FIXED)
+
+**Location:** `src/session-store.ts:readSessionFileMetadata()`
+
+**Problem:** Fixed 4096-byte buffer could truncate mid-multibyte UTF-8 characters, leading to invalid JSON parsing.
+
+**Fix:** Replaced buffer-based reading with readline-based reading:
 ```typescript
-// session-manager.ts:311
-const { session } = await createAgentSession({
-  cwd: cwd ?? process.cwd(),
-  // NO sessionManager provided → defaults to in-memory
-});
+// BEFORE: Fixed buffer could truncate mid-multibyte character
+const buffer = Buffer.alloc(4096);
+await fd.read(buffer, 0, 4096, 0);
+const firstLine = buffer.toString("utf-8").split("\n")[0];
+
+// AFTER: Proper line-by-line reading handles UTF-8 correctly
+const fileStream = fsRegular.createReadStream(filePath, { encoding: "utf-8" });
+const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
+for await (const line of rl) {
+  firstLine = line;
+  break;
+}
 ```
 
-**Result:** Existing sessions in `~/.pi/agent/sessions/` are invisible to pi-server and pi-web.
+---
+
+### 3. Extension UI Response Rate Limiting (LOW → FIXED)
+
+**Location:** `src/resource-governor.ts`, `src/session-manager.ts`
+
+**Problem:** A malicious client could spam `extension_ui_response` commands with different requestIds, potentially overwhelming the server.
+
+**Fix:** Added a separate, more restrictive rate limit specifically for `extension_ui_response`:
+- **Config:** `maxExtensionUIResponsePerMinute: 60` (1 per second on average)
+- **New method:** `canExecuteExtensionUIResponse(sessionId)` in ResourceGovernor
+- **Integration:** Check added in `executeCommand()` right after general rate limiting
+
+```typescript
+// Added to ResourceGovernor config
+maxExtensionUIResponsePerMinute: 60,
+
+// Added check in SessionManager.executeCommand()
+if (commandType === "extension_ui_response" && sessionId) {
+  const extRateLimitResult = this.governor.canExecuteExtensionUIResponse(sessionId);
+  if (!extRateLimitResult.allowed) {
+    return { id, type: "response", command: commandType, success: false, 
+             error: extRateLimitResult.reason };
+  }
+}
+```
 
 ---
 
-## CORE INTENT (UNCHANGED)
+### Previously Fixed (Earlier in Session)
 
-`pi-server` is a deterministic protocol boundary around `AgentSession`.
+#### Security: Path Validation (HIGH PRIORITY)
+- Detects `..` (parent directory traversal)
+- Detects `~` (home directory expansion)
+- Detects null bytes (injection attacks)
+- Enforces max path length (4096 chars)
 
-It does only four things:
-1. multiplex sessions
-2. preserve causal command semantics
-3. enforce resource and safety constraints
-4. expose a stable, inspectable wire contract
+#### Memory: Synthetic ID Exclusion (MEDIUM PRIORITY)
+- Only store outcomes for explicit client-provided IDs
+- Synthetic IDs (`anon:timestamp:seq`) not stored in outcome cache
+- Prevents unbounded memory growth under high traffic
 
----
-
-## PROPOSED SOLUTIONS
-
-### Phase 1: Immediate UX Fix (Priority H)
-
-| ID | Suggestion | Files |
-|----|------------|-------|
-| S1 | Add `list_stored_sessions` command | `types.ts`, `session-manager.ts` |
-| S2 | Add `load_session <path>` command | `types.ts`, `session-manager.ts` |
-| S4 | pi-web: Show "Active" vs "Stored" sections | `pi-web/src/renderer.ts` |
-| S7 | pi-web: Add "Load Session" button | `pi-web/src/renderer.ts` |
-
-### Phase 2: Protocol Completeness (Priority M)
-
-| ID | Suggestion |
-|----|------------|
-| S3 | `create_session` accepts optional `sessionPath` |
-| S5 | Document session persistence in PROTOCOL.md |
-| S6 | Add `persistence: "ephemeral" | "file"` to SessionInfo |
-| S8 | Add `session_loaded` event type |
-
-### Phase 3: Polish (Priority L)
-
-| ID | Suggestion |
-|----|------------|
-| S9 | `--persist` flag for default persistence |
-| S10 | Session search/filter in pi-web |
+#### Code Quality
+- Removed unused `decodeCwdFromDirName()` function
+- Removed unused `mostRecent` variable
+- All lint warnings resolved
 
 ---
 
-## HOW TO START
+## TEST RESULTS
+
+| Test Suite | Status |
+|------------|--------|
+| Unit tests | 96 passed, 0 failed |
+| Fuzz tests | 17 passed, 0 failed |
+| Typecheck | Clean |
+| Lint | Clean |
+
+### Run Tests
 
 ```bash
 cd ~/programming/pi-server
+npm test           # 96 unit tests
+npm run test:fuzz  # 17 fuzz tests
+npm run check      # typecheck + lint
+```
+
+---
+
+## ARCHITECTURE
+
+### Protocol Semantics (ADR-0008)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Command ID Semantics                      │
+├─────────────────────────────────────────────────────────────┤
+│  Explicit ID (client-provided)                              │
+│  ├─ Stored in outcome cache                                 │
+│  ├─ Replayable (same ID = same response)                    │
+│  └─ Can be used in dependsOn chains                         │
+│                                                             │
+│  Synthetic ID (server-generated: anon:timestamp:seq)        │
+│  ├─ NOT stored in outcome cache                             │
+│  ├─ NOT replayable                                          │
+│  └─ Tracked in-flight only during execution                 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Path Validation
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Dangerous Path Patterns                   │
+├─────────────────────────────────────────────────────────────┤
+│  ../     → Parent directory traversal (rejected)            │
+│  ~/      → Home directory expansion (rejected)              │
+│  \0      → Null byte injection (rejected)                   │
+│  > 4096  → Path too long (rejected)                         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Rate Limiting Layers
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Rate Limiting Hierarchy                   │
+├─────────────────────────────────────────────────────────────┤
+│  1. Global rate limit (1000 commands/minute)                │
+│  2. Per-session rate limit (100 commands/minute)            │
+│  3. Extension UI response limit (60 responses/minute)       │
+│                                                             │
+│  Replay operations are FREE (don't consume rate limit)      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## COMPLETED FEATURES
+
+| Feature | Status |
+|---------|--------|
+| Session slot leak prevention | ✅ |
+| WebSocket backpressure | ✅ |
+| Bounded pending UI requests | ✅ |
+| WebSocket heartbeat | ✅ |
+| RequestId validation | ✅ |
+| Session persistence | ✅ |
+| Session discovery | ✅ |
+| Auto-load most recent session | ✅ |
+| Periodic metadata cleanup | ✅ |
+| Group sessions by folder | ✅ |
+| Show session names/timestamps | ✅ |
+| Load message history | ✅ |
+| **Path validation (security)** | ✅ |
+| **Synthetic ID exclusion (memory)** | ✅ |
+| **UTF-8 safe file reading** | ✅ |
+| **Extension UI response rate limiting** | ✅ |
+| **File descriptor leak prevention** | ✅ |
+
+---
+
+## ADRs (Architecture Decision Records)
+
+| ADR | Title | Status |
+|-----|-------|--------|
+| 0001 | Atomic Outcome Storage | Accepted |
+| 0002 | Session ID Locking | Accepted |
+| 0003 | WebSocket Backpressure | Accepted |
+| 0004 | Bounded Pending UI Requests | Accepted |
+| 0005 | WebSocket Heartbeat | Accepted |
+| 0006 | RequestId Validation | Accepted |
+| 0007 | Session Persistence | Accepted |
+| 0008 | Synthetic ID Semantics | Accepted |
+
+---
+
+## FILES MODIFIED THIS SESSION
+
+| File | Changes |
+|------|---------|
+| `src/session-store.ts` | UTF-8 safe reading, FD leak fix, added `fsRegular` import |
+| `src/resource-governor.ts` | Added `maxExtensionUIResponsePerMinute` config, `canExecuteExtensionUIResponse()` method, cleanup tracking |
+| `src/session-manager.ts` | Added extension UI response rate limit check |
+| `src/types.ts` | Added `extensionUIResponseRateLimit` to metrics |
+| `src/validation.ts` | Path validation (from earlier) |
+
+---
+
+## NEXT STEPS
+
+1. **Release to npm** - Ready for release
+2. **Optional: Per-client session limits** - Low priority, current global limits sufficient
+3. **Optional: Circuit breaker for AgentSession failures** - Monitor first, implement if needed
+
+---
+
+## ROLLBACK
+
+If issues arise from this session's changes:
+
+```bash
+# Revert all session-store changes (UTF-8 reading, FD leak fix)
+git checkout HEAD~1 -- src/session-store.ts
+
+# Revert resource governor changes (extension UI rate limiting)
+git checkout HEAD~1 -- src/resource-governor.ts
+
+# Revert session-manager changes (rate limit integration)
+git checkout HEAD~1 -- src/session-manager.ts
+
+# Revert types changes
+git checkout HEAD~1 -- src/types.ts
+
+# Rebuild
 npm run build
-node dist/server.js
 ```
 
-Server starts on:
-- WebSocket: `ws://localhost:3141`
-- stdio: newline-delimited JSON on stdin/stdout
+No data migration needed - all changes are pure logic additions.
 
 ---
 
-## TESTING WITH pi-web
+## TRIGGERS USED
 
-```bash
-# Terminal 1: Start pi-server
-cd ~/programming/pi-server
-node dist/server.js
+From `~/steve/prompts/triggers/`:
 
-# Terminal 2: Start pi-web
-cd ~/programming/pi-web
-npm run dev
-
-# Open http://localhost:3000
-```
-
-**Current limitation:** Only sessions created via pi-server appear in web UI.
+| Trigger | What It Found |
+|---------|---------------|
+| `inversion.md` | FD leak (what if read fails after open succeeds?) |
+| `telescopic.md` | Micro analysis of every error path, resource boundary |
+| `audit.md` | Quality tetrahedron - found FD leak in DEBT dimension |
+| `inquisition.md` | Resource inquisition - allocation succeeds but something after fails |
 
 ---
 
-## NEXT STEPS (PRIORITY ORDER)
+## CODE QUALITY OBSERVATIONS
 
-1. **Implement S1 + S2** - `list_stored_sessions` and `load_session` commands
-2. **Update pi-web** - Show stored sessions, add load button
-3. **Test full flow** - Load existing session, send prompt, verify persistence
-4. **Document** - Update PROTOCOL.md with session persistence semantics
-
----
-
-## VALIDATION GATES
-
-### FAST_GATE (per commit)
-```bash
-npm run check
-npm test
-```
-
-### FULL_GATE (final)
-```bash
-npm run release:check
-npm run test:integration
-npm run test:fuzz
-```
-
-### SMOKE_TEST (pi-web)
-```bash
-cd ~/programming/pi-web
-npx tsc --noEmit
-npm run build
-# Open in browser and verify connection
-```
-
----
-
-## OPEN QUESTIONS
-
-1. Should persistent sessions be the default or opt-in?
-2. How to handle session file conflicts (same sessionId from different paths)?
-3. Should pi-web auto-load the most recent session on connect?
+- No TODOs, FIXMEs, HACKs, or XXXs in production code
+- Proper `try/finally` patterns throughout
+- Good use of explicit cleanup functions
+- Minimal use of `any` types (mostly for extensibility interfaces)
+- All empty catch blocks avoided
+- No bugs found in lock management, heartbeat/cleanup, error paths, memory management, race conditions, or backpressure handling
