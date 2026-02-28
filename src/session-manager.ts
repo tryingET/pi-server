@@ -32,9 +32,15 @@ import { ExtensionUIManager } from "./extension-ui.js";
 import { createServerUIContext } from "./server-ui-context.js";
 import { validateCommand, formatValidationErrors } from "./validation.js";
 import { ResourceGovernor, DEFAULT_CONFIG } from "./resource-governor.js";
-import { CommandReplayStore, type InFlightCommandRecord } from "./command-replay-store.js";
+import {
+  CommandReplayStore,
+  type InFlightCommandRecord,
+  SYNTHETIC_ID_PREFIX,
+} from "./command-replay-store.js";
 import { SessionVersionStore } from "./session-version-store.js";
 import { CommandExecutionEngine } from "./command-execution-engine.js";
+import { SessionLockManager } from "./session-lock-manager.js";
+import { SessionStore, type StoredSessionInfo } from "./session-store.js";
 
 /** Default timeout for session commands (5 minutes for LLM operations) */
 const DEFAULT_COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
@@ -53,6 +59,8 @@ export interface SessionManagerRuntimeOptions {
   shortCommandTimeoutMs?: number;
   dependencyWaitTimeoutMs?: number;
   idempotencyTtlMs?: number;
+  /** Server version for session metadata tracking */
+  serverVersion?: string;
 }
 
 export class PiSessionManager implements SessionResolver {
@@ -68,6 +76,10 @@ export class PiSessionManager implements SessionResolver {
   private versionStore: SessionVersionStore;
   /** Command execution engine. */
   private executionEngine: CommandExecutionEngine;
+  /** Session ID lock manager for preventing create/delete races. */
+  private lockManager: SessionLockManager;
+  /** Session metadata store for persistence across restarts (ADR-0007). */
+  private sessionStore: SessionStore;
 
   // Shutdown state (single source of truth - server.ts delegates to this)
   private isShuttingDown = false;
@@ -111,6 +123,10 @@ export class PiSessionManager implements SessionResolver {
         dependencyWaitTimeoutMs: this.dependencyWaitTimeoutMs,
       }
     );
+    this.lockManager = new SessionLockManager();
+    this.sessionStore = new SessionStore({
+      serverVersion: options.serverVersion,
+    });
   }
 
   /**
@@ -240,6 +256,7 @@ export class PiSessionManager implements SessionResolver {
     this.versionStore.clear();
     this.executionEngine.clear();
     this.replayStore.clear();
+    this.lockManager.clear();
 
     // Clear governor state
     this.governor.cleanupStaleData(new Set());
@@ -283,7 +300,7 @@ export class PiSessionManager implements SessionResolver {
   // ==========================================================================
 
   async createSession(sessionId: string, cwd?: string): Promise<SessionInfo> {
-    // Validate session ID
+    // Validate session ID (validation doesn't need lock)
     const sessionIdError = this.governor.validateSessionId(sessionId);
     if (sessionIdError) {
       throw new Error(sessionIdError);
@@ -297,94 +314,126 @@ export class PiSessionManager implements SessionResolver {
       }
     }
 
-    // Check for duplicate (still possible race, but unlikely with valid IDs)
-    if (this.sessions.has(sessionId)) {
-      throw new Error(`Session ${sessionId} already exists`);
-    }
-
-    // Atomically reserve a session slot (prevents race conditions)
-    if (!this.governor.tryReserveSessionSlot()) {
-      throw new Error(`Session limit reached (${this.governor.getConfig().maxSessions} sessions)`);
-    }
+    // Acquire lock for this session ID to prevent concurrent create/delete races
+    const lock = await this.lockManager.acquire(sessionId, "createSession");
 
     try {
-      const { session } = await createAgentSession({
-        cwd: cwd ?? process.cwd(),
-      });
-
-      // Wire extension UI - this is the nexus intervention!
-      // Without this, extension UI requests (select, confirm, input, etc.) hang.
-      await session.bindExtensions({
-        uiContext: createServerUIContext(sessionId, this.extensionUI, (sid, event) =>
-          this.broadcastEvent(sid, event)
-        ),
-      });
-
-      // Re-check duplicate after async creation to close race window
+      // Check for duplicate UNDER LOCK - prevents race condition
       if (this.sessions.has(sessionId)) {
-        session.dispose();
         throw new Error(`Session ${sessionId} already exists`);
       }
 
-      this.sessions.set(sessionId, session);
-      this.sessionCreatedAt.set(sessionId, new Date());
-      this.versionStore.initialize(sessionId);
-      // Record heartbeat (session count already incremented by tryReserveSessionSlot)
-      this.governor.recordHeartbeat(sessionId);
+      // Atomically reserve a session slot (prevents resource exhaustion)
+      if (!this.governor.tryReserveSessionSlot()) {
+        throw new Error(
+          `Session limit reached (${this.governor.getConfig().maxSessions} sessions)`
+        );
+      }
 
-      // Subscribe to all events from this session
-      const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
-        this.broadcastEvent(sessionId, event);
-      });
-      this.unsubscribers.set(sessionId, unsubscribe);
+      try {
+        const { session } = await createAgentSession({
+          cwd: cwd ?? process.cwd(),
+        });
 
-      return this.getSessionInfo(sessionId)!;
-    } catch (error) {
-      // Release the slot if session creation failed
-      this.governor.releaseSessionSlot();
-      throw error;
+        // Wire extension UI - this is the nexus intervention!
+        // Without this, extension UI requests (select, confirm, input, etc.) hang.
+        await session.bindExtensions({
+          uiContext: createServerUIContext(sessionId, this.extensionUI, (sid, event) =>
+            this.broadcastEvent(sid, event)
+          ),
+        });
+
+        // Final check still under lock - handles edge case of session creation side effects
+        if (this.sessions.has(sessionId)) {
+          session.dispose();
+          throw new Error(`Session ${sessionId} already exists`);
+        }
+
+        this.sessions.set(sessionId, session);
+        this.sessionCreatedAt.set(sessionId, new Date());
+        this.versionStore.initialize(sessionId);
+        // Record heartbeat (session count already incremented by tryReserveSessionSlot)
+        this.governor.recordHeartbeat(sessionId);
+
+        // Subscribe to all events from this session
+        const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+          this.broadcastEvent(sessionId, event);
+        });
+        this.unsubscribers.set(sessionId, unsubscribe);
+
+        // ADR-0007: Persist session metadata
+        const sessionInfo = this.getSessionInfo(sessionId)!;
+        if (!session.sessionFile) {
+          throw new Error("Session created without session file - cannot persist");
+        }
+        await this.sessionStore.save({
+          sessionId,
+          sessionFile: session.sessionFile,
+          cwd: cwd ?? process.cwd(),
+          createdAt: sessionInfo.createdAt,
+          modelId: session.model?.id,
+        });
+
+        return sessionInfo;
+      } catch (error) {
+        // Release the slot if session creation failed
+        this.governor.releaseSessionSlot();
+        throw error;
+      }
+    } finally {
+      lock.release();
     }
   }
 
   async deleteSession(sessionId: string): Promise<void> {
-    const session = this.sessions.get(sessionId);
-    if (!session) {
-      throw new Error(`Session ${sessionId} not found`);
-    }
+    // Acquire lock for this session ID to prevent concurrent create/delete races
+    const lock = await this.lockManager.acquire(sessionId, "deleteSession");
 
-    // Cancel any pending extension UI requests for this session
-    this.extensionUI.cancelSessionRequests(sessionId);
-
-    // Remove from maps first to prevent new operations
-    this.sessions.delete(sessionId);
-    this.sessionCreatedAt.delete(sessionId);
-    this.versionStore.delete(sessionId);
-    this.governor.unregisterSession(sessionId);
-
-    // Clean up stale governor data for this session
-    this.governor.cleanupStaleData(new Set(this.sessions.keys()));
-
-    // Unsubscribe from events
-    const unsubscribe = this.unsubscribers.get(sessionId);
-    if (unsubscribe) {
-      this.unsubscribers.delete(sessionId);
-      try {
-        unsubscribe();
-      } catch (error) {
-        console.error(`[deleteSession] Failed to unsubscribe:`, error);
-      }
-    }
-
-    // Dispose the session
     try {
-      session.dispose();
-    } catch (error) {
-      console.error(`[deleteSession] Failed to dispose session:`, error);
-    }
+      const session = this.sessions.get(sessionId);
+      if (!session) {
+        throw new Error(`Session ${sessionId} not found`);
+      }
 
-    // Remove this session from all subscriber subscriptions
-    for (const subscriber of this.subscribers) {
-      subscriber.subscribedSessions.delete(sessionId);
+      // Cancel any pending extension UI requests for this session
+      this.extensionUI.cancelSessionRequests(sessionId);
+
+      // Remove from maps first to prevent new operations
+      this.sessions.delete(sessionId);
+      this.sessionCreatedAt.delete(sessionId);
+      this.versionStore.delete(sessionId);
+      this.governor.unregisterSession(sessionId);
+
+      // Clean up stale governor data for this session
+      this.governor.cleanupStaleData(new Set(this.sessions.keys()));
+
+      // Unsubscribe from events
+      const unsubscribe = this.unsubscribers.get(sessionId);
+      if (unsubscribe) {
+        this.unsubscribers.delete(sessionId);
+        try {
+          unsubscribe();
+        } catch (error) {
+          console.error(`[deleteSession] Failed to unsubscribe:`, error);
+        }
+      }
+
+      // Dispose the session
+      try {
+        session.dispose();
+      } catch (error) {
+        console.error(`[deleteSession] Failed to dispose session:`, error);
+      }
+
+      // Remove this session from all subscriber subscriptions
+      for (const subscriber of this.subscribers) {
+        subscriber.subscribedSessions.delete(sessionId);
+      }
+
+      // ADR-0007: Remove session metadata
+      await this.sessionStore.delete(sessionId);
+    } finally {
+      lock.release();
     }
   }
 
@@ -422,6 +471,134 @@ export class PiSessionManager implements SessionResolver {
       if (info) infos.push(info);
     }
     return infos;
+  }
+
+  // ==========================================================================
+  // SESSION PERSISTENCE (ADR-0007)
+  // ==========================================================================
+
+  /**
+   * List stored sessions that can be loaded.
+   * These are sessions that existed in previous server runs OR discovered on disk.
+   */
+  async listStoredSessions(): Promise<StoredSessionInfo[]> {
+    return this.sessionStore.listAllSessions();
+  }
+
+  /**
+   * Load a session from a stored session file.
+   * Creates a new in-memory session that reads from the existing session file.
+   */
+  async loadSession(sessionId: string, sessionPath: string): Promise<SessionInfo> {
+    // Validate session ID
+    const sessionIdError = this.governor.validateSessionId(sessionId);
+    if (sessionIdError) {
+      throw new Error(sessionIdError);
+    }
+
+    // Acquire lock for this session ID
+    const lock = await this.lockManager.acquire(sessionId, "loadSession");
+
+    try {
+      // Check for duplicate UNDER LOCK
+      if (this.sessions.has(sessionId)) {
+        throw new Error(`Session ${sessionId} already exists`);
+      }
+
+      // Atomically reserve a session slot
+      if (!this.governor.tryReserveSessionSlot()) {
+        throw new Error(
+          `Session limit reached (${this.governor.getConfig().maxSessions} sessions)`
+        );
+      }
+
+      try {
+        // Create session and switch to the specified file
+        const { session } = await createAgentSession({
+          cwd: process.cwd(),
+        });
+
+        // Switch to the specified session file
+        const switched = await session.switchSession(sessionPath);
+        if (!switched) {
+          session.dispose();
+          throw new Error(`Failed to load session from ${sessionPath}`);
+        }
+
+        // Wire extension UI
+        await session.bindExtensions({
+          uiContext: createServerUIContext(sessionId, this.extensionUI, (sid, event) =>
+            this.broadcastEvent(sid, event)
+          ),
+        });
+
+        // Final check still under lock
+        if (this.sessions.has(sessionId)) {
+          session.dispose();
+          throw new Error(`Session ${sessionId} already exists`);
+        }
+
+        this.sessions.set(sessionId, session);
+        this.sessionCreatedAt.set(sessionId, new Date());
+        this.versionStore.initialize(sessionId);
+        this.governor.recordHeartbeat(sessionId);
+
+        // Subscribe to events
+        const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+          this.broadcastEvent(sessionId, event);
+        });
+        this.unsubscribers.set(sessionId, unsubscribe);
+
+        // Update session metadata
+        const sessionInfo = this.getSessionInfo(sessionId)!;
+        if (!session.sessionFile) {
+          throw new Error("Session loaded without session file - cannot persist metadata");
+        }
+        await this.sessionStore.save({
+          sessionId,
+          sessionFile: session.sessionFile,
+          cwd: process.cwd(),
+          createdAt: sessionInfo.createdAt,
+          modelId: session.model?.id,
+        });
+
+        return sessionInfo;
+      } catch (error) {
+        this.governor.releaseSessionSlot();
+        throw error;
+      }
+    } finally {
+      lock.release();
+    }
+  }
+
+  /**
+   * Get the session store for direct access (e.g., cleanup).
+   */
+  getSessionStore(): SessionStore {
+    return this.sessionStore;
+  }
+
+  /**
+   * Start periodic cleanup of orphaned session metadata.
+   * @param intervalMs Cleanup interval in milliseconds (default: 1 hour)
+   */
+  startSessionCleanup(intervalMs?: number): void {
+    this.sessionStore.startPeriodicCleanup(intervalMs);
+  }
+
+  /**
+   * Stop periodic cleanup.
+   */
+  stopSessionCleanup(): void {
+    this.sessionStore.stopPeriodicCleanup();
+  }
+
+  /**
+   * Run a one-time cleanup of orphaned session metadata.
+   */
+  async cleanupSessions(): Promise<{ removed: number; kept: number }> {
+    return this.sessionStore.cleanup();
   }
 
   // ==========================================================================
@@ -612,6 +789,20 @@ export class PiSessionManager implements SessionResolver {
       };
     }
 
+    // Additional rate limiting for extension_ui_response (prevents spam)
+    if (commandType === "extension_ui_response" && sessionId) {
+      const extRateLimitResult = this.governor.canExecuteExtensionUIResponse(sessionId);
+      if (!extRateLimitResult.allowed) {
+        return {
+          id,
+          type: "response",
+          command: commandType,
+          success: false,
+          error: extRateLimitResult.reason,
+        };
+      }
+    }
+
     // Proceed with normal execution
     const commandExecution = this.executionEngine.runOnLane<RpcResponse>(
       laneKey,
@@ -731,7 +922,13 @@ export class PiSessionManager implements SessionResolver {
     // ADR-0001: ATOMIC OUTCOME STORAGE
     // Store outcome BEFORE returning (not in async callback)
     // This ensures same command ID always returns same response
-    if (id) {
+    //
+    // Only store outcomes for EXPLICIT client IDs (not synthetic IDs).
+    // Synthetic IDs (anon:timestamp:seq) are server-generated for anonymous
+    // commands and should not be stored to prevent unbounded memory growth.
+    // Clients must provide explicit IDs if they want replay semantics.
+    const isExplicitId = id && !id.startsWith(SYNTHETIC_ID_PREFIX);
+    if (isExplicitId) {
       try {
         this.replayStore.storeCommandOutcome({
           commandId: id,
@@ -752,6 +949,9 @@ export class PiSessionManager implements SessionResolver {
       if (this.replayStore.getInFlight(id) === inFlightRecord) {
         this.replayStore.unregisterInFlight(id, inFlightRecord!);
       }
+    } else if (id && this.replayStore.getInFlight(id) === inFlightRecord) {
+      // Synthetic ID: still need to unregister in-flight
+      this.replayStore.unregisterInFlight(id, inFlightRecord!);
     }
 
     this.broadcastCommandLifecycle("command_finished", {
@@ -845,6 +1045,8 @@ export class PiSessionManager implements SessionResolver {
           const replayStats = this.replayStore.getStats();
           const versionStats = this.versionStore.getStats();
           const executionStats = this.executionEngine.getStats();
+          const lockStats = this.lockManager.getStats();
+          const extensionUIStats = this.extensionUI.getStats();
           return {
             id,
             type: "response",
@@ -856,6 +1058,8 @@ export class PiSessionManager implements SessionResolver {
                 replay: replayStats,
                 version: versionStats,
                 execution: executionStats,
+                lock: lockStats,
+                extensionUI: extensionUIStats,
               },
             },
           };
@@ -870,6 +1074,38 @@ export class PiSessionManager implements SessionResolver {
             success: true,
             data: health,
           };
+        }
+
+        // ADR-0007: Session persistence commands
+        case "list_stored_sessions": {
+          const storedSessions = await this.listStoredSessions();
+          return {
+            id,
+            type: "response",
+            command: "list_stored_sessions",
+            success: true,
+            data: { sessions: storedSessions },
+          };
+        }
+
+        case "load_session": {
+          const cmd = command as { sessionId?: string; sessionPath: string };
+          const sessionId = cmd.sessionId ?? this.generateSessionId();
+          try {
+            const sessionInfo = await this.loadSession(sessionId, cmd.sessionPath);
+            return {
+              id,
+              type: "response",
+              command: "load_session",
+              success: true,
+              data: { sessionId, sessionInfo },
+            };
+          } catch (error) {
+            return failResponse(
+              error instanceof Error ? error.message : String(error),
+              "load_session"
+            );
+          }
         }
       }
 

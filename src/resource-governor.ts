@@ -30,6 +30,10 @@ export interface ResourceGovernorConfig {
   heartbeatIntervalMs: number;
   /** Time without heartbeat before session is considered zombie (default: 5 min) */
   zombieTimeoutMs: number;
+  /** Maximum extension_ui_response commands per minute per session (default: 60) */
+  maxExtensionUIResponsePerMinute: number;
+  /** Maximum session lifetime in ms (0 = unlimited, default: 24 hours) */
+  maxSessionLifetimeMs: number;
 }
 
 export const DEFAULT_CONFIG: ResourceGovernorConfig = {
@@ -40,6 +44,8 @@ export const DEFAULT_CONFIG: ResourceGovernorConfig = {
   maxConnections: 1000,
   heartbeatIntervalMs: 30000,
   zombieTimeoutMs: 5 * 60 * 1000, // 5 minutes
+  maxExtensionUIResponsePerMinute: 60, // 1 per second on average
+  maxSessionLifetimeMs: 24 * 60 * 60 * 1000, // 24 hours
 };
 
 // ============================================================================
@@ -56,6 +62,7 @@ export interface GovernorMetrics {
     rateLimit: number;
     globalRateLimit: number;
     connectionLimit: number;
+    extensionUIResponseRateLimit: number;
   };
   zombieSessionsDetected: number;
   zombieSessionsCleaned: number;
@@ -121,7 +128,9 @@ export class ResourceGovernor {
   private connectionCount = 0;
   private commandTimestamps = new Map<string, number[]>();
   private globalCommandTimestamps: number[] = [];
+  private extensionUIResponseTimestamps = new Map<string, number[]>();
   private lastHeartbeat = new Map<string, number>();
+  private sessionCreatedAt = new Map<string, number>();
   private totalCommandsExecuted = 0;
   private commandsRejected = {
     sessionLimit: 0,
@@ -129,6 +138,7 @@ export class ResourceGovernor {
     rateLimit: 0,
     globalRateLimit: 0,
     connectionLimit: 0,
+    extensionUIResponseRateLimit: 0,
   };
   private zombieSessionsDetected = 0;
   private zombieSessionsCleaned = 0;
@@ -258,6 +268,7 @@ export class ResourceGovernor {
       );
     }
     this.lastHeartbeat.delete(sessionId);
+    this.sessionCreatedAt.delete(sessionId);
     this.commandTimestamps.delete(sessionId);
   }
 
@@ -439,14 +450,54 @@ export class ResourceGovernor {
   }
 
   // ==========================================================================
+  // EXTENSION UI RESPONSE RATE LIMITING
+  // ==========================================================================
+
+  /**
+   * Check if an extension_ui_response command can be executed for the given session.
+   * This is a separate, more restrictive rate limit to prevent abuse of UI responses.
+   */
+  canExecuteExtensionUIResponse(sessionId: string): GovernorResult {
+    const now = Date.now();
+    const windowStart = now - RATE_WINDOW_MS;
+
+    let timestamps = this.extensionUIResponseTimestamps.get(sessionId);
+    if (!timestamps) {
+      timestamps = [];
+      this.extensionUIResponseTimestamps.set(sessionId, timestamps);
+    } else {
+      timestamps = timestamps.filter((t) => t > windowStart);
+      this.extensionUIResponseTimestamps.set(sessionId, timestamps);
+    }
+
+    if (timestamps.length >= this.config.maxExtensionUIResponsePerMinute) {
+      this.commandsRejected.extensionUIResponseRateLimit++;
+      return {
+        allowed: false,
+        reason: `Extension UI response rate limit exceeded (${this.config.maxExtensionUIResponsePerMinute} responses/minute)`,
+      };
+    }
+
+    // Record this response
+    timestamps.push(now);
+    return { allowed: true };
+  }
+
+  // ==========================================================================
   // HEARTBEAT / ZOMBIE DETECTION
   // ==========================================================================
 
   /**
    * Record a heartbeat for a session.
+   * Also tracks session creation time for lifetime enforcement.
    */
   recordHeartbeat(sessionId: string): void {
-    this.lastHeartbeat.set(sessionId, Date.now());
+    const now = Date.now();
+    this.lastHeartbeat.set(sessionId, now);
+    // Track creation time if this is a new session
+    if (!this.sessionCreatedAt.has(sessionId)) {
+      this.sessionCreatedAt.set(sessionId, now);
+    }
   }
 
   /**
@@ -558,6 +609,7 @@ export class ResourceGovernor {
       rateLimit: 0,
       globalRateLimit: 0,
       connectionLimit: 0,
+      extensionUIResponseRateLimit: 0,
     };
     this.zombieSessionsDetected = 0;
     this.zombieSessionsCleaned = 0;
@@ -601,5 +653,49 @@ export class ResourceGovernor {
         this.lastHeartbeat.delete(sessionId);
       }
     }
+
+    for (const sessionId of this.sessionCreatedAt.keys()) {
+      if (!activeSessionIds.has(sessionId)) {
+        this.sessionCreatedAt.delete(sessionId);
+      }
+    }
+
+    for (const sessionId of this.extensionUIResponseTimestamps.keys()) {
+      if (!activeSessionIds.has(sessionId)) {
+        this.extensionUIResponseTimestamps.delete(sessionId);
+      }
+    }
+  }
+
+  // ==========================================================================
+  // SESSION LIFETIME
+  // ==========================================================================
+
+  /**
+   * Get list of expired session IDs (exceeded maxSessionLifetimeMs).
+   * Returns empty array if maxSessionLifetimeMs is 0 (unlimited).
+   */
+  getExpiredSessions(): string[] {
+    if (this.config.maxSessionLifetimeMs === 0) {
+      return [];
+    }
+
+    const now = Date.now();
+    const expired: string[] = [];
+
+    for (const [sessionId, createdAt] of this.sessionCreatedAt) {
+      if (now - createdAt > this.config.maxSessionLifetimeMs) {
+        expired.push(sessionId);
+      }
+    }
+
+    return expired;
+  }
+
+  /**
+   * Get the creation time for a session.
+   */
+  getSessionCreatedAt(sessionId: string): number | undefined {
+    return this.sessionCreatedAt.get(sessionId);
   }
 }

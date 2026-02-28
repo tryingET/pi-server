@@ -26,6 +26,171 @@ const DEFAULT_PORT = 3141;
 /** Default graceful shutdown timeout (30 seconds) */
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 30000;
 
+/** WebSocket backpressure threshold (64KB). Beyond this, we start dropping non-critical messages. */
+const BACKPRESSURE_THRESHOLD_BYTES = 64 * 1024;
+
+/** WebSocket critical backpressure threshold (1MB). Beyond this, we close the connection. */
+const BACKPRESSURE_CRITICAL_BYTES = 1024 * 1024;
+
+/** WebSocket heartbeat interval (30 seconds). */
+const HEARTBEAT_INTERVAL_MS = 30 * 1000;
+
+/** WebSocket heartbeat timeout (10 seconds). If no pong received, close connection. */
+const HEARTBEAT_TIMEOUT_MS = 10 * 1000;
+
+/**
+ * WebSocket connection state for heartbeat tracking.
+ */
+interface WebSocketConnectionState {
+  /** Whether we're waiting for a pong response. */
+  waitingForPong: boolean;
+  /** Timestamp of last pong received. */
+  lastPongAt: number;
+  /** Heartbeat interval timer. */
+  heartbeatTimer: NodeJS.Timeout | null;
+  /** Timeout timer for missing pong. */
+  pongTimeoutTimer: NodeJS.Timeout | null;
+  /** Whether the connection has been cleaned up (prevents use-after-free in async callbacks). */
+  cleanedUp: boolean;
+}
+
+/**
+ * Send result types for backpressure-aware WebSocket sends.
+ */
+type SendResult =
+  | { ok: true }
+  | { ok: false; reason: "backpressure" | "closed" | "error"; error?: Error };
+
+/**
+ * Backpressure-aware WebSocket send.
+ *
+ * - Returns { ok: true } if sent successfully
+ * - Returns { ok: false, reason: "backpressure" } if message dropped due to backpressure
+ * - Returns { ok: false, reason: "closed" } if connection not open
+ * - Returns { ok: false, reason: "error" } if send threw
+ *
+ * For critical messages (isCritical: true), we attempt send even under mild backpressure.
+ * Under critical backpressure (>1MB), connection is closed to prevent OOM.
+ */
+function sendWithBackpressure(
+  ws: WebSocket,
+  data: string,
+  options: { isCritical?: boolean } = {}
+): SendResult {
+  if (ws.readyState !== WebSocket.OPEN) {
+    return { ok: false, reason: "closed" };
+  }
+
+  const bufferedAmount = ws.bufferedAmount;
+
+  // Critical backpressure: close connection to prevent OOM
+  if (bufferedAmount > BACKPRESSURE_CRITICAL_BYTES) {
+    console.error(
+      `[WebSocket] Critical backpressure (${bufferedAmount} bytes), closing connection`
+    );
+    try {
+      ws.close(1013, "Backpressure limit exceeded");
+    } catch {
+      // Ignore close errors
+    }
+    return { ok: false, reason: "backpressure" };
+  }
+
+  // Mild backpressure: drop non-critical messages
+  if (bufferedAmount > BACKPRESSURE_THRESHOLD_BYTES && !options.isCritical) {
+    console.error(
+      `[WebSocket] Backpressure warning (${bufferedAmount} bytes), dropping non-critical message`
+    );
+    return { ok: false, reason: "backpressure" };
+  }
+
+  try {
+    ws.send(data);
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: "error",
+      error: error instanceof Error ? error : new Error(String(error)),
+    };
+  }
+}
+
+/**
+ * Start heartbeat for a WebSocket connection.
+ * Sends periodic pings and closes connection if pong not received.
+ */
+function startHeartbeat(ws: WebSocket, state: WebSocketConnectionState): void {
+  state.lastPongAt = Date.now();
+  state.waitingForPong = false;
+  state.cleanedUp = false;
+
+  state.heartbeatTimer = setInterval(() => {
+    // Check cleanup flag first to prevent use-after-free
+    if (state.cleanedUp || ws.readyState !== WebSocket.OPEN) {
+      stopHeartbeat(state);
+      return;
+    }
+
+    // If still waiting for previous pong, close connection
+    if (state.waitingForPong) {
+      const elapsed = Date.now() - state.lastPongAt;
+      console.error(`[WebSocket] No pong received after ${elapsed}ms, closing connection`);
+      stopHeartbeat(state);
+      try {
+        ws.close(1001, "Heartbeat timeout");
+      } catch {
+        // Ignore close errors
+      }
+      return;
+    }
+
+    // Send ping
+    state.waitingForPong = true;
+    try {
+      ws.ping();
+    } catch {
+      // Ping failed, connection likely dead
+      stopHeartbeat(state);
+    }
+
+    // Set pong timeout
+    state.pongTimeoutTimer = setTimeout(() => {
+      // Check cleanup flag first to prevent race with cleanupConnection
+      if (state.cleanedUp) return;
+
+      if (state.waitingForPong && ws.readyState === WebSocket.OPEN) {
+        console.error(
+          `[WebSocket] Pong timeout after ${HEARTBEAT_TIMEOUT_MS}ms, closing connection`
+        );
+        stopHeartbeat(state);
+        try {
+          ws.close(1001, "Heartbeat timeout");
+        } catch {
+          // Ignore close errors
+        }
+      }
+    }, HEARTBEAT_TIMEOUT_MS);
+  }, HEARTBEAT_INTERVAL_MS);
+}
+
+/**
+ * Stop heartbeat timers for a WebSocket connection.
+ */
+function stopHeartbeat(state: WebSocketConnectionState): void {
+  // Set cleanedUp flag first to prevent any in-flight callbacks from acting
+  state.cleanedUp = true;
+  if (state.heartbeatTimer) {
+    clearInterval(state.heartbeatTimer);
+    state.heartbeatTimer = null;
+  }
+  if (state.pongTimeoutTimer) {
+    clearTimeout(state.pongTimeoutTimer);
+    state.pongTimeoutTimer = null;
+  }
+  state.waitingForPong = false;
+}
+
 // ============================================================================
 // SERVER
 // ============================================================================
@@ -60,6 +225,9 @@ export class PiServer {
 
     // Setup stdio transport
     this.stdinInterface = this.setupStdio();
+
+    // ADR-0007: Start periodic session metadata cleanup (every hour)
+    this.sessionManager.startSessionCleanup(3600000);
 
     // Broadcast server_ready
     const readyEvent: RpcBroadcast = {
@@ -111,6 +279,9 @@ export class PiServer {
     }
 
     console.error("[shutdown] Initiating graceful shutdown...");
+
+    // ADR-0007: Stop periodic cleanup
+    this.sessionManager.stopSessionCleanup();
 
     // Stop accepting new WebSocket connections
     if (this.wss) {
@@ -180,22 +351,24 @@ export class PiServer {
       // Register connection
       this.sessionManager.getGovernor().registerConnection();
 
+      // Initialize heartbeat state
+      const heartbeatState: WebSocketConnectionState = {
+        waitingForPong: false,
+        lastPongAt: Date.now(),
+        heartbeatTimer: null,
+        pongTimeoutTimer: null,
+        cleanedUp: false,
+      };
+
       const subscriber: Subscriber = {
         send: (data: string) => {
-          // Check state immediately before send; if closed, silently skip
-          // This is inherently racy but the race window is acceptable
-          if (ws.readyState === WebSocket.OPEN) {
-            try {
-              ws.send(data);
-            } catch {
-              // Send failed, subscriber will be cleaned up by close handler
-            }
-          }
+          // Use backpressure-aware send for broadcast messages (non-critical)
+          sendWithBackpressure(ws, data, { isCritical: false });
         },
         subscribedSessions: new Set(),
       };
 
-      // Send server_ready to new connection
+      // Send server_ready to new connection (critical - must be delivered)
       const readyEvent: RpcBroadcast = {
         type: "server_ready",
         data: {
@@ -204,11 +377,7 @@ export class PiServer {
           transports: ["websocket", "stdio"],
         },
       };
-      try {
-        ws.send(JSON.stringify(readyEvent));
-      } catch {
-        // Send failed, connection will be cleaned up
-      }
+      sendWithBackpressure(ws, JSON.stringify(readyEvent), { isCritical: true });
 
       this.sessionManager.addSubscriber(subscriber);
 
@@ -216,9 +385,23 @@ export class PiServer {
       const cleanupConnection = () => {
         if (cleanedUp) return;
         cleanedUp = true;
+        stopHeartbeat(heartbeatState);
         this.sessionManager.removeSubscriber(subscriber);
         this.sessionManager.getGovernor().unregisterConnection();
       };
+
+      // Start heartbeat monitoring
+      startHeartbeat(ws, heartbeatState);
+
+      // Handle pong responses
+      ws.on("pong", () => {
+        heartbeatState.waitingForPong = false;
+        heartbeatState.lastPongAt = Date.now();
+        if (heartbeatState.pongTimeoutTimer) {
+          clearTimeout(heartbeatState.pongTimeoutTimer);
+          heartbeatState.pongTimeoutTimer = null;
+        }
+      });
 
       ws.on("message", async (data: Buffer) => {
         // Check message size limit
@@ -230,24 +413,16 @@ export class PiServer {
             success: false,
             error: sizeResult.reason,
           };
-          try {
-            ws.send(JSON.stringify(errorResponse));
-          } catch {
-            // Error response send failed
-          }
+          // Error responses are critical - client needs to know why their message was rejected
+          sendWithBackpressure(ws, JSON.stringify(errorResponse), { isCritical: true });
           return;
         }
 
         try {
           const command: RpcCommand = JSON.parse(data.toString());
           await this.handleCommand(command, subscriber, (response: RpcResponse) => {
-            if (ws.readyState === WebSocket.OPEN) {
-              try {
-                ws.send(JSON.stringify(response));
-              } catch {
-                // Response send failed
-              }
-            }
+            // Command responses are critical - client is waiting for them
+            sendWithBackpressure(ws, JSON.stringify(response), { isCritical: true });
           });
         } catch (error) {
           const errorResponse: RpcResponse = {
@@ -256,11 +431,8 @@ export class PiServer {
             success: false,
             error: error instanceof Error ? error.message : "Invalid JSON",
           };
-          try {
-            ws.send(JSON.stringify(errorResponse));
-          } catch {
-            // Error response send failed
-          }
+          // Parse error responses are critical
+          sendWithBackpressure(ws, JSON.stringify(errorResponse), { isCritical: true });
         }
       });
 

@@ -34,7 +34,10 @@ export type ServerCommand =
   | { id?: string; type: "delete_session"; sessionId: string }
   | { id?: string; type: "switch_session"; sessionId: string }
   | { id?: string; type: "get_metrics" }
-  | { id?: string; type: "health_check" };
+  | { id?: string; type: "health_check" }
+  // ADR-0007: Session persistence
+  | { id?: string; type: "list_stored_sessions" }
+  | { id?: string; type: "load_session"; sessionId?: string; sessionPath: string };
 
 // ============================================================================
 // SESSION COMMANDS (pass through to AgentSession)
@@ -160,6 +163,7 @@ export type ServerResponse =
           rateLimit: number;
           globalRateLimit: number;
           connectionLimit: number;
+          extensionUIResponseRateLimit: number;
         };
         zombieSessionsDetected: number;
         zombieSessionsCleaned: number;
@@ -184,6 +188,16 @@ export type ServerResponse =
           execution: {
             laneCount: number;
           };
+          lock: {
+            activeLocks: number;
+            timeoutCount: number;
+            waitingCount: number;
+          };
+          extensionUI: {
+            pendingCount: number;
+            maxPendingRequests: number;
+            rejectedCount: number;
+          };
         };
       };
     })
@@ -191,7 +205,25 @@ export type ServerResponse =
       command: "health_check";
       success: true;
       data: { healthy: boolean; issues: string[] };
+    })
+  // ADR-0007: Session persistence
+  | (RpcResponseBase & {
+      command: "list_stored_sessions";
+      success: true;
+      data: { sessions: StoredSessionInfo[] };
+    })
+  | (RpcResponseBase & {
+      command: "load_session";
+      success: true;
+      data: { sessionId: string; sessionInfo: SessionInfo };
     });
+
+// ADR-0007: Stored session info (extends SessionInfo with persistence metadata)
+export interface StoredSessionInfo extends SessionInfo {
+  sessionFile: string;
+  cwd: string;
+  fileExists: boolean;
+}
 
 // Session command responses (mirrors RpcCommand types)
 export type SessionResponse =

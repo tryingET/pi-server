@@ -98,6 +98,7 @@ if (!this.governor.canExecuteCommand(sessionId)) {
 | `command-replay-store.ts` | Idempotency, duplicate detection, outcome history | Execution logic |
 | `session-version-store.ts` | Monotonic version counters per session | Replay semantics |
 | `command-execution-engine.ts` | Lane serialization, dependency waits, timeouts | Storage |
+| `session-lock-manager.ts` | Per-session-ID mutual exclusion for create/delete | Long-running locks |
 | `extension-ui.ts` | Pending UI request tracking | Command handling, transport |
 | `types.ts` | Protocol definitions | Implementation |
 | `validation.ts` | Command validation, reserved ID enforcement | Execution logic |
@@ -144,6 +145,219 @@ session.setModel((session.modelRegistry as any).getModel(provider, modelId));
 ### bindExtensions Required for Extension UI
 
 Without calling `session.bindExtensions({ uiContext: ... })`, extensions that need user input will hang forever.
+
+---
+
+## ADR-0002: Session ID Locking
+
+**Status:** Accepted (2026-02-22)
+
+### The Problem
+
+Concurrent `createSession("same-id")` calls could both pass the duplicate check, reserve slots, then race to insert. The first wins, the second throws "already exists" - but BOTH slots are consumed. This is a permanent slot leak until server restart.
+
+### The Solution
+
+`SessionLockManager` provides per-session-ID mutual exclusion:
+
+```typescript
+const lock = await lockManager.acquire(sessionId, "createSession");
+try {
+  // Critical section - only one caller per sessionId
+  if (this.sessions.has(sessionId)) {
+    throw new Error(`Session ${sessionId} already exists`);
+  }
+  // ... create session ...
+} finally {
+  lock.release();
+}
+```
+
+### Key Properties
+
+1. **Lock is per-session-ID** - Different sessions can be created concurrently
+2. **5 second timeout** - Prevents indefinite waiting on deadlocks
+3. **30 second hold warning** - Logs if lock held too long
+4. **Lock manager stats** - Exposed via `get_metrics.stores.lock`
+
+---
+
+## ADR-0003: WebSocket Backpressure
+
+**Status:** Accepted (2026-02-22)
+
+### The Problem
+
+`ws.send()` buffers in memory when client is slow. A malicious or slow client can cause OOM on the server.
+
+### The Solution
+
+`sendWithBackpressure()` helper checks `ws.bufferedAmount` before sending:
+
+- **< 64KB**: Send normally
+- **64KB - 1MB**: Drop non-critical messages (events, broadcasts)
+- **> 1MB**: Close connection to prevent OOM
+
+```typescript
+// Critical messages (responses, errors) - attempt send even under mild backpressure
+sendWithBackpressure(ws, JSON.stringify(response), { isCritical: true });
+
+// Non-critical messages (events, broadcasts) - dropped under backpressure
+sendWithBackpressure(ws, data, { isCritical: false });
+```
+
+### Key Properties
+
+1. **Command responses are critical** - Clients are waiting for them
+2. **Events are non-critical** - Dropped under pressure, client catches up
+3. **Connection closed at 1MB** - Prevents OOM, client must reconnect
+
+---
+
+## ADR-0004: Bounded Pending UI Requests
+
+**Status:** Accepted (2026-02-22)
+
+### The Problem
+
+`ExtensionUIManager.pendingRequests` is unbounded. A misbehaving extension creating infinite UI requests can fill memory.
+
+### The Solution
+
+`createPendingRequest()` returns `null` when limit (default: 1000) is reached:
+
+```typescript
+const request = extensionUI.createPendingRequest(sessionId, "select", { ... });
+if (!request) {
+  // Limit reached - return default value
+  return undefined;
+}
+```
+
+### Key Properties
+
+1. **Default limit: 1000** - Configurable via constructor
+2. **Graceful degradation** - UI requests return default values
+3. **Stats exposed** - `get_metrics.stores.extensionUI.{pendingCount, rejectedCount}`
+
+---
+
+## ADR-0005: WebSocket Heartbeat
+
+**Status:** Accepted (2026-02-22)
+
+### The Problem
+
+Silent network disconnects leave zombie WebSocket connections. The server believes the connection is open, but messages are never received by the client.
+
+### The Solution
+
+Periodic ping/pong heartbeat with timeout:
+
+- **30 second interval** - Server sends ping every 30 seconds
+- **10 second timeout** - If no pong within 10 seconds, close connection
+- **Pong handler** - Resets timeout timer on pong receipt
+
+```typescript
+// Heartbeat state per connection
+const heartbeatState = {
+  waitingForPong: false,
+  lastPongAt: Date.now(),
+  heartbeatTimer: null,
+  pongTimeoutTimer: null,
+};
+
+// Start heartbeat on connection
+startHeartbeat(ws, heartbeatState);
+
+// Handle pong
+ws.on("pong", () => {
+  heartbeatState.waitingForPong = false;
+  heartbeatState.lastPongAt = Date.now();
+});
+```
+
+### Key Properties
+
+1. **Detects silent disconnects** - Dead connections cleaned up within 40 seconds
+2. **No client changes required** - WebSocket ping/pong is automatic in browsers
+3. **Low overhead** - 2 bytes per ping, minimal bandwidth
+
+---
+
+## ADR-0006: RequestId Validation
+
+**Status:** Accepted (2026-02-22)
+
+### The Problem
+
+`requestId` in `extension_ui_response` was not validated, allowing injection attacks or malformed data.
+
+### The Solution
+
+Validate requestId length and character set:
+
+- **Max length: 256 characters** - Prevents memory exhaustion
+- **Allowed characters: `[a-zA-Z0-9:_-]+`** - Alphanumeric, colon, underscore, dash
+- **Matches server format** - Server generates `sessionId:timestamp:random`
+
+```typescript
+const REQUEST_ID_PATTERN = /^[a-zA-Z0-9:_-]+$/;
+const MAX_REQUEST_ID_LENGTH = 256;
+
+if (requestId.length > MAX_REQUEST_ID_LENGTH) {
+  return { success: false, error: "requestId too long" };
+}
+if (!REQUEST_ID_PATTERN.test(requestId)) {
+  return { success: false, error: "requestId contains invalid characters" };
+}
+```
+
+### Key Properties
+
+1. **Prevents injection** - Special characters like `'`, `"`, `;`, `<`, `>` rejected
+2. **Matches server format** - Server-generated IDs always pass validation
+3. **Clear error messages** - Client knows exactly what's wrong
+
+---
+
+## ADR-0008: Synthetic ID Semantics
+
+**Status:** Accepted (2026-02-22)
+
+### The Problem
+
+When clients omit command IDs, the server generates synthetic IDs (`anon:timestamp:seq`). These were being stored in the outcome cache, leading to unbounded memory growth for high-traffic scenarios where clients don't need replay semantics.
+
+### The Solution
+
+Only store outcomes for **explicit client-provided IDs**. Synthetic IDs are ephemeral and never stored:
+
+```typescript
+const isExplicitId = id && !id.startsWith(SYNTHETIC_ID_PREFIX);
+if (isExplicitId) {
+  this.replayStore.storeCommandOutcome({...});
+}
+```
+
+### Key Properties
+
+1. **Explicit IDs enable replay** - Clients must provide IDs for replay semantics
+2. **Synthetic IDs are ephemeral** - Generated for tracking only, not stored
+3. **Bounded memory** - Outcome storage limited to explicit IDs (max 2000 by default)
+4. **Clear semantics** - Only explicit IDs can be used in `dependsOn` chains
+
+### Protocol Implication
+
+Clients that want replay/deduplication MUST provide explicit `id` fields:
+
+```typescript
+// Will be stored and replayable
+{ "id": "my-command-1", "type": "prompt", "sessionId": "s1", "message": "hello" }
+
+// Will NOT be stored - ephemeral
+{ "type": "prompt", "sessionId": "s1", "message": "hello" }
+```
 
 ---
 
@@ -337,6 +551,33 @@ cat /tmp/test.jsonl | timeout 5 node dist/server.js | jq .
 | ~~Lane tail memory leak~~ | command-execution-engine.ts | **FIXED** - correct promise comparison |
 | ~~No reserved ID validation~~ | validation.ts | **FIXED** - `anon:` prefix rejected |
 | ~~No store metrics~~ | All stores | **FIXED** - `getStats()` added + wired to `get_metrics` |
+| ~~Session slot leak on race~~ | session-manager.ts | **FIXED** - SessionLockManager (ADR-0002) |
+| ~~No WebSocket backpressure~~ | server.ts | **FIXED** - sendWithBackpressure (ADR-0003) |
+| ~~Unbounded pending UI requests~~ | extension-ui.ts | **FIXED** - bounded with rejection (ADR-0004) |
+| ~~No WebSocket heartbeat~~ | server.ts | **FIXED** - ping/pong with timeout (ADR-0005) |
+| ~~No requestId validation~~ | validation.ts | **FIXED** - length and character validation (ADR-0006) |
+| ~~No path validation for load_session~~ | validation.ts | **FIXED** - traversal detection (deep-review) |
+| ~~Synthetic IDs stored in outcomes~~ | session-manager.ts | **FIXED** - only explicit IDs stored (ADR-0008) |
+| ~~Pong timeout race condition~~ | server.ts | **FIXED** - `cleanedUp` flag prevents use-after-free |
+| ~~SessionStore temp file collision~~ | session-store.ts | **FIXED** - PID + UUID suffix for temp files |
+| ~~ReadStream leak on parse error~~ | session-store.ts | **FIXED** - try/finally ensures stream destruction |
+| ~~No max session lifetime~~ | resource-governor.ts | **FIXED** - `maxSessionLifetimeMs` config added (default: 24h) |
+
+---
+
+## Deferred Items (Explicit Contracts)
+
+| Finding | Rationale | Owner | Trigger | Deadline | Blast Radius |
+|---------|-----------|-------|---------|----------|--------------|
+| Connection authentication | Requires API design decision (token-based? mTLS?) + client changes | @tryingET | When multi-user deployment needed | When feature requested | Any client can connect |
+| Metrics export (Prometheus) | Requires format decision + endpoint design | @tryingET | When ops team needs monitoring | When deployed to production | No observability |
+| Circuit breaker for LLM | Requires per-provider tuning + fallback design | @tryingET | When latency spikes cause cascades | After production incident | Slow LLM blocks all sessions |
+| Structured logging | Requires logger selection (pino? winston?) + format standard | @tryingET | When log aggregation needed | When deployed at scale | Logs not aggregatable |
+| Refactor session-manager.ts | God object (700+ lines) - high risk of breaking changes | @tryingET | When adding major new feature | Before v2.0.0 | Technical debt compounds |
+| BoundedMap utility | Multiple maps need same cleanup pattern | @tryingET | When third map with same pattern added | Low priority | Code duplication |
+| Type guards to separate file | Minor smell, low impact | @tryingET | When types.ts exceeds 500 lines | Low priority | File organization |
+| Dependency cycle detection | Cross-lane cycles could deadlock but extremely unlikely (requires explicit IDs + simultaneous in-flight + mutual reference) | @tryingET | If deadlock observed in production | Low priority | Theoretical deadlock |
+| Stdio backpressure | stdout.write can block but rare in practice | @tryingET | If server freezes on output | Low priority | Server freeze on fast events |
 
 ---
 
@@ -351,6 +592,8 @@ All stores have bounded memory:
 | `idempotencyCache` | TTL-based | `idempotencyTtlMs` (10 min) |
 | `laneTails` | Auto-cleanup | Tasks delete on completion |
 | `dependsOn` array | 32 entries | `MAX_DEPENDENCIES` in validation.ts |
+| `pendingUIRequests` | 1,000 entries | `maxPendingRequests` in ExtensionUIManager |
+| `sessionLocks` | Auto-cleanup | Released on operation completion |
 
 ### Validation Order (Critical)
 
@@ -511,3 +754,90 @@ git clean -fd
 # Selective rollback
 git checkout HEAD -- src/specific-file.ts
 ```
+
+---
+
+## Bug Fix Patterns (Deep Review 2026-02-22)
+
+### Pattern: `cleanedUp` Flag for Async Callback Safety
+
+**Problem:** Async callbacks (timers, event handlers) can fire after cleanup, causing use-after-free.
+
+**Solution:** Add a `cleanedUp` boolean to state objects, check it at the start of every callback.
+
+```typescript
+// WRONG: Callback fires after cleanup
+state.pongTimeoutTimer = setTimeout(() => {
+  if (state.waitingForPong) { /* can reference freed state */ }
+}, timeout);
+
+// RIGHT: Check cleanup flag first
+state.pongTimeoutTimer = setTimeout(() => {
+  if (state.cleanedUp) return; // Guard against use-after-free
+  if (state.waitingForPong) { /* safe */ }
+}, timeout);
+```
+
+**Applied to:** WebSocket heartbeat (server.ts)
+
+### Pattern: Unique Temp File Names
+
+**Problem:** Constant temp file path causes collision with concurrent writes.
+
+**Solution:** Include PID and random suffix in temp file name.
+
+```typescript
+// WRONG: Constant temp path
+const tempPath = `${metadataPath}.tmp`;
+
+// RIGHT: Unique per-write
+const tempPath = `${metadataPath}.${process.pid}.${crypto.randomUUID().slice(0, 8)}.tmp`;
+```
+
+**Applied to:** SessionStore.saveMetadata (session-store.ts)
+
+### Pattern: try/finally for Resource Cleanup
+
+**Problem:** Early return or exception skips resource cleanup.
+
+**Solution:** Always use try/finally for cleanup, not just try/catch.
+
+```typescript
+// WRONG: Stream not destroyed on JSON.parse error
+try {
+  const meta = JSON.parse(firstLine);
+  fileStream.destroy();
+  return meta;
+} catch {
+  return defaultValue; // Stream leaked!
+}
+
+// RIGHT: finally always runs
+try {
+  const meta = JSON.parse(firstLine);
+  return meta;
+} catch {
+  return defaultValue;
+} finally {
+  fileStream.destroy(); // Always runs
+}
+```
+
+**Applied to:** readSessionFileMetadata (session-store.ts)
+
+### Pattern: wouldExceedLimit() for Pre-Check
+
+**Problem:** Returning `null` for limit reached is indistinguishable from other failures.
+
+**Solution:** Add a pre-check method so callers can distinguish limit from other error modes.
+
+```typescript
+// Extension can now check before creating request
+if (extensionUI.wouldExceedLimit()) {
+  // Known: limit reached, can log appropriately
+  return undefined;
+}
+const request = extensionUI.createPendingRequest(...);
+```
+
+**Applied to:** ExtensionUIManager (extension-ui.ts)

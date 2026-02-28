@@ -37,21 +37,24 @@ export function createServerUIContext(
       options: string[],
       opts?: { signal?: AbortSignal; timeout?: number }
     ): Promise<string | undefined> {
-      const { requestId, promise } = extensionUI.createPendingRequest(sessionId, "select", {
+      const request = extensionUI.createPendingRequest(sessionId, "select", {
         title,
         options,
         timeout: opts?.timeout,
       });
 
-      extensionUI.broadcastUIRequest(sessionId, requestId, "select", {
+      // If limit reached, return undefined (no selection possible)
+      if (!request) return undefined;
+
+      extensionUI.broadcastUIRequest(sessionId, request.requestId, "select", {
         title,
         options,
         timeout: opts?.timeout,
       });
 
       try {
-        const response = await raceWithAbortAndSignal(promise, opts?.signal, () =>
-          extensionUI.cancelRequest(requestId)
+        const response = await raceWithAbortAndSignal(request.promise, opts?.signal, () =>
+          extensionUI.cancelRequest(request.requestId)
         );
         if (response.method === "cancelled") return undefined;
         if (isSelectResponse(response)) return response.value;
@@ -67,21 +70,24 @@ export function createServerUIContext(
       message: string,
       opts?: { signal?: AbortSignal; timeout?: number }
     ): Promise<boolean> {
-      const { requestId, promise } = extensionUI.createPendingRequest(sessionId, "confirm", {
+      const request = extensionUI.createPendingRequest(sessionId, "confirm", {
         title,
         message,
         timeout: opts?.timeout,
       });
 
-      extensionUI.broadcastUIRequest(sessionId, requestId, "confirm", {
+      // If limit reached, return false (not confirmed)
+      if (!request) return false;
+
+      extensionUI.broadcastUIRequest(sessionId, request.requestId, "confirm", {
         title,
         message,
         timeout: opts?.timeout,
       });
 
       try {
-        const response = await raceWithAbortAndSignal(promise, opts?.signal, () =>
-          extensionUI.cancelRequest(requestId)
+        const response = await raceWithAbortAndSignal(request.promise, opts?.signal, () =>
+          extensionUI.cancelRequest(request.requestId)
         );
         if (response.method === "cancelled") return false;
         if (isConfirmResponse(response)) return response.confirmed;
@@ -97,21 +103,24 @@ export function createServerUIContext(
       placeholder?: string,
       opts?: { signal?: AbortSignal; timeout?: number }
     ): Promise<string | undefined> {
-      const { requestId, promise } = extensionUI.createPendingRequest(sessionId, "input", {
+      const request = extensionUI.createPendingRequest(sessionId, "input", {
         title,
         placeholder,
         timeout: opts?.timeout,
       });
 
-      extensionUI.broadcastUIRequest(sessionId, requestId, "input", {
+      // If limit reached, return undefined (no input possible)
+      if (!request) return undefined;
+
+      extensionUI.broadcastUIRequest(sessionId, request.requestId, "input", {
         title,
         placeholder,
         timeout: opts?.timeout,
       });
 
       try {
-        const response = await raceWithAbortAndSignal(promise, opts?.signal, () =>
-          extensionUI.cancelRequest(requestId)
+        const response = await raceWithAbortAndSignal(request.promise, opts?.signal, () =>
+          extensionUI.cancelRequest(request.requestId)
         );
         if (response.method === "cancelled") return undefined;
         if (isInputResponse(response)) return response.value;
@@ -123,21 +132,24 @@ export function createServerUIContext(
     },
 
     async editor(title: string, prefill?: string): Promise<string | undefined> {
-      const { requestId, promise } = extensionUI.createPendingRequest(sessionId, "editor", {
+      const request = extensionUI.createPendingRequest(sessionId, "editor", {
         title,
         prefill,
       });
 
-      extensionUI.broadcastUIRequest(sessionId, requestId, "editor", {
+      // If limit reached, return undefined (no editor input possible)
+      if (!request) return undefined;
+
+      extensionUI.broadcastUIRequest(sessionId, request.requestId, "editor", {
         title,
         prefill,
       });
 
       try {
         const response = await raceWithAbortAndSignal(
-          promise,
+          request.promise,
           undefined, // editor doesn't typically use abort signal
-          () => extensionUI.cancelRequest(requestId)
+          () => extensionUI.cancelRequest(request.requestId)
         );
         if (response.method === "cancelled") return undefined;
         if (isEditorResponse(response)) return response.value;

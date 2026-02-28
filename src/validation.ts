@@ -19,7 +19,17 @@ const MAX_BASH_COMMAND_LENGTH = 20_000;
 const MAX_SESSION_NAME_LENGTH = 256;
 const MAX_COMMAND_ID_LENGTH = 256;
 const MAX_IDEMPOTENCY_KEY_LENGTH = 256;
+const MAX_REQUEST_ID_LENGTH = 256;
 const MAX_DEPENDENCIES = 32;
+
+/** Valid characters for requestId (alphanumeric, colon, dash, underscore). */
+const REQUEST_ID_PATTERN = /^[a-zA-Z0-9:_-]+$/;
+
+/** Dangerous path patterns that could allow traversal or injection. */
+const DANGEROUS_PATH_PATTERNS = [/\.\./, /^~/, /\0/];
+
+/** Maximum path length to prevent abuse. */
+const MAX_PATH_LENGTH = 4096;
 
 function hasControlCharacters(value: string): boolean {
   for (let i = 0; i < value.length; i++) {
@@ -27,6 +37,22 @@ function hasControlCharacters(value: string): boolean {
     if (code <= 31 || code === 127) return true;
   }
   return false;
+}
+
+/**
+ * Check if a path contains dangerous components.
+ * Returns error message if dangerous, null if safe.
+ */
+function validatePath(path: string, fieldName: string): string | null {
+  if (path.length > MAX_PATH_LENGTH) {
+    return `${fieldName} too long (max ${MAX_PATH_LENGTH} chars)`;
+  }
+  for (const pattern of DANGEROUS_PATH_PATTERNS) {
+    if (pattern.test(path)) {
+      return `${fieldName} contains potentially dangerous path components`;
+    }
+  }
+  return null;
 }
 
 /**
@@ -90,6 +116,9 @@ const SERVER_COMMANDS = new Set([
   "switch_session",
   "get_metrics",
   "health_check",
+  // ADR-0007: Session persistence
+  "list_stored_sessions",
+  "load_session",
 ]);
 
 const ALL_COMMANDS = new Set([...SESSION_COMMANDS, ...SERVER_COMMANDS]);
@@ -289,6 +318,19 @@ function validateCommandByType(type: string, cmd: Record<string, unknown>): Vali
     case "extension_ui_response":
       if (!cmd.requestId || typeof cmd.requestId !== "string") {
         errors.push({ field: "requestId", message: "Required string" });
+      } else {
+        if (cmd.requestId.length > MAX_REQUEST_ID_LENGTH) {
+          errors.push({
+            field: "requestId",
+            message: `Too long (max ${MAX_REQUEST_ID_LENGTH} chars)`,
+          });
+        }
+        if (!REQUEST_ID_PATTERN.test(cmd.requestId)) {
+          errors.push({
+            field: "requestId",
+            message: "Must contain only alphanumeric characters, colons, underscores, and dashes",
+          });
+        }
       }
       if (!cmd.response || typeof cmd.response !== "object") {
         errors.push({ field: "response", message: "Required object" });
@@ -315,6 +357,11 @@ function validateCommandByType(type: string, cmd: Record<string, unknown>): Vali
     case "switch_session_file":
       if (!cmd.sessionPath || typeof cmd.sessionPath !== "string") {
         errors.push({ field: "sessionPath", message: "Required string" });
+      } else {
+        const pathError = validatePath(cmd.sessionPath, "sessionPath");
+        if (pathError) {
+          errors.push({ field: "sessionPath", message: pathError });
+        }
       }
       break;
 
@@ -344,6 +391,24 @@ function validateCommandByType(type: string, cmd: Record<string, unknown>): Vali
     case "cycle_model":
       if ("direction" in cmd && !["forward", "backward"].includes(cmd.direction as string)) {
         errors.push({ field: "direction", message: "Must be 'forward' or 'backward'" });
+      }
+      break;
+
+    // ADR-0007: Session persistence
+    case "load_session":
+      if (!cmd.sessionPath || typeof cmd.sessionPath !== "string") {
+        errors.push({ field: "sessionPath", message: "Required string" });
+      } else {
+        const pathError = validatePath(cmd.sessionPath, "sessionPath");
+        if (pathError) {
+          errors.push({ field: "sessionPath", message: pathError });
+        }
+      }
+      if (
+        "sessionId" in cmd &&
+        (typeof cmd.sessionId !== "string" || cmd.sessionId.trim().length === 0)
+      ) {
+        errors.push({ field: "sessionId", message: "Must be a non-empty string if provided" });
       }
       break;
   }

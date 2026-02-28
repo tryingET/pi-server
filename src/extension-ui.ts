@@ -82,30 +82,69 @@ export interface ExtensionUIResponseCommand {
 // EXTENSION UI MANAGER
 // =============================================================================
 
+/** Default maximum pending UI requests per manager. */
+const DEFAULT_MAX_PENDING_REQUESTS = 1000;
+
+/**
+ * Statistics about the extension UI manager.
+ */
+export interface ExtensionUIManagerStats {
+  /** Current number of pending requests. */
+  pendingCount: number;
+  /** Maximum pending requests allowed. */
+  maxPendingRequests: number;
+  /** Total requests rejected due to limit. */
+  rejectedCount: number;
+}
+
 export class ExtensionUIManager {
   private pendingRequests = new Map<string, PendingUIRequest>();
   private defaultTimeoutMs: number;
+  private maxPendingRequests: number;
+  private rejectedCount = 0;
   // Broadcast function - will be wired up in Phase 3
   private broadcast: (sessionId: string, event: any) => void;
 
   constructor(
     broadcast: (sessionId: string, event: any) => void,
-    defaultTimeoutMs: number = 60000
+    defaultTimeoutMs: number = 60000,
+    maxPendingRequests: number = DEFAULT_MAX_PENDING_REQUESTS
   ) {
     this.broadcast = broadcast;
     this.defaultTimeoutMs = defaultTimeoutMs;
+    this.maxPendingRequests = maxPendingRequests;
+  }
+
+  /**
+   * Check if a new pending request would exceed the limit.
+   * Use this to check before calling createPendingRequest if you need to
+   * distinguish limit reached from other failure modes.
+   */
+  wouldExceedLimit(): boolean {
+    return this.pendingRequests.size >= this.maxPendingRequests;
   }
 
   /**
    * Handle a UI request from an extension.
    * This is called by our ExtensionUIContext implementation.
    * Returns the requestId and a promise that resolves when client responds.
+   *
+   * Returns null if the pending request limit has been reached.
    */
   createPendingRequest(
     sessionId: string,
     method: ExtensionUIMethod,
     requestData: Record<string, any>
-  ): { requestId: string; promise: Promise<ExtensionUIResponseValue> } {
+  ): { requestId: string; promise: Promise<ExtensionUIResponseValue> } | null {
+    // Check pending request limit to prevent memory exhaustion
+    if (this.pendingRequests.size >= this.maxPendingRequests) {
+      this.rejectedCount++;
+      console.error(
+        `[ExtensionUIManager] Pending request limit reached (${this.maxPendingRequests}), rejecting request for session ${sessionId}`
+      );
+      return null;
+    }
+
     const requestId = this.generateRequestId(sessionId);
     const timeoutMs =
       typeof requestData.timeout === "number" &&
@@ -226,6 +265,24 @@ export class ExtensionUIManager {
    */
   getPendingCount(): number {
     return this.pendingRequests.size;
+  }
+
+  /**
+   * Get full statistics about the manager (for monitoring).
+   */
+  getStats(): ExtensionUIManagerStats {
+    return {
+      pendingCount: this.pendingRequests.size,
+      maxPendingRequests: this.maxPendingRequests,
+      rejectedCount: this.rejectedCount,
+    };
+  }
+
+  /**
+   * Reset rejected count (for testing).
+   */
+  resetStats(): void {
+    this.rejectedCount = 0;
   }
 
   // ===========================================================================

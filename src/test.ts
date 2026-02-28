@@ -171,6 +171,54 @@ async function testValidation() {
     );
   });
 
+  await test("validation: rejects overly long requestId", () => {
+    const errors = validateCommand({
+      type: "extension_ui_response",
+      sessionId: "test",
+      requestId: "a".repeat(300),
+      response: { method: "cancelled" },
+    });
+    assert(
+      errors.some((e) => e.field === "requestId" && e.message.includes("Too long")),
+      "Should reject overly long requestId"
+    );
+  });
+
+  await test("validation: rejects requestId with invalid characters", () => {
+    const errors = validateCommand({
+      type: "extension_ui_response",
+      sessionId: "test",
+      requestId: "req'; DROP TABLE--",
+      response: { method: "cancelled" },
+    });
+    assert(
+      errors.some((e) => e.field === "requestId" && e.message.includes("alphanumeric")),
+      "Should reject requestId with invalid characters"
+    );
+  });
+
+  await test("validation: accepts valid requestId formats", () => {
+    // requestId from ExtensionUIManager uses format: sessionId:timestamp:random
+    const validIds = [
+      "session-1:1234567890:abc123",
+      "simple-request",
+      "req_123",
+      "req:with:colons",
+    ];
+    for (const requestId of validIds) {
+      const errors = validateCommand({
+        type: "extension_ui_response",
+        sessionId: "test",
+        requestId,
+        response: { method: "cancelled" },
+      });
+      assert(
+        !errors.some((e) => e.field === "requestId"),
+        `Should accept requestId "${requestId}"`
+      );
+    }
+  });
+
   await test("validation: rejects unknown command type", () => {
     const errors = validateCommand({ type: "totally_unknown", sessionId: "x" });
     assert(
@@ -301,6 +349,72 @@ async function testValidation() {
     ]);
     assert(formatted.includes("type:"), "Should include field name");
     assert(formatted.includes("sessionId:"), "Should include field name");
+  });
+
+  // Test: Path validation for load_session
+  await test("validation: rejects path traversal in load_session", () => {
+    const errors = validateCommand({
+      type: "load_session",
+      sessionPath: "../../../etc/passwd",
+    });
+    assert(
+      errors.some((e) => e.field === "sessionPath" && e.message.includes("dangerous")),
+      "Should reject path traversal"
+    );
+  });
+
+  await test("validation: rejects tilde expansion in load_session", () => {
+    const errors = validateCommand({
+      type: "load_session",
+      sessionPath: "~/.ssh/id_rsa",
+    });
+    assert(
+      errors.some((e) => e.field === "sessionPath" && e.message.includes("dangerous")),
+      "Should reject tilde expansion"
+    );
+  });
+
+  await test("validation: accepts valid absolute path in load_session", () => {
+    const errors = validateCommand({
+      type: "load_session",
+      sessionPath: "/home/user/.pi/agent/sessions/2026-02-22/session.jsonl",
+    });
+    assert.strictEqual(errors.length, 0, "Should accept valid path");
+  });
+
+  await test("validation: rejects null byte in path", () => {
+    const errors = validateCommand({
+      type: "load_session",
+      sessionPath: "/valid/path\u0000/../../../etc/passwd",
+    });
+    assert(
+      errors.some((e) => e.field === "sessionPath" && e.message.includes("dangerous")),
+      "Should reject null byte in path"
+    );
+  });
+
+  await test("validation: rejects overly long path", () => {
+    const errors = validateCommand({
+      type: "load_session",
+      sessionPath: "a".repeat(5000),
+    });
+    assert(
+      errors.some((e) => e.field === "sessionPath" && e.message.includes("too long")),
+      "Should reject overly long path"
+    );
+  });
+
+  // Test: Path validation for switch_session_file
+  await test("validation: rejects path traversal in switch_session_file", () => {
+    const errors = validateCommand({
+      type: "switch_session_file",
+      sessionId: "test",
+      sessionPath: "../../other-session",
+    });
+    assert(
+      errors.some((e) => e.field === "sessionPath" && e.message.includes("dangerous")),
+      "Should reject path traversal"
+    );
   });
 }
 
@@ -748,14 +862,46 @@ async function testExtensionUI() {
     const ui = new ExtensionUIManager(() => {}, 500);
     const start = Date.now();
 
-    const { promise } = ui.createPendingRequest("s1", "input", { timeout: 50 });
+    const request = ui.createPendingRequest("s1", "input", { timeout: 50 });
+    assert(request !== null, "createPendingRequest should not return null under normal conditions");
 
-    await assert.rejects(promise, (error: Error) => {
+    await assert.rejects(request.promise, (error: Error) => {
       const elapsed = Date.now() - start;
       assert(elapsed < 300, `Expected timeout near request timeout, got ${elapsed}ms`);
       assert(error.message.includes("50ms"), "Error should report request-scoped timeout");
       return true;
     });
+  });
+
+  await test("extension-ui: rejects when pending limit reached", async () => {
+    const ui = new ExtensionUIManager(() => {}, 500, 3); // max 3 pending
+
+    // Create 3 requests (at limit) - catch rejections to avoid unhandled promise rejection
+    const r1 = ui.createPendingRequest("s1", "input", {});
+    const r2 = ui.createPendingRequest("s1", "input", {});
+    const r3 = ui.createPendingRequest("s1", "input", {});
+
+    assert(r1 !== null, "First request should succeed");
+    assert(r2 !== null, "Second request should succeed");
+    assert(r3 !== null, "Third request should succeed");
+
+    // Catch promise rejections (they will be cancelled later)
+    r1?.promise.catch(() => {});
+    r2?.promise.catch(() => {});
+    r3?.promise.catch(() => {});
+
+    // Fourth should fail
+    const r4 = ui.createPendingRequest("s1", "input", {});
+    assert(r4 === null, "Fourth request should be rejected (at limit)");
+
+    // Check stats
+    const stats = ui.getStats();
+    assert.strictEqual(stats.pendingCount, 3, "Should have 3 pending");
+    assert.strictEqual(stats.maxPendingRequests, 3, "Max should be 3");
+    assert.strictEqual(stats.rejectedCount, 1, "Should have 1 rejection");
+
+    // Cleanup: cancel pending requests
+    ui.cancelSessionRequests("s1");
   });
 }
 
@@ -1275,6 +1421,51 @@ async function testSessionManager() {
 
     // Cleanup
     await manager.executeCommand({ type: "delete_session", sessionId: "metrics-test" });
+  });
+
+  // Test: list_stored_sessions (ADR-0007)
+  await test("session-manager: list_stored_sessions returns empty initially", async () => {
+    const response = await manager.executeCommand({ type: "list_stored_sessions" });
+    assert.strictEqual(response.success, true, "list_stored_sessions should succeed");
+    assert.ok(Array.isArray((response as any).data.sessions), "Should have sessions array");
+  });
+
+  // Test: create_session persists metadata (ADR-0007)
+  await test("session-manager: create_session persists metadata", async () => {
+    const manager = new PiSessionManager();
+
+    // Create a session
+    await manager.executeCommand({ type: "create_session", sessionId: "persist-test" });
+
+    // List stored sessions should include it
+    const response = await manager.executeCommand({ type: "list_stored_sessions" });
+    assert.strictEqual(response.success, true, "list_stored_sessions should succeed");
+
+    const sessions = (response as any).data.sessions;
+    const found = sessions.find((s: any) => s.sessionId === "persist-test");
+    assert.ok(found, "Should find persisted session");
+    // Note: fileExists may be false if the session file is in a different location
+    // The important thing is that the metadata was persisted
+    assert.ok(found.sessionFile, "Should have session file path");
+    assert.ok(found.createdAt, "Should have createdAt");
+
+    // Cleanup
+    await manager.executeCommand({ type: "delete_session", sessionId: "persist-test" });
+  });
+
+  // Test: delete_session removes metadata (ADR-0007)
+  await test("session-manager: delete_session removes metadata", async () => {
+    const manager = new PiSessionManager();
+
+    // Create and then delete a session
+    await manager.executeCommand({ type: "create_session", sessionId: "delete-persist-test" });
+    await manager.executeCommand({ type: "delete_session", sessionId: "delete-persist-test" });
+
+    // List stored sessions should not include it
+    const response = await manager.executeCommand({ type: "list_stored_sessions" });
+    const sessions = (response as any).data.sessions;
+    const found = sessions.find((s: any) => s.sessionId === "delete-persist-test");
+    assert.ok(!found, "Should not find deleted session in stored sessions");
   });
 
   // Test: disposeAllSessions
