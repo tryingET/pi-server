@@ -23,6 +23,8 @@ export interface PendingUIRequest {
   reject: (error: Error) => void;
   timeout: NodeJS.Timeout;
   createdAt: Date;
+  /** Guard flag to prevent double-resolve on race between timeout and cancel */
+  settled: boolean;
 }
 
 export type ExtensionUIMethod =
@@ -155,6 +157,9 @@ export class ExtensionUIManager {
 
     const promise = new Promise<ExtensionUIResponseValue>((resolve, reject) => {
       const timeout = setTimeout(() => {
+        const pending = this.pendingRequests.get(requestId);
+        if (!pending || pending.settled) return; // Guard against race
+        pending.settled = true;
         this.pendingRequests.delete(requestId);
         reject(new Error(`Extension UI request ${requestId} timed out after ${timeoutMs}ms`));
       }, timeoutMs);
@@ -167,6 +172,7 @@ export class ExtensionUIManager {
         reject,
         timeout,
         createdAt: new Date(),
+        settled: false,
       });
     });
 
@@ -204,6 +210,14 @@ export class ExtensionUIManager {
       };
     }
 
+    // Guard against race with timeout/cancel
+    if (pending.settled) {
+      return {
+        success: false,
+        error: `Request ${command.requestId} already settled`,
+      };
+    }
+
     // Verify sessionId matches
     if (pending.sessionId !== command.sessionId) {
       return {
@@ -212,7 +226,8 @@ export class ExtensionUIManager {
       };
     }
 
-    // Clear timeout and remove from pending
+    // Mark as settled, clear timeout and remove from pending
+    pending.settled = true;
     clearTimeout(pending.timeout);
     this.pendingRequests.delete(command.requestId);
 
@@ -240,7 +255,8 @@ export class ExtensionUIManager {
    */
   cancelSessionRequests(sessionId: string): void {
     for (const [requestId, pending] of this.pendingRequests.entries()) {
-      if (pending.sessionId === sessionId) {
+      if (pending.sessionId === sessionId && !pending.settled) {
+        pending.settled = true;
         clearTimeout(pending.timeout);
         pending.reject(new Error(`Session ${sessionId} was deleted`));
         this.pendingRequests.delete(requestId);
@@ -253,7 +269,8 @@ export class ExtensionUIManager {
    */
   cancelRequest(requestId: string): void {
     const pending = this.pendingRequests.get(requestId);
-    if (pending) {
+    if (pending && !pending.settled) {
+      pending.settled = true;
       clearTimeout(pending.timeout);
       pending.reject(new Error(`Request ${requestId} was cancelled`));
       this.pendingRequests.delete(requestId);

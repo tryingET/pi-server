@@ -94,6 +94,8 @@ export class SessionStore {
   private lastLoadTime = 0;
   /** Cache TTL in ms (5 seconds) */
   private readonly cacheTtl = 5000;
+  /** Count of metadata resets due to oversized/corrupt files */
+  private metadataResetCount = 0;
 
   constructor(config: SessionStoreConfig = {}) {
     this.dataDir = config.dataDir ?? path.join(process.env.HOME ?? "~", ".pi", "agent", "server");
@@ -134,7 +136,19 @@ export class SessionStore {
 
       // Safety check: reject oversized files
       if (stat.size > MAX_METADATA_SIZE) {
-        console.error(`[SessionStore] Metadata file too large (${stat.size} bytes), resetting`);
+        this.metadataResetCount++;
+        // Backup the oversized file before resetting
+        const backupPath = `${this.metadataPath}.oversized.${Date.now()}.bak`;
+        try {
+          await fs.rename(this.metadataPath, backupPath);
+          console.error(
+            `[SessionStore] CRITICAL: Metadata file too large (${stat.size} bytes > ${MAX_METADATA_SIZE}), backed up to ${backupPath} and resetting`
+          );
+        } catch {
+          console.error(
+            `[SessionStore] CRITICAL: Metadata file too large (${stat.size} bytes), failed to backup: ${this.metadataPath}`
+          );
+        }
         this.metadataCache = new Map();
         this.lastLoadTime = now;
         return this.metadataCache;
@@ -562,12 +576,14 @@ export class SessionStore {
     sessionCount: number;
     dataDir: string;
     metadataPath: string;
+    metadataResetCount: number;
   }> {
     const metadata = await this.loadMetadata();
     return {
       sessionCount: metadata.size,
       dataDir: this.dataDir,
       metadataPath: this.metadataPath,
+      metadataResetCount: this.metadataResetCount,
     };
   }
 
