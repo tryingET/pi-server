@@ -5,6 +5,8 @@ Session multiplexer for [pi-coding-agent](https://www.npmjs.com/package/@marioze
 [![CI](https://github.com/tryingET/pi-server/actions/workflows/ci.yml/badge.svg)](https://github.com/tryingET/pi-server/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/pi-app-server.svg)](https://www.npmjs.com/package/pi-app-server)
 
+> Note: This is a standalone pi server package, not an extension/skills/themes bundle.
+
 ## Features
 
 - **Dual transport**: WebSocket (port 3141) + stdio (JSON lines)
