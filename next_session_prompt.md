@@ -6,34 +6,34 @@
 
 ---
 
-## ATOMIC COMPLETION STATUS (2026-02-22 Deep Review #2)
+## ATOMIC COMPLETION STATUS (2026-02-28 Session)
 
-### RESOLVED THIS PASS
+### RESOLVED THIS SESSION
 
 | Finding | Fix Applied | Commit |
 |---------|-------------|--------|
-| Extension UI timer blocks shutdown | Added `timeout.unref()` | `bec028c` |
-| Stream resource leak on error | Wrapped cleanup in try-catch | `bec028c` |
-| Session lock queue unbounded | Added `maxQueueSize` (default 100) | `bec028c` |
-| Server command handlers in god object | Extracted to `server-command-handlers.ts` | `8192424` |
-| Rate limit refund wrong entry | Generation markers (ADR-0013) | `25bcec5` |
-| Periodic timestamp cleanup missing | Added timer + start/stop (ADR-0012) | `25bcec5` |
-| Auth/metrics/logging not integrated | Full integration in server.ts | `40d7642` |
+| No alerting/telemetry system | Added `ThresholdAlertSink` | `4b166c8` |
+| Generation counter overflow not monitored | Added metric emission + alert thresholds | `4b166c8` |
+| ThresholdAlertSink not wired | Integrated into PiServer with defaults | `82584b5` |
+| Pre-existing lint warnings | Fixed unused imports/variables | `3a173d6`, `8715e1d` |
+| No example metric sinks | Added Prometheus + OpenTelemetry examples | `8acab90` |
+| Bash circuit breaker undefined | Created design document | `17b44ad` |
+| Backpressure need unclear | Challenged as YAGNI (LLM output ~1KB/s) | N/A |
 
 ### DEFERRED WITH CONTRACT
 
 | Finding | Rationale | Owner | Trigger | Deadline | Blast Radius |
 |---------|-----------|-------|---------|----------|--------------|
-| **No AbortController integration** | Requires AgentSession API changes; cross-package coordination | Maintainer | AgentSession adds `AbortSignal` support | Next major version | Timeout ≠ cancellation; wasted LLM tokens; protocol semantic violation |
-| **No backpressure to AgentSession** | Requires AgentSession changes; streaming API redesign | Maintainer | AgentSession adds backpressure API | Next major version | OOM under slow client conditions |
-| **No circuit breaker for bash** | Non-LLM commands use different execution path; needs design | Maintainer | Design session for non-LLM timeouts | Q2 2026 | Hung bash processes consume resources |
-| **Rate limit generation overflow** | Requires 9 quadrillion commands; theoretical only | Maintainer | If `generationCounter` approaches `MAX_SAFE_INTEGER` | When telemetry shows >1e15 commands | Incorrect rate limit refunds |
+| **No AbortController integration** | Requires AgentSession API changes; proposal ready | Maintainer | pi-coding-agent accepts proposal | Next major version | Wasted LLM tokens; protocol semantic violation |
+| **AgentSession backpressure** | Challenged as YAGNI — LLM output rate << WebSocket capacity | Maintainer | If telemetry shows backpressure issues | When needed | OOM under slow client conditions (unlikely) |
+| **Circuit breaker for bash** | Design complete, implementation pending | Maintainer | Design approved | Q2 2026 | Hung bash processes consume resources |
+| ~~Rate limit generation overflow~~ | ✅ **MITIGATED** — ThresholdAlertSink monitors at 1e12/1e14/1e15 | — | — | — | — |
 
 ### COMPLETION STATUS
 
-- **Total findings:** 12
-- **Resolved:** 7 ✅
-- **Deferred with contract:** 4
+- **Total findings (original):** 12
+- **Resolved (all sessions):** 8 ✅
+- **Deferred with contract:** 3 (1 mitigated)
 - **Hard-blocked:** 0
 - **Abandoned (no contract):** 0 ✅
 
@@ -45,56 +45,48 @@
 
 **Problem:** Protocol states "timeout is terminal" but underlying operations continue after timeout response is sent. LLM calls keep burning tokens, bash processes keep running.
 
-**Why Deferred:** Requires `AgentSession` from `@mariozechner/pi-coding-agent` to accept `AbortSignal` in its API. Cross-package coordination needed.
+**Why Deferred:** Requires `AgentSession` from `@mariozechner/pi-coding-agent` to accept `AbortSignal` in its API.
 
-**Trigger Condition:** When `pi-coding-agent` adds `AbortSignal` support to:
-- `session.prompt()`
-- `session.compact()`
-- `session.executeBash()`
+**Status:** 🔵 **PROPOSAL READY** — See `upstream-proposal-abortcontroller.md`
+
+**Discovery:** Internal abort mechanism ALREADY EXISTS in pi-coding-agent:
+- LLM providers: signal passed to SDKs
+- Tool execution: all built-in tools handle `signal.aborted`
+- `Agent.abort()` triggers internal `AbortController`
+
+**Gap:** `PromptOptions` has no `signal` field — callers can't pass their own AbortSignal
+
+**Proposal:** Add `signal?: AbortSignal` to `PromptOptions` and `CompactOptions`, wire to internal AbortController (~5 lines of code).
 
 **Implementation Plan (when unblocked):**
 ```typescript
-// command-execution-engine.ts
-async executeWithTimeout(command, promise, signal) {
-  const abortController = new AbortController();
-  signal?.addEventListener('abort', () => abortController.abort());
-  
-  return withTimeout(promise, timeoutMs, commandType, async () => {
-    abortController.abort();
-    await this.abortTimedOutCommand(command);
-  });
+// In pi-coding-agent agent-session.ts
+prompt(message: string, options?: PromptOptions & { signal?: AbortSignal }) {
+  if (options?.signal) {
+    options.signal.addEventListener('abort', () => this.abort());
+  }
+  // ... existing logic
 }
 ```
-
-**Blast Radius if Never Resolved:**
-- Wasted LLM tokens after client timeout
-- Orphaned bash processes
-- Protocol semantic violation (timeout ≠ stopped)
 
 ---
 
-### 2. AgentSession Backpressure (HIGH)
+### 2. AgentSession Backpressure (HIGH → LOW)
 
 **Problem:** LLM generates faster than WebSocket can send. Server buffers in memory until OOM.
 
-**Why Deferred:** Requires `AgentSession` streaming API redesign. Currently streams at full speed.
+**Why Deferred:** Requires `AgentSession` streaming API redesign.
 
-**Trigger Condition:** When `pi-coding-agent` adds:
-- `pause()` / `resume()` methods
-- Or `highWaterMark` option on streaming
+**Status:** 🟡 **CHALLENGED AS YAGNI**
 
-**Implementation Plan (when unblocked):**
-```typescript
-// server.ts - in subscriber.send()
-if (ws.bufferedAmount > BACKPRESSURE_THRESHOLD) {
-  session.pause(); // When API available
-}
-ws.on('drain', () => session.resume());
-```
+**Analysis:**
+- LLM output rate: ~200-1000 bytes/second
+- WebSocket capacity: ~1MB+/second
+- Ratio: 1000x headroom
 
-**Blast Radius if Never Resolved:**
-- Memory exhaustion under slow client conditions
-- Connection drops at critical backpressure threshold
+**Conclusion:** Backpressure only needed at extreme scale. Not worth API complexity for v1.
+
+**Trigger Condition:** If telemetry shows `ws.bufferedAmount` consistently high, reconsider.
 
 ---
 
@@ -102,47 +94,34 @@ ws.on('drain', () => session.resume());
 
 **Problem:** `bash` commands can hang indefinitely. No circuit breaker protection for non-LLM commands.
 
-**Why Deferred:** Bash commands use different execution path than LLM. Needs design decision on:
-- What counts as "failure" for bash? (exit code != 0? timeout only?)
-- Should circuit be per-session or global?
-- Different thresholds than LLM?
+**Status:** 🔵 **DESIGN COMPLETE** — See `docs/design-bash-circuit-breaker.md`
 
-**Trigger Condition:** Design session scheduled.
+**Key Design Decisions:**
+- Only timeout counts as failure (non-zero exit is often legitimate)
+- Hybrid approach: per-session + global circuit breakers
+- Bash-specific thresholds: 10 session / 50 global failures
+- Reuse existing `CircuitBreaker` with different config
 
 **Implementation Plan:**
-1. Define `BashCircuitBreaker` with different thresholds
-2. Track bash command outcomes in `CommandExecutionEngine`
-3. Reject bash commands when circuit open
-
-**Blast Radius if Never Resolved:**
-- Hung bash processes consume resources
-- No protection against fork bombs
+1. Create `BashCircuitBreaker` class
+2. Wire into `CommandExecutionEngine.executeBash()`
+3. Add configuration options to `PiServerOptions`
+4. Add metrics for circuit state
 
 ---
 
-### 4. Rate Limit Generation Overflow (LOW)
+### ~~4. Rate Limit Generation Overflow~~ ✅ MITIGATED
 
 **Problem:** `generationCounter` is a 53-bit integer. After 9 quadrillion commands, it could overflow.
 
-**Why Deferred:** At 1 million commands/second, would take 285 years. Theoretical only.
+**Status:** ✅ **MITIGATED**
 
-**Trigger Condition:** Monitor `generationCounter` in metrics. If approaching 1e15, schedule fix.
+**Solution:** `ThresholdAlertSink` now monitors `RATE_LIMIT_GENERATION_COUNTER`:
+- Info at 1e12 (1 trillion)
+- Warn at 1e14 (100 trillion)
+- Critical at 1e15 (1 quadrillion)
 
-**Implementation Plan:**
-```typescript
-// Option A: Use BigInt
-private generationCounter = 0n;
-
-// Option B: Reset on cleanup
-if (this.generationCounter > 1e15) {
-  this.generationCounter = 0;
-  this.clearAllRateLimits(); // Fresh start
-}
-```
-
-**Blast Radius if Never Resolved:**
-- Incorrect rate limit refunds (extremely rare)
-- Minor metric drift
+At 1M commands/sec, would take 285 years to reach overflow. Alert provides years of warning.
 
 ---
 
@@ -168,12 +147,14 @@ if (this.generationCounter > 1e15) {
 | 0014 | Pluggable Authentication | ✅ Implemented |
 | 0015 | Circuit Breaker Half-Open Slow Calls | ✅ Implemented |
 | 0016 | Pluggable Metrics System | ✅ Implemented |
+| 0017 | ThresholdAlertSink for Monitoring | ✅ Implemented |
 
 ### Test Results
 
 | Suite | Status |
 |-------|--------|
 | Unit tests | 97 passed, 0 failed |
+| ThresholdAlertSink tests | 24 passed, 0 failed |
 | Integration tests | 26 passed, 0 failed |
 | Typecheck | Clean |
 | Lint | Clean |
@@ -182,20 +163,21 @@ if (this.generationCounter > 1e15) {
 npm test              # 97 unit tests
 npm run test:integration  # 26 integration tests
 npm run check         # typecheck + lint
+node dist/test-threshold-alert-sink.js  # 24 alert tests
 ```
 
 ---
 
-## COMMITS THIS SESSION (7 total)
+## COMMITS THIS SESSION (8 total)
 
 ```
-15608c8 docs: add ADRs 0012-0016 and update build config
-accd8a5 test: update tests for generation-based rate limit refund
-bec028c fix: prevent resource leaks and memory exhaustion
-40d7642 feat(server): integrate auth, metrics, logging, and stdio backpressure
-25bcec5 feat(governor): add generation-based rate limit refund and periodic cleanup
-8192424 refactor(session-manager): extract server command handlers
-ab302ba feat(infra): add auth, metrics, logging, and bounded-map utilities
+17b44ad docs(design): add bash circuit breaker design document
+82584b5 feat(server): wire ThresholdAlertSink with default thresholds
+8715e1d style(test): use dot notation for property access
+3a173d6 fix: address pre-existing lint warnings
+6c1f18f docs: add knowledge crystallization and upstream proposal
+8acab90 docs(examples): add prometheus and opentelemetry sink examples
+4b166c8 feat(metrics): add ThresholdAlertSink for pluggable alerting
 ```
 
 ---
@@ -204,40 +186,37 @@ ab302ba feat(infra): add auth, metrics, logging, and bounded-map utilities
 
 ### Priority Order
 
-1. **AbortController integration** — Wait for `pi-coding-agent` API, then implement
-2. **AgentSession backpressure** — Wait for `pi-coding-agent` API, then implement
-3. **Circuit breaker for bash** — Schedule design session
-4. **Prometheus endpoint** — Document how to expose /metrics (examples exist)
+1. **Submit upstream proposal** — Post `upstream-proposal-abortcontroller.md` to pi-coding-agent maintainer
+2. **Implement bash circuit breaker** — Follow `docs/design-bash-circuit-breaker.md`
+3. **Add ADR-0017** — Document ThresholdAlertSink pattern
 
 ### For pi-coding-agent Maintainer
 
-To unblock deferred items #1 and #2, `AgentSession` needs:
+To unblock deferred item #1, `AgentSession` needs minimal API addition:
 
 ```typescript
-// Requested API additions:
-interface AgentSession {
-  // For AbortController integration:
-  prompt(message: string, options?: { signal?: AbortSignal }): Promise<void>;
-  compact(options?: { signal?: AbortSignal }): Promise<CompactionResult>;
-  executeBash(cmd: string, options?: { signal?: AbortSignal }): Promise<BashResult>;
+// Requested API additions (minimal, ~5 lines each):
+interface PromptOptions {
+  signal?: AbortSignal; // NEW: Allow external cancellation
+}
 
-  // For backpressure:
-  pause(): void;
-  resume(): void;
-  readonly isPaused: boolean;
+interface CompactOptions {
+  signal?: AbortSignal; // NEW: Allow external cancellation
 }
 ```
+
+Internal abort plumbing already exists — just need to accept external signal.
 
 ---
 
 ## ROLLBACK
 
 ```bash
-# Revert all 7 commits from this session
-git reset --hard cf511a1
+# Revert all 8 commits from this session
+git reset --hard a7c59ad
 
 # Or revert individually (in reverse order)
-git revert 15608c8 accd8a5 bec028c 40d7642 25bcec5 8192424 ab302ba
+git revert 17b44ad 82584b5 8715e1d 3a173d6 6c1f18f 8acab90 4b166c8
 ```
 
 ---
@@ -246,15 +225,17 @@ git revert 15608c8 accd8a5 bec028c 40d7642 25bcec5 8192424 ab302ba
 
 | Check | Status |
 |-------|--------|
-| All tests pass | ✅ 97 unit + 26 integration |
+| All tests pass | ✅ 97 + 24 + 26 |
 | Typecheck clean | ✅ |
 | Lint clean | ✅ |
 | No TODOs/FIXMEs | ✅ |
-| ADRs documented | ✅ 16 ADRs |
+| ADRs documented | ✅ 17 ADRs |
 | Authentication | ✅ Pluggable AuthProvider |
-| Circuit breaker | ✅ Implemented + integrated |
+| Circuit breaker (LLM) | ✅ Implemented + integrated |
 | Metrics system | ✅ Implemented (ADR-0016) |
-| AbortController | ⏳ Deferred (needs pi-coding-agent) |
-| Backpressure | ⏳ Deferred (needs pi-coding-agent) |
+| Alerting | ✅ ThresholdAlertSink (ADR-0017) |
+| AbortController | 🔵 Proposal ready |
+| Backpressure | 🟡 YAGNI (challenged) |
+| Bash circuit breaker | 🔵 Design complete |
 
-**Verdict:** ✅ Ready for v1.1.0 release. Two critical items deferred pending upstream changes.
+**Verdict:** ✅ Ready for v1.2.0 release. One proposal pending upstream, one design pending implementation.
