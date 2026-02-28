@@ -30,7 +30,7 @@ function test(name: string, fn: () => void | Promise<void>) {
 // IMPORTS
 // =============================================================================
 
-import { ThresholdAlertSink, consoleAlertHandler } from "./threshold-alert-sink.js";
+import { ThresholdAlertSink } from "./threshold-alert-sink.js";
 import { MemorySink, NoOpSink } from "./metrics-types.js";
 import type { MetricEvent } from "./metrics-types.js";
 
@@ -84,7 +84,7 @@ async function runTests() {
     alertSink.record(event);
 
     const metrics = memorySink.getMetrics();
-    assert.strictEqual((metrics.gauges as Record<string, number>)["test_metric"], 10);
+    assert.strictEqual((metrics.gauges as Record<string, number | undefined>)["test_metric"], 10);
   });
 
   await test("passes unwatched metrics through without alerting", async () => {
@@ -95,7 +95,7 @@ async function runTests() {
 
     assert.strictEqual(alertHandlerCalls.length, 0);
     const metrics = memorySink.getMetrics();
-    assert.strictEqual((metrics.gauges as Record<string, number>)["unwatched_metric"], 999);
+    assert.strictEqual((metrics.gauges as Record<string, number | undefined>)["unwatched_metric"], 999);
   });
 
   // ==========================================================================

@@ -221,7 +221,7 @@ export class MemorySink implements MetricsSink {
         this.gauges.set(key, event.value ?? 0);
         break;
 
-      case "histogram":
+      case "histogram": {
         const hist = this.histograms.get(key) ?? { sum: 0, count: 0, min: Infinity, max: -Infinity };
         const val = event.value ?? 0;
         hist.sum += val;
@@ -230,6 +230,7 @@ export class MemorySink implements MetricsSink {
         hist.max = Math.max(hist.max, val);
         this.histograms.set(key, hist);
         break;
+      }
 
       case "event":
         this.events.push({ ...event, timestamp: event.timestamp ?? Date.now() });

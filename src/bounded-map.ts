@@ -240,7 +240,7 @@ export class BoundedMap<K, V> {
   values(): V[] {
     const result: V[] = [];
     const now = Date.now();
-    for (const [key, entry] of this.map) {
+    for (const [_key, entry] of this.map) {
       // Skip expired entries
       if (this.ttlMs > 0 && now - entry.insertedAt > this.ttlMs) {
         continue;

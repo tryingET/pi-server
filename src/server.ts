@@ -28,7 +28,7 @@ import {
   MetricNames,
 } from "./metrics-index.js";
 import {
-  Logger,
+  type Logger,
   ConsoleLogger,
   type LogLevel,
 } from "./logger-index.js";
@@ -51,7 +51,7 @@ const BACKPRESSURE_THRESHOLD_BYTES = 64 * 1024;
 const BACKPRESSURE_CRITICAL_BYTES = 1024 * 1024;
 
 /** Stdio backpressure threshold (256KB). Beyond this, we start dropping non-critical messages. */
-const STDIO_BACKPRESSURE_THRESHOLD_BYTES = 256 * 1024;
+const _STDIO_BACKPRESSURE_THRESHOLD_BYTES = 256 * 1024;
 
 /** WebSocket heartbeat interval (30 seconds). */
 const HEARTBEAT_INTERVAL_MS = 30 * 1000;

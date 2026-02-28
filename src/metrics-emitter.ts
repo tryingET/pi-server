@@ -25,7 +25,6 @@
 import type {
   MetricEvent,
   MetricTags,
-  MetricType,
   MetricsSink,
   Span,
 } from "./metrics-types.js";
