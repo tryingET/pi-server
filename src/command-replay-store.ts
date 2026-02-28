@@ -297,6 +297,18 @@ export class CommandReplayStore {
   // ==========================================================================
 
   /**
+   * Check whether an in-flight command can be tracked for this command ID.
+   *
+   * Returns true if:
+   * - the command ID is already tracked (replacement/update path), OR
+   * - there is free capacity for a new tracked command.
+   */
+  canRegisterInFlight(commandId: string): boolean {
+    const existed = this.commandInFlightById.has(commandId);
+    return existed || this.inFlightOrder.length < this.maxInFlightCommands;
+  }
+
+  /**
    * Register an in-flight command.
    *
    * ADR-0001: Rejects when limit exceeded instead of evicting.

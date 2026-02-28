@@ -953,6 +953,26 @@ async function testExtensionUI() {
 // =============================================================================
 
 import { PiSessionManager } from "./session-manager.js";
+import { PiServer } from "./server.js";
+import { MetricNames, type MetricEvent, type MetricsSink } from "./metrics-types.js";
+
+class BufferedTestSink implements MetricsSink {
+  private buffer: MetricEvent[] = [];
+  private flushed: MetricEvent[] = [];
+
+  record(event: MetricEvent): void {
+    this.buffer.push(event);
+  }
+
+  async flush(): Promise<void> {
+    this.flushed.push(...this.buffer);
+    this.buffer = [];
+  }
+
+  hasFlushedMetric(name: string): boolean {
+    return this.flushed.some((event) => event.name === name);
+  }
+}
 
 async function testSessionManager() {
   console.log("\n=== Session Manager Tests ===\n");
@@ -1245,6 +1265,145 @@ async function testSessionManager() {
     assert(r4.error?.includes("Rate limit"), `Expected rate limit error, got: ${r4.error}`);
   });
 
+  await test("session-manager: server busy rejection does not execute command side effects", async () => {
+    const localManager = new PiSessionManager();
+    (localManager as any).replayStore.maxInFlightCommands = 0;
+
+    const response = await localManager.executeCommand({
+      id: "busy-create",
+      type: "create_session",
+      sessionId: "busy-ghost",
+    });
+
+    assert.strictEqual(response.success, false, "Command should be rejected as busy");
+    assert(response.error?.includes("Server busy"), `Unexpected error: ${response.error}`);
+    assert.strictEqual(localManager.getSession("busy-ghost"), undefined, "Session must not be created on rejection");
+  });
+
+  await test("session-manager: idempotency replay preserves timeout terminal outcome", async () => {
+    const localManager = new PiSessionManager(undefined, {
+      defaultCommandTimeoutMs: 10,
+      shortCommandTimeoutMs: 10,
+    });
+
+    const managerAny = localManager as any;
+    const originalExecuteInternal = managerAny.executeCommandInternal.bind(localManager);
+
+    managerAny.executeCommandInternal = async (
+      command: any,
+      id: string | undefined,
+      commandType: string
+    ) => {
+      if (commandType === "list_sessions") {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        return {
+          id,
+          type: "response",
+          command: "list_sessions",
+          success: true,
+          data: { sessions: [] },
+        };
+      }
+      return originalExecuteInternal(command, id, commandType);
+    };
+
+    const first = await localManager.executeCommand({
+      id: "timeout-idem-1",
+      type: "list_sessions",
+      idempotencyKey: "timeout-idem-key",
+    } as any);
+
+    assert.strictEqual(first.success, false, "Initial request should time out");
+    assert.strictEqual(first.timedOut, true, "Initial request should be marked timedOut");
+
+    await new Promise((resolve) => setTimeout(resolve, 70));
+
+    const second = await localManager.executeCommand({
+      id: "timeout-idem-2",
+      type: "list_sessions",
+      idempotencyKey: "timeout-idem-key",
+    } as any);
+
+    assert.strictEqual(second.success, false, "Replay should preserve terminal timeout outcome");
+    assert.strictEqual(second.timedOut, true, "Replay should stay timedOut");
+    assert.strictEqual(second.replayed, true, "Replay should be served from cache");
+  });
+
+  await test("session-manager: emits command_finished for admitted rate-limited commands", async () => {
+    const governor = new ResourceGovernor({
+      ...DEFAULT_CONFIG,
+      maxCommandsPerMinute: 1,
+      maxGlobalCommandsPerMinute: 100,
+    });
+    const localManager = new PiSessionManager(governor);
+
+    const events: any[] = [];
+    const subscriber = {
+      send: (data: string) => {
+        events.push(JSON.parse(data));
+      },
+      subscribedSessions: new Set<string>(),
+    };
+    localManager.addSubscriber(subscriber);
+
+    const first = await localManager.executeCommand({ id: "rl-lifecycle-1", type: "list_sessions" } as any);
+    assert.strictEqual(first.success, true);
+
+    const second = await localManager.executeCommand({ id: "rl-lifecycle-2", type: "list_sessions" } as any);
+    assert.strictEqual(second.success, false);
+    assert(second.error?.includes("Rate limit"));
+
+    const accepted = events.find(
+      (e) => e.type === "command_accepted" && e.data?.commandId === "rl-lifecycle-2"
+    );
+    const finished = events.find(
+      (e) => e.type === "command_finished" && e.data?.commandId === "rl-lifecycle-2"
+    );
+
+    assert.ok(accepted, "Expected command_accepted event for rate-limited command");
+    assert.ok(finished, "Expected command_finished event for rate-limited command");
+    assert.strictEqual(finished.data.success, false, "Finished event should report failure");
+
+    localManager.removeSubscriber(subscriber);
+  });
+
+  await test("session-manager: load_session initializes version at 0", async () => {
+    const localManager = new PiSessionManager();
+
+    const created = await localManager.executeCommand({
+      type: "create_session",
+      sessionId: "load-src",
+    });
+    assert.strictEqual(created.success, true);
+
+    const sessionPath = (created as any).data.sessionInfo.sessionFile;
+    assert.ok(sessionPath, "Expected source session file");
+
+    await localManager.executeCommand({ type: "delete_session", sessionId: "load-src" });
+
+    const loadedAutoId = await localManager.executeCommand({
+      type: "load_session",
+      sessionPath,
+    } as any);
+    assert.strictEqual(loadedAutoId.success, true);
+    assert.strictEqual(loadedAutoId.sessionVersion, 0, "Auto-id load_session should start at version 0");
+
+    await localManager.executeCommand({
+      type: "delete_session",
+      sessionId: (loadedAutoId as any).data.sessionId,
+    });
+
+    const loadedExplicitId = await localManager.executeCommand({
+      type: "load_session",
+      sessionId: "load-explicit",
+      sessionPath,
+    } as any);
+    assert.strictEqual(loadedExplicitId.success, true);
+    assert.strictEqual(loadedExplicitId.sessionVersion, 0, "Explicit-id load_session should start at version 0");
+
+    await localManager.executeCommand({ type: "delete_session", sessionId: "load-explicit" });
+  });
+
   // Test: Create and delete session (integration test)
   await test("session-manager: creates and deletes session", async () => {
     const createResponse = await manager.executeCommand({
@@ -1531,6 +1690,23 @@ async function testSessionManager() {
     // Verify sessions are gone
     const listAfter = await manager.executeCommand({ type: "list_sessions" });
     assert.strictEqual((listAfter as any).data.sessions.length, 0, "Should have 0 sessions");
+  });
+
+  await test("server: shutdown flush includes final uptime metric", async () => {
+    const sink = new BufferedTestSink();
+    const server = new PiServer({
+      metricsSink: sink,
+      includeMemoryMetrics: false,
+    });
+
+    await server.start(0);
+    await server.stop(1000);
+
+    assert.strictEqual(
+      sink.hasFlushedMetric(MetricNames.SESSION_LIFETIME_SECONDS),
+      true,
+      "Expected uptime metric to be included in flushed metrics"
+    );
   });
 }
 

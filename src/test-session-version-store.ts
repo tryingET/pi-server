@@ -179,6 +179,22 @@ describe("session-version-store", () => {
       assert.strictEqual(store.getVersion("new-session"), 0);
     });
 
+    it("initializes version for load_session", () => {
+      const store = new SessionVersionStore();
+      const response = {
+        type: "response" as const,
+        command: "load_session",
+        success: true,
+        data: { sessionId: "loaded-session", sessionInfo: {} as any },
+      } as any;
+      const result = store.applyVersion(
+        { type: "load_session", sessionPath: "/tmp/s.jsonl" } as any,
+        response
+      );
+      assert.strictEqual(result.sessionVersion, 0);
+      assert.strictEqual(store.getVersion("loaded-session"), 0);
+    });
+
     it("deletes version for delete_session", () => {
       const store = new SessionVersionStore();
       store.initialize("session-to-delete");

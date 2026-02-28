@@ -536,12 +536,12 @@ export class PiServer {
       failed: disposeResult.failed,
     });
 
-    // Flush metrics before shutdown
-    await this.metrics.flush();
-
-    // Record uptime
+    // Record uptime before final flush so buffered sinks include it
     const uptimeMs = Date.now() - this.serverStartTime;
     this.metrics.gauge(MetricNames.SESSION_LIFETIME_SECONDS, Math.floor(uptimeMs / 1000));
+
+    // Flush metrics before shutdown
+    await this.metrics.flush();
 
     this.logger.info("Shutdown complete", { uptimeMs });
   }

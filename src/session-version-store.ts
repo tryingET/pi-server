@@ -124,6 +124,7 @@ export class SessionVersionStore {
    *
    * For successful responses:
    * - create_session: initialize new session at version 0
+   * - load_session: initialize loaded session at version 0
    * - delete_session: remove version record
    * - other session commands: increment if mutating
    *
@@ -140,6 +141,13 @@ export class SessionVersionStore {
     ) {
       const createdSessionId = response.data.sessionId;
       this.sessionVersions.set(createdSessionId, 0);
+      return { ...response, sessionVersion: 0 };
+    }
+
+    // Handle load_session specially
+    if (command.type === "load_session" && response.command === "load_session" && response.success) {
+      const loadedSessionId = response.data.sessionId;
+      this.sessionVersions.set(loadedSessionId, 0);
       return { ...response, sessionVersion: 0 };
     }
 

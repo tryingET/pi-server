@@ -968,82 +968,77 @@ export class PiSessionManager implements SessionResolver {
       idempotencyKey,
     });
 
+    const finalizeResponse = (response: RpcResponse): RpcResponse => {
+      this.broadcastCommandLifecycle("command_finished", {
+        commandId,
+        commandType,
+        sessionId,
+        dependsOn,
+        ifSessionVersion,
+        idempotencyKey,
+        success: response.success,
+        error: response.success ? undefined : response.error,
+        sessionVersion: response.sessionVersion,
+        replayed: response.replayed,
+      });
+      return response;
+    };
+
     // Check for replay opportunities or conflicts (ADR-0001: Free replay)
     // Replay is O(1) lookup - no execution cost, should not consume rate limit
     const replayCheck = this.replayStore.checkReplay(command, fingerprint);
 
     if (replayCheck.kind === "conflict") {
-      this.broadcastCommandLifecycle("command_finished", {
-        commandId,
-        commandType,
-        sessionId,
-        dependsOn,
-        ifSessionVersion,
-        idempotencyKey,
-        success: false,
-        error: replayCheck.response.error,
-      });
-      return replayCheck.response;
+      return finalizeResponse(replayCheck.response);
     }
 
     if (replayCheck.kind === "replay_cached") {
-      this.broadcastCommandLifecycle("command_finished", {
-        commandId,
-        commandType,
-        sessionId,
-        dependsOn,
-        ifSessionVersion,
-        idempotencyKey,
-        success: replayCheck.response.success,
-        error: replayCheck.response.success ? undefined : replayCheck.response.error,
-        sessionVersion: replayCheck.response.sessionVersion,
-        replayed: true,
-      });
-      return replayCheck.response;
+      return finalizeResponse(replayCheck.response);
     }
 
     if (replayCheck.kind === "replay_inflight") {
       const replayed = await replayCheck.promise;
-      this.broadcastCommandLifecycle("command_finished", {
-        commandId,
-        commandType,
-        sessionId,
-        dependsOn,
-        ifSessionVersion,
-        idempotencyKey,
-        success: replayed.success,
-        error: replayed.success ? undefined : replayed.error,
-        sessionVersion: replayed.sessionVersion,
-        replayed: true,
-      });
-      return replayed;
+      return finalizeResponse(replayed);
     }
 
     // ADR-0001: Rate limiting only for NEW executions (replay is free)
     const rateLimitKey = sessionId ?? "_server_";
     const rateLimitResult = this.governor.canExecuteCommand(rateLimitKey);
     if (!rateLimitResult.allowed) {
-      return {
+      return finalizeResponse({
         id,
         type: "response",
         command: commandType,
         success: false,
         error: rateLimitResult.reason,
-      };
+      });
     }
 
     // Additional rate limiting for extension_ui_response (prevents spam)
     if (commandType === "extension_ui_response" && sessionId) {
       const extRateLimitResult = this.governor.canExecuteExtensionUIResponse(sessionId);
       if (!extRateLimitResult.allowed) {
-        return {
+        return finalizeResponse({
           id,
           type: "response",
           command: commandType,
           success: false,
           error: extRateLimitResult.reason,
-        };
+        });
       }
+    }
+
+    // Reject before starting execution if we cannot track this explicit command ID.
+    // This prevents side effects from commands that are rejected as "server busy".
+    const isExplicitId = typeof id === "string" && !id.startsWith(SYNTHETIC_ID_PREFIX);
+    if (isExplicitId && !this.replayStore.canRegisterInFlight(id)) {
+      return finalizeResponse({
+        id,
+        type: "response",
+        command: commandType,
+        success: false,
+        error: "Server busy - too many concurrent commands. Please retry.",
+      });
     }
 
     // Proceed with normal execution
@@ -1117,27 +1112,14 @@ export class PiSessionManager implements SessionResolver {
       // ADR-0001: Reject if in-flight limit reached (don't evict - breaks dependencies)
       const registered = this.replayStore.registerInFlight(id, inFlightRecord);
       if (!registered) {
-        return {
+        return finalizeResponse({
           id,
           type: "response",
           command: commandType,
           success: false,
           error: "Server busy - too many concurrent commands. Please retry.",
-        };
-      }
-    }
-
-    // Cache idempotency result on completion
-    if (idempotencyKey) {
-      commandExecution.then((response) => {
-        this.replayStore.cacheIdempotencyResult({
-          command,
-          idempotencyKey,
-          commandType,
-          fingerprint,
-          response,
         });
-      });
+      }
     }
 
     this.registerInFlightCommand(commandExecution);
@@ -1170,7 +1152,6 @@ export class PiSessionManager implements SessionResolver {
     // Synthetic IDs (anon:timestamp:seq) are server-generated for anonymous
     // commands and should not be stored to prevent unbounded memory growth.
     // Clients must provide explicit IDs if they want replay semantics.
-    const isExplicitId = id && !id.startsWith(SYNTHETIC_ID_PREFIX);
     if (isExplicitId) {
       try {
         this.replayStore.storeCommandOutcome({
@@ -1197,20 +1178,18 @@ export class PiSessionManager implements SessionResolver {
       this.replayStore.unregisterInFlight(id, inFlightRecord!);
     }
 
-    this.broadcastCommandLifecycle("command_finished", {
-      commandId,
-      commandType,
-      sessionId,
-      dependsOn,
-      ifSessionVersion,
-      idempotencyKey,
-      success: response.success,
-      error: response.success ? undefined : response.error,
-      sessionVersion: response.sessionVersion,
-      replayed: response.replayed,
-    });
+    // Cache terminal idempotency outcome (including timeout responses)
+    if (idempotencyKey) {
+      this.replayStore.cacheIdempotencyResult({
+        command,
+        idempotencyKey,
+        commandType,
+        fingerprint,
+        response,
+      });
+    }
 
-    return response;
+    return finalizeResponse(response);
   }
 
   /**
