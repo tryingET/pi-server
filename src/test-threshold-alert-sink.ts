@@ -41,7 +41,12 @@ import type { MetricEvent } from "./metrics-types.js";
 async function runTests() {
   console.log("\n=== ThresholdAlertSink Tests ===\n");
 
-  let alertHandlerCalls: Array<{ metricName: string; value: number; level: string; threshold: number }> = [];
+  let alertHandlerCalls: Array<{
+    metricName: string;
+    value: number;
+    level: string;
+    threshold: number;
+  }> = [];
   let clearHandlerCalls: Array<{ metricName: string; value: number }> = [];
   let memorySink: MemorySink;
   let alertSink: ThresholdAlertSink;
@@ -228,42 +233,33 @@ async function runTests() {
   // ==========================================================================
 
   await test("throws on negative warn threshold", () => {
-    assert.throws(
-      () => {
-        new ThresholdAlertSink({
-          sink: new NoOpSink(),
-          thresholds: { test: { warn: -10 } },
-          onAlert: () => {},
-        });
-      },
-      /negative warn threshold/
-    );
+    assert.throws(() => {
+      new ThresholdAlertSink({
+        sink: new NoOpSink(),
+        thresholds: { test: { warn: -10 } },
+        onAlert: () => {},
+      });
+    }, /negative warn threshold/);
   });
 
   await test("throws when critical < warn", () => {
-    assert.throws(
-      () => {
-        new ThresholdAlertSink({
-          sink: new NoOpSink(),
-          thresholds: { test: { warn: 100, critical: 50 } },
-          onAlert: () => {},
-        });
-      },
-      /critical.*< warn/
-    );
+    assert.throws(() => {
+      new ThresholdAlertSink({
+        sink: new NoOpSink(),
+        thresholds: { test: { warn: 100, critical: 50 } },
+        onAlert: () => {},
+      });
+    }, /critical.*< warn/);
   });
 
   await test("throws when info > warn", () => {
-    assert.throws(
-      () => {
-        new ThresholdAlertSink({
-          sink: new NoOpSink(),
-          thresholds: { test: { warn: 50, info: 100 } },
-          onAlert: () => {},
-        });
-      },
-      /info.*> warn/
-    );
+    assert.throws(() => {
+      new ThresholdAlertSink({
+        sink: new NoOpSink(),
+        thresholds: { test: { warn: 50, info: 100 } },
+        onAlert: () => {},
+      });
+    }, /info.*> warn/);
   });
 
   await test("accepts valid config with all thresholds", () => {

@@ -22,12 +22,7 @@
  * ```
  */
 
-import type {
-  MetricEvent,
-  MetricTags,
-  MetricsSink,
-  Span,
-} from "./metrics-types.js";
+import type { MetricEvent, MetricTags, MetricsSink, Span } from "./metrics-types.js";
 import { NoOpSink } from "./metrics-types.js";
 
 /**
@@ -54,13 +49,15 @@ export class MetricsEmitter {
   private prefix: string;
   private defaultTags: MetricTags;
 
-  constructor(options: {
-    sink?: MetricsSink;
-    /** Prefix to add to all metric names (default: none) */
-    prefix?: string;
-    /** Tags to add to all metrics */
-    defaultTags?: MetricTags;
-  } = {}) {
+  constructor(
+    options: {
+      sink?: MetricsSink;
+      /** Prefix to add to all metric names (default: none) */
+      prefix?: string;
+      /** Tags to add to all metrics */
+      defaultTags?: MetricTags;
+    } = {}
+  ) {
     this.sink = options.sink ?? new NoOpSink();
     this.prefix = options.prefix ?? "";
     this.defaultTags = options.defaultTags ?? {};
@@ -249,11 +246,7 @@ export class MetricsEmitter {
    * Time an async function with tracing.
    * Creates a span that covers the function execution.
    */
-  async traceAsync<T>(
-    name: string,
-    fn: () => Promise<T>,
-    parent?: Span
-  ): Promise<T> {
+  async traceAsync<T>(name: string, fn: () => Promise<T>, parent?: Span): Promise<T> {
     const span = this.startSpan(name, parent);
     try {
       const result = await fn();

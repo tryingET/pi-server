@@ -166,37 +166,67 @@ export abstract class BaseLogger implements Logger {
 
   trace(message: string, context?: Record<string, unknown>): void {
     if (this.isLevelEnabled("trace")) {
-      this.log({ level: "trace", message, timestamp: Date.now(), context: this.mergeContext(context) });
+      this.log({
+        level: "trace",
+        message,
+        timestamp: Date.now(),
+        context: this.mergeContext(context),
+      });
     }
   }
 
   debug(message: string, context?: Record<string, unknown>): void {
     if (this.isLevelEnabled("debug")) {
-      this.log({ level: "debug", message, timestamp: Date.now(), context: this.mergeContext(context) });
+      this.log({
+        level: "debug",
+        message,
+        timestamp: Date.now(),
+        context: this.mergeContext(context),
+      });
     }
   }
 
   info(message: string, context?: Record<string, unknown>): void {
     if (this.isLevelEnabled("info")) {
-      this.log({ level: "info", message, timestamp: Date.now(), context: this.mergeContext(context) });
+      this.log({
+        level: "info",
+        message,
+        timestamp: Date.now(),
+        context: this.mergeContext(context),
+      });
     }
   }
 
   warn(message: string, context?: Record<string, unknown>): void {
     if (this.isLevelEnabled("warn")) {
-      this.log({ level: "warn", message, timestamp: Date.now(), context: this.mergeContext(context) });
+      this.log({
+        level: "warn",
+        message,
+        timestamp: Date.now(),
+        context: this.mergeContext(context),
+      });
     }
   }
 
   error(message: string, context?: Record<string, unknown>): void {
     if (this.isLevelEnabled("error")) {
-      this.log({ level: "error", message, timestamp: Date.now(), context: this.mergeContext(context) });
+      this.log({
+        level: "error",
+        message,
+        timestamp: Date.now(),
+        context: this.mergeContext(context),
+      });
     }
   }
 
   fatal(message: string, context?: Record<string, unknown>): void {
     if (this.isLevelEnabled("fatal")) {
-      this.log({ level: "fatal", message, timestamp: Date.now(), context: this.mergeContext(context) });
+      this.log({
+        level: "fatal",
+        message,
+        timestamp: Date.now(),
+        context: this.mergeContext(context),
+      });
     }
   }
 
@@ -214,7 +244,10 @@ export abstract class BaseLogger implements Logger {
 
   child(context: Record<string, unknown>): Logger {
     // Create a new instance with merged context
-    const ChildLoggerClass = this.constructor as new (level: LogLevel, ctx: Record<string, unknown>) => this;
+    const ChildLoggerClass = this.constructor as new (
+      level: LogLevel,
+      ctx: Record<string, unknown>
+    ) => this;
     return new ChildLoggerClass(this.level, { ...this.baseContext, ...context });
   }
 
@@ -266,12 +299,14 @@ export class ConsoleLogger extends BaseLogger {
   private json: boolean;
   private component?: string;
 
-  constructor(options: {
-    level?: LogLevel;
-    json?: boolean;
-    component?: string;
-    baseContext?: Record<string, unknown>;
-  } = {}) {
+  constructor(
+    options: {
+      level?: LogLevel;
+      json?: boolean;
+      component?: string;
+      baseContext?: Record<string, unknown>;
+    } = {}
+  ) {
     super(options.level ?? "info", options.baseContext ?? {});
     this.json = options.json ?? false;
     this.component = options.component;

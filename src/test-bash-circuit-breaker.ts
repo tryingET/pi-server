@@ -3,10 +3,7 @@
  */
 
 import assert from "assert";
-import {
-  BashCircuitBreaker,
-  DEFAULT_BASH_CIRCUIT_CONFIG,
-} from "./bash-circuit-breaker.js";
+import { BashCircuitBreaker, DEFAULT_BASH_CIRCUIT_CONFIG } from "./bash-circuit-breaker.js";
 
 let testsPassed = 0;
 let testsFailed = 0;

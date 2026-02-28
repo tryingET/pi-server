@@ -14,11 +14,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { PiSessionManager } from "./session-manager.js";
 import type { RpcCommand, RpcResponse, Subscriber, RpcBroadcast } from "./types.js";
 import { getSessionId as getSessionIdFromCmd, isCreateSessionResponse } from "./types.js";
-import {
-  type AuthProvider,
-  type AuthContext,
-  AllowAllAuthProvider,
-} from "./auth.js";
+import { type AuthProvider, type AuthContext, AllowAllAuthProvider } from "./auth.js";
 import {
   MetricsEmitter,
   type MetricsSink,
@@ -30,11 +26,7 @@ import {
   type ThresholdConfig,
   type Alert,
 } from "./metrics-index.js";
-import {
-  type Logger,
-  ConsoleLogger,
-  type LogLevel,
-} from "./logger-index.js";
+import { type Logger, ConsoleLogger, type LogLevel } from "./logger-index.js";
 
 // ============================================================================
 // CONSTANTS
@@ -128,7 +120,11 @@ function sendWithBackpressure(
     ws.send(data);
     return { ok: true };
   } catch (error) {
-    return { ok: false, reason: "error", error: error instanceof Error ? error : new Error(String(error)) };
+    return {
+      ok: false,
+      reason: "error",
+      error: error instanceof Error ? error : new Error(String(error)),
+    };
   }
 }
 
@@ -303,16 +299,18 @@ export class PiServer {
     this.authProvider = options.authProvider ?? new AllowAllAuthProvider();
 
     // Setup logger
-    this.logger = options.logger ?? new ConsoleLogger({
-      level: options.logLevel ?? "info",
-      component: "pi-server",
-    });
+    this.logger =
+      options.logger ??
+      new ConsoleLogger({
+        level: options.logLevel ?? "info",
+        component: "pi-server",
+      });
 
     // Default alert thresholds for built-in monitoring
     const defaultAlertThresholds: Record<string, ThresholdConfig> = {
       [MetricNames.RATE_LIMIT_GENERATION_COUNTER]: {
-        info: 1e12,    // 1 trillion - start paying attention
-        warn: 1e14,    // 100 trillion - concerning
+        info: 1e12, // 1 trillion - start paying attention
+        warn: 1e14, // 100 trillion - concerning
         critical: 1e15, // 1 quadrillion - action needed
       },
     };
@@ -335,14 +333,16 @@ export class PiServer {
 
     // Wrap with ThresholdAlertSink for monitoring
     const alertThresholds = options.alertThresholds ?? defaultAlertThresholds;
-    const onAlert = options.onAlert ?? ((alert: Alert) => {
-      const levelStr = `[${alert.level.toUpperCase()}]`;
-      if (alert.level === "critical") {
-        console.error(`${levelStr} ${alert.message}`);
-      } else {
-        console.log(`${levelStr} ${alert.message}`);
-      }
-    });
+    const onAlert =
+      options.onAlert ??
+      ((alert: Alert) => {
+        const levelStr = `[${alert.level.toUpperCase()}]`;
+        if (alert.level === "critical") {
+          console.error(`${levelStr} ${alert.message}`);
+        } else {
+          console.log(`${levelStr} ${alert.message}`);
+        }
+      });
 
     const alertSink = new ThresholdAlertSink({
       sink: baseSink,
@@ -485,7 +485,10 @@ export class PiServer {
       try {
         await Promise.resolve(this.authProvider.dispose());
       } catch (error) {
-        this.logger.logError("Auth provider dispose failed", error instanceof Error ? error : new Error(String(error)));
+        this.logger.logError(
+          "Auth provider dispose failed",
+          error instanceof Error ? error : new Error(String(error))
+        );
       }
     }
 
@@ -591,7 +594,10 @@ export class PiServer {
 
       // Record connection metric
       this.metrics.counter(MetricNames.CONNECTIONS_TOTAL, 1);
-      this.metrics.gauge(MetricNames.CONNECTIONS_ACTIVE, this.sessionManager.getGovernor().getConnectionCount());
+      this.metrics.gauge(
+        MetricNames.CONNECTIONS_ACTIVE,
+        this.sessionManager.getGovernor().getConnectionCount()
+      );
 
       // Initialize heartbeat state
       const heartbeatState: WebSocketConnectionState = {
@@ -631,7 +637,10 @@ export class PiServer {
         this.sessionManager.removeSubscriber(subscriber);
         this.sessionManager.getGovernor().unregisterConnection();
         // Update connection metrics
-        this.metrics.gauge(MetricNames.CONNECTIONS_ACTIVE, this.sessionManager.getGovernor().getConnectionCount());
+        this.metrics.gauge(
+          MetricNames.CONNECTIONS_ACTIVE,
+          this.sessionManager.getGovernor().getConnectionCount()
+        );
       };
 
       // Start heartbeat monitoring
@@ -726,7 +735,9 @@ export class PiServer {
           error: sizeResult.reason,
         };
         // Error responses are critical
-        sendWithStdioBackpressure(JSON.stringify(errorResponse), this.stdioState, { isCritical: true });
+        sendWithStdioBackpressure(JSON.stringify(errorResponse), this.stdioState, {
+          isCritical: true,
+        });
         return;
       }
 
@@ -734,7 +745,9 @@ export class PiServer {
         const command: RpcCommand = JSON.parse(line);
         await this.handleCommand(command, subscriber, (response: RpcResponse) => {
           // Command responses are critical
-          sendWithStdioBackpressure(JSON.stringify(response), this.stdioState, { isCritical: true });
+          sendWithStdioBackpressure(JSON.stringify(response), this.stdioState, {
+            isCritical: true,
+          });
         });
       } catch (error) {
         const errorResponse: RpcResponse = {
@@ -743,7 +756,9 @@ export class PiServer {
           success: false,
           error: error instanceof Error ? error.message : "Invalid JSON",
         };
-        sendWithStdioBackpressure(JSON.stringify(errorResponse), this.stdioState, { isCritical: true });
+        sendWithStdioBackpressure(JSON.stringify(errorResponse), this.stdioState, {
+          isCritical: true,
+        });
       }
     });
 

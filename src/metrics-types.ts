@@ -222,7 +222,12 @@ export class MemorySink implements MetricsSink {
         break;
 
       case "histogram": {
-        const hist = this.histograms.get(key) ?? { sum: 0, count: 0, min: Infinity, max: -Infinity };
+        const hist = this.histograms.get(key) ?? {
+          sum: 0,
+          count: 0,
+          min: Infinity,
+          max: -Infinity,
+        };
         const val = event.value ?? 0;
         hist.sum += val;
         hist.count++;
@@ -246,10 +251,7 @@ export class MemorySink implements MetricsSink {
       counters: Object.fromEntries(this.counters),
       gauges: Object.fromEntries(this.gauges),
       histograms: Object.fromEntries(
-        Array.from(this.histograms.entries()).map(([k, v]) => [
-          k,
-          { ...v, avg: v.sum / v.count },
-        ])
+        Array.from(this.histograms.entries()).map(([k, v]) => [k, { ...v, avg: v.sum / v.count }])
       ),
       recentEvents: this.events.slice(-100),
     };

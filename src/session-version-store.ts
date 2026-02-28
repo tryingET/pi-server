@@ -145,7 +145,11 @@ export class SessionVersionStore {
     }
 
     // Handle load_session specially
-    if (command.type === "load_session" && response.command === "load_session" && response.success) {
+    if (
+      command.type === "load_session" &&
+      response.command === "load_session" &&
+      response.success
+    ) {
       const loadedSessionId = response.data.sessionId;
       this.sessionVersions.set(loadedSessionId, 0);
       return { ...response, sessionVersion: 0 };

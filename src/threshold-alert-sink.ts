@@ -159,9 +159,7 @@ export class ThresholdAlertSink implements MetricsSink {
     // Should we fire an alert?
     const levelChanged = newLevel !== previousLevel;
     const shouldRealert =
-      newLevel !== null &&
-      state !== undefined &&
-      now - state.lastAlertTime >= realertAfterMs;
+      newLevel !== null && state !== undefined && now - state.lastAlertTime >= realertAfterMs;
 
     if (levelChanged || shouldRealert) {
       if (newLevel !== null) {
@@ -257,7 +255,10 @@ export class ThresholdAlertSink implements MetricsSink {
 
   // Pass-through methods for underlying sink
 
-  startSpan(name: string, parent?: import("./metrics-types.js").Span): import("./metrics-types.js").Span | undefined {
+  startSpan(
+    name: string,
+    parent?: import("./metrics-types.js").Span
+  ): import("./metrics-types.js").Span | undefined {
     return this.sink.startSpan?.(name, parent);
   }
 
@@ -328,7 +329,8 @@ export function consoleAlertHandler(alert: Alert): void {
  */
 export function createSlackAlertHandler(webhookUrl: string): (alert: Alert) => Promise<void> {
   return async (alert: Alert) => {
-    const color = alert.level === "critical" ? "danger" : alert.level === "warn" ? "warning" : "#439FE0";
+    const color =
+      alert.level === "critical" ? "danger" : alert.level === "warn" ? "warning" : "#439FE0";
     const emoji = alert.level === "critical" ? "🚨" : alert.level === "warn" ? "⚠️" : "ℹ️";
 
     const payload = {

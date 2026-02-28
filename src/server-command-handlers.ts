@@ -192,7 +192,7 @@ const handleGetMetrics: ServerCommandHandler = (_command, context) => {
   // Add memory sink metrics if available (ADR-0016)
   if (context.getMemoryMetrics && response.success) {
     const memoryMetrics = context.getMemoryMetrics();
-    if (memoryMetrics && 'data' in response && response.data) {
+    if (memoryMetrics && "data" in response && response.data) {
       (response.data as Record<string, unknown>).metrics = memoryMetrics;
     }
   }

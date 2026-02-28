@@ -24,9 +24,7 @@ import type { IncomingMessage } from "http";
 /**
  * Authentication result returned by AuthProvider.
  */
-export type AuthResult =
-  | { allowed: true; identity?: string }
-  | { allowed: false; reason: string };
+export type AuthResult = { allowed: true; identity?: string } | { allowed: false; reason: string };
 
 /**
  * Context information available to auth providers.

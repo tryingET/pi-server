@@ -506,8 +506,9 @@ export class ResourceGovernor {
 
     const sessionCount =
       this.commandTimestamps.get(sessionId)?.filter((e) => e.timestamp > windowStart).length ?? 0;
-    const globalCount = this.globalCommandTimestamps.filter((e) => e.timestamp > windowStart)
-      .length;
+    const globalCount = this.globalCommandTimestamps.filter(
+      (e) => e.timestamp > windowStart
+    ).length;
 
     return {
       session: sessionCount,
@@ -622,8 +623,9 @@ export class ResourceGovernor {
   getMetrics(): GovernorMetrics {
     const now = Date.now();
     const windowStart = now - RATE_WINDOW_MS;
-    const globalCount = this.globalCommandTimestamps.filter((e) => e.timestamp > windowStart)
-      .length;
+    const globalCount = this.globalCommandTimestamps.filter(
+      (e) => e.timestamp > windowStart
+    ).length;
 
     return {
       sessionCount: this.sessionCount,
