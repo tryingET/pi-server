@@ -14,6 +14,9 @@ const DEFAULT_LOCK_TIMEOUT_MS = 5000;
 /** Maximum time to hold a lock before warning (30 seconds). */
 const LOCK_HOLD_WARNING_MS = 30000;
 
+/** Maximum number of waiters per session lock (prevents memory exhaustion). */
+const DEFAULT_MAX_QUEUE_SIZE = 100;
+
 /**
  * A lock handle that must be released after use.
  * Implements RAII pattern via explicit release().
@@ -40,6 +43,8 @@ interface LockState {
 export interface SessionLockManagerOptions {
   /** Timeout for lock acquisition (default: 5000ms). */
   lockTimeoutMs?: number;
+  /** Maximum waiters per session lock (default: 100). Prevents memory exhaustion. */
+  maxQueueSize?: number;
   /** Enable debug logging for lock operations. */
   debug?: boolean;
 }
@@ -54,6 +59,8 @@ export interface SessionLockManagerStats {
   timeoutCount: number;
   /** Number of currently waiting lock acquisitions. */
   waitingCount: number;
+  /** Number of lock acquisitions rejected due to queue full. */
+  queueFullRejections: number;
 }
 
 /**
@@ -81,8 +88,10 @@ export class SessionLockManager {
     Array<{ resolve: (handle: SessionLockHandle) => void; reject: (error: Error) => void }>
   >();
   private timeoutCount = 0;
+  private queueFullRejections = 0;
 
   private readonly lockTimeoutMs: number;
+  private readonly maxQueueSize: number;
   private readonly debug: boolean;
 
   constructor(options: SessionLockManagerOptions = {}) {
@@ -90,6 +99,10 @@ export class SessionLockManager {
       typeof options.lockTimeoutMs === "number" && options.lockTimeoutMs > 0
         ? options.lockTimeoutMs
         : DEFAULT_LOCK_TIMEOUT_MS;
+    this.maxQueueSize =
+      typeof options.maxQueueSize === "number" && options.maxQueueSize > 0
+        ? options.maxQueueSize
+        : DEFAULT_MAX_QUEUE_SIZE;
     this.debug = options.debug ?? false;
   }
 
@@ -141,6 +154,7 @@ export class SessionLockManager {
       activeLocks: this.locks.size,
       timeoutCount: this.timeoutCount,
       waitingCount,
+      queueFullRejections: this.queueFullRejections,
     };
   }
 
@@ -159,6 +173,7 @@ export class SessionLockManager {
     this.waitingQueues.clear();
     this.locks.clear();
     this.timeoutCount = 0;
+    this.queueFullRejections = 0;
   }
 
   // ===========================================================================
@@ -237,6 +252,14 @@ export class SessionLockManager {
     if (!queue) {
       queue = [];
       this.waitingQueues.set(sessionId, queue);
+    }
+
+    // Check queue size limit to prevent memory exhaustion
+    if (queue.length >= this.maxQueueSize) {
+      this.queueFullRejections++;
+      throw new Error(
+        `Lock queue full for session ${sessionId} (max ${this.maxQueueSize} waiters)`
+      );
     }
 
     this.log(`Queued for lock on ${sessionId}`, holder);

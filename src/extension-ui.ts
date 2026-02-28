@@ -164,6 +164,11 @@ export class ExtensionUIManager {
         reject(new Error(`Extension UI request ${requestId} timed out after ${timeoutMs}ms`));
       }, timeoutMs);
 
+      // Don't prevent process exit if waiting for UI response
+      if (timeout.unref) {
+        timeout.unref();
+      }
+
       this.pendingRequests.set(requestId, {
         sessionId,
         requestId,

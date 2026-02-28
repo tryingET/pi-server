@@ -424,8 +424,17 @@ export class SessionStore {
     } finally {
       // Always close readline interface first, then destroy the stream
       // This prevents resource leaks if the for-await loop throws
-      rl?.close();
-      fileStream.destroy();
+      // Use try-catch to ensure both cleanup steps run even if one fails
+      try {
+        rl?.close();
+      } catch {
+        // Ignore close errors
+      }
+      try {
+        fileStream.destroy();
+      } catch {
+        // Ignore destroy errors
+      }
     }
   }
 
@@ -585,6 +594,15 @@ export class SessionStore {
       metadataPath: this.metadataPath,
       metadataResetCount: this.metadataResetCount,
     };
+  }
+
+  /**
+   * Get metadata reset count (synchronous, for metrics).
+   * This tracks how many times the metadata file was reset due to being
+   * oversized or corrupt, indicating potential disk/filesystem issues.
+   */
+  getMetadataResetCount(): number {
+    return this.metadataResetCount;
   }
 
   // ==========================================================================
