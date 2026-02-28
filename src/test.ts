@@ -868,9 +868,17 @@ async function testResourceGovernor() {
 
   await test("governor: tracks double-unregister errors", () => {
     const governor = new ResourceGovernor();
-    governor.registerConnection();
-    governor.unregisterConnection();
-    governor.unregisterConnection(); // double-unregister
+
+    // Suppress expected error log for this intentional double-unregister test.
+    const originalError = console.error;
+    console.error = () => {};
+    try {
+      governor.registerConnection();
+      governor.unregisterConnection();
+      governor.unregisterConnection(); // intentional double-unregister
+    } finally {
+      console.error = originalError;
+    }
 
     const metrics = governor.getMetrics();
     assert.strictEqual(metrics.doubleUnregisterErrors, 1);
