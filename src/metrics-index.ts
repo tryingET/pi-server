@@ -39,6 +39,19 @@ export {
   CompositeSink,
 } from "./metrics-types.js";
 
+// Alerting
+export {
+  ThresholdAlertSink,
+  consoleAlertHandler,
+  createSlackAlertHandler,
+} from "./threshold-alert-sink.js";
+export type {
+  Alert,
+  AlertLevel,
+  ThresholdConfig,
+  ThresholdAlertSinkConfig,
+} from "./threshold-alert-sink.js";
+
 // Emitter
 export {
   MetricsEmitter,

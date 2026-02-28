@@ -11,6 +11,9 @@
  * Makes testing trivial (mock the governor).
  */
 
+import type { MetricsEmitter } from "./metrics-emitter.js";
+import { MetricNames } from "./metrics-types.js";
+
 // ============================================================================
 // CONFIG
 // ============================================================================
@@ -164,7 +167,25 @@ export class ResourceGovernor {
   /** Periodic cleanup timer for stale timestamps */
   private cleanupTimer: NodeJS.Timeout | null = null;
 
-  constructor(private config: ResourceGovernorConfig = DEFAULT_CONFIG) {}
+  constructor(
+    private config: ResourceGovernorConfig = DEFAULT_CONFIG,
+    private metrics?: MetricsEmitter
+  ) {}
+
+  /**
+   * Increment generation counter and emit metric.
+   * Used for unique rate limit entry IDs and overflow monitoring.
+   */
+  private nextGeneration(): number {
+    const generation = ++this.generationCounter;
+
+    // Emit metric for threshold alerting (e.g., overflow at 1e15)
+    if (this.metrics && generation % 1000 === 0) {
+      this.metrics.gauge(MetricNames.RATE_LIMIT_GENERATION_COUNTER, generation);
+    }
+
+    return generation;
+  }
 
   // ==========================================================================
   // CONFIG ACCESS
@@ -427,7 +448,7 @@ export class ResourceGovernor {
     }
 
     // Record this command with unique generation marker
-    const generation = ++this.generationCounter;
+    const generation = this.nextGeneration();
     const entry: RateLimitEntry = { timestamp: now, generation };
     entries.push(entry);
     this.globalCommandTimestamps.push(entry);
@@ -516,7 +537,7 @@ export class ResourceGovernor {
     }
 
     // Record this response with generation marker
-    const generation = ++this.generationCounter;
+    const generation = this.nextGeneration();
     entries.push({ timestamp: now, generation });
     return { allowed: true };
   }

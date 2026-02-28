@@ -409,6 +409,7 @@ export const MetricNames = {
 
   // Rate limiting
   RATE_LIMIT_REJECTED_TOTAL: "pi_server_rate_limit_rejected_total",
+  RATE_LIMIT_GENERATION_COUNTER: "pi_server_rate_limit_generation_counter",
 
   // Extension UI
   EXTENSION_UI_PENDING: "pi_server_extension_ui_pending",
