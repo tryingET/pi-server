@@ -173,6 +173,14 @@ export class ResourceGovernor {
   ) {}
 
   /**
+   * Set the metrics emitter for monitoring.
+   * Can be called after construction to wire up metrics.
+   */
+  setMetrics(metrics: MetricsEmitter): void {
+    this.metrics = metrics;
+  }
+
+  /**
    * Increment generation counter and emit metric.
    * Used for unique rate limit entry IDs and overflow monitoring.
    */

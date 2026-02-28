@@ -26,6 +26,9 @@ import {
   MemorySink,
   CompositeSink,
   MetricNames,
+  ThresholdAlertSink,
+  type ThresholdConfig,
+  type Alert,
 } from "./metrics-index.js";
 import {
   type Logger,
@@ -271,6 +274,12 @@ export interface PiServerOptions {
   logger?: Logger;
   /** Log level for default ConsoleLogger (ignored if logger is provided) */
   logLevel?: LogLevel;
+  /** Alert thresholds for automatic monitoring (default: built-in thresholds) */
+  alertThresholds?: Record<string, ThresholdConfig>;
+  /** Called when an alert fires (default: console logging) */
+  onAlert?: (alert: Alert) => void | Promise<void>;
+  /** Called when an alert clears (optional) */
+  onAlertClear?: (alert: Alert) => void | Promise<void>;
 }
 
 export class PiServer {
@@ -299,6 +308,15 @@ export class PiServer {
       component: "pi-server",
     });
 
+    // Default alert thresholds for built-in monitoring
+    const defaultAlertThresholds: Record<string, ThresholdConfig> = {
+      [MetricNames.RATE_LIMIT_GENERATION_COUNTER]: {
+        info: 1e12,    // 1 trillion - start paying attention
+        warn: 1e14,    // 100 trillion - concerning
+        critical: 1e15, // 1 quadrillion - action needed
+      },
+    };
+
     // Setup metrics system
     const includeMemory = options.includeMemoryMetrics ?? true;
     const sinks: MetricsSink[] = [];
@@ -312,10 +330,32 @@ export class PiServer {
       sinks.push(this.memorySink);
     }
 
-    // Create emitter with composite sink (or no-op if no sinks)
-    this.metrics = new MetricsEmitter({
-      sink: sinks.length > 0 ? new CompositeSink(sinks) : new NoOpSink(),
+    // Create base composite sink (or no-op if no sinks)
+    const baseSink = sinks.length > 0 ? new CompositeSink(sinks) : new NoOpSink();
+
+    // Wrap with ThresholdAlertSink for monitoring
+    const alertThresholds = options.alertThresholds ?? defaultAlertThresholds;
+    const onAlert = options.onAlert ?? ((alert: Alert) => {
+      const levelStr = `[${alert.level.toUpperCase()}]`;
+      if (alert.level === "critical") {
+        console.error(`${levelStr} ${alert.message}`);
+      } else {
+        console.log(`${levelStr} ${alert.message}`);
+      }
     });
+
+    const alertSink = new ThresholdAlertSink({
+      sink: baseSink,
+      thresholds: alertThresholds,
+      onAlert,
+      onClear: options.onAlertClear,
+      maxAlertStates: 1000,
+    });
+
+    this.metrics = new MetricsEmitter({ sink: alertSink });
+
+    // Wire metrics to governor for rate limit monitoring
+    this.sessionManager.getGovernor().setMetrics(this.metrics);
 
     // Wire memory metrics provider to session manager
     if (this.memorySink) {
