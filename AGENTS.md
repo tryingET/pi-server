@@ -561,7 +561,8 @@ cat /tmp/test.jsonl | timeout 5 node dist/server.js | jq .
 | ~~Pong timeout race condition~~ | server.ts | **FIXED** - `cleanedUp` flag prevents use-after-free |
 | ~~SessionStore temp file collision~~ | session-store.ts | **FIXED** - PID + UUID suffix for temp files |
 | ~~ReadStream leak on parse error~~ | session-store.ts | **FIXED** - try/finally ensures stream destruction |
-| ~~No max session lifetime~~ | resource-governor.ts | **FIXED** - `maxSessionLifetimeMs` config added (default: 24h) |
+| ~~No max session lifetime~~ | resource-governor.ts | **FIXED** - `maxSessionLifetimeMs` config + periodic enforcement |
+| ~~Readline interface leak on stream error~~ | session-store.ts | **FIXED** - `rl?.close()` in finally block |
 
 ---
 
@@ -841,3 +842,37 @@ const request = extensionUI.createPendingRequest(...);
 ```
 
 **Applied to:** ExtensionUIManager (extension-ui.ts)
+
+### Pattern: Readline Interface Cleanup Before Stream Destruction
+
+**Problem:** If a `for await` loop over a readline interface throws, the interface is never closed, leaking resources.
+
+**Solution:** Track the readline interface in a variable and close it in the finally block before destroying the stream.
+
+```typescript
+// WRONG: rl.close() skipped on stream error
+try {
+  const rl = readline.createInterface({ input: fileStream });
+  for await (const line of rl) {
+    // If this throws, rl.close() is never called
+    break;
+  }
+  rl.close();
+} finally {
+  fileStream.destroy();
+}
+
+// RIGHT: Always close readline in finally
+let rl: ReturnType<typeof readline.createInterface> | undefined;
+try {
+  rl = readline.createInterface({ input: fileStream });
+  for await (const line of rl) {
+    break;
+  }
+} finally {
+  rl?.close();  // Safe even if rl was never created
+  fileStream.destroy();
+}
+```
+
+**Applied to:** readSessionFileMetadata (session-store.ts) - Deep Review 2026-02-22
