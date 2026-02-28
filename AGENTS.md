@@ -563,6 +563,7 @@ cat /tmp/test.jsonl | timeout 5 node dist/server.js | jq .
 | ~~ReadStream leak on parse error~~ | session-store.ts | **FIXED** - try/finally ensures stream destruction |
 | ~~No max session lifetime~~ | resource-governor.ts | **FIXED** - `maxSessionLifetimeMs` config + periodic enforcement |
 | ~~Readline interface leak on stream error~~ | session-store.ts | **FIXED** - `rl?.close()` in finally block |
+| ~~Type guards in types.ts~~ | types.ts | **FIXED** - extracted to type-guards.ts with re-exports |
 
 ---
 
@@ -576,7 +577,6 @@ cat /tmp/test.jsonl | timeout 5 node dist/server.js | jq .
 | Structured logging | Requires logger selection (pino? winston?) + format standard | @tryingET | When log aggregation needed | When deployed at scale | Logs not aggregatable |
 | Refactor session-manager.ts | God object (700+ lines) - high risk of breaking changes | @tryingET | When adding major new feature | Before v2.0.0 | Technical debt compounds |
 | BoundedMap utility | Multiple maps need same cleanup pattern | @tryingET | When third map with same pattern added | Low priority | Code duplication |
-| Type guards to separate file | Minor smell, low impact | @tryingET | When types.ts exceeds 500 lines | Low priority | File organization |
 | Dependency cycle detection | Cross-lane cycles could deadlock but extremely unlikely (requires explicit IDs + simultaneous in-flight + mutual reference) | @tryingET | If deadlock observed in production | Low priority | Theoretical deadlock |
 | Stdio backpressure | stdout.write can block but rare in practice | @tryingET | If server freezes on output | Low priority | Server freeze on fast events |
 
