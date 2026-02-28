@@ -206,6 +206,16 @@ export type ServerResponse =
         };
         /** Circuit breaker metrics per provider (ADR-0010) */
         circuitBreakers: CircuitBreakerMetrics[];
+        /** Bash circuit breaker metrics */
+        bashCircuitBreaker: {
+          enabled: boolean;
+          globalState: string;
+          sessionCount: number;
+          openSessionCount: number;
+          totalCalls: number;
+          totalTimeouts: number;
+          totalRejected: number;
+        };
         /** Metrics system data (ADR-0016) - optional, only if MemorySink is enabled */
         metrics?: Record<string, unknown>;
       };
@@ -218,6 +228,8 @@ export type ServerResponse =
         issues: string[];
         /** Whether any LLM provider circuit is open (ADR-0010) */
         hasOpenCircuit: boolean;
+        /** Whether bash command circuit is open */
+        hasOpenBashCircuit: boolean;
       };
     })
   // ADR-0007: Session persistence

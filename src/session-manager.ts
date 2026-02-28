@@ -39,6 +39,7 @@ import { routeSessionCommand } from "./command-router.js";
 import {
   routeServerCommand,
   executeLLMCommand,
+  executeBashCommand,
   type ServerCommandContext,
 } from "./server-command-handlers.js";
 import { ExtensionUIManager } from "./extension-ui.js";
@@ -55,6 +56,10 @@ import { CommandExecutionEngine } from "./command-execution-engine.js";
 import { SessionLockManager } from "./session-lock-manager.js";
 import { SessionStore, type StoredSessionInfo } from "./session-store.js";
 import { CircuitBreakerManager, type CircuitBreakerConfig } from "./circuit-breaker.js";
+import {
+  BashCircuitBreaker,
+  type BashCircuitBreakerConfig,
+} from "./bash-circuit-breaker.js";
 
 /** Default timeout for session commands (5 minutes for LLM operations) */
 const DEFAULT_COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
@@ -77,6 +82,8 @@ export interface SessionManagerRuntimeOptions {
   serverVersion?: string;
   /** Circuit breaker configuration (optional, uses defaults if not provided) */
   circuitBreakerConfig?: Partial<Omit<CircuitBreakerConfig, "providerName">>;
+  /** Bash circuit breaker configuration (optional, uses defaults if not provided) */
+  bashCircuitBreakerConfig?: Partial<BashCircuitBreakerConfig>;
 }
 
 export class PiSessionManager implements SessionResolver {
@@ -98,6 +105,8 @@ export class PiSessionManager implements SessionResolver {
   private sessionStore: SessionStore;
   /** Circuit breaker for LLM providers (ADR-0010). */
   private circuitBreakers: CircuitBreakerManager;
+  /** Circuit breaker for bash commands. */
+  private bashCircuitBreaker: BashCircuitBreaker;
 
   // Shutdown state (single source of truth - server.ts delegates to this)
   private isShuttingDown = false;
@@ -152,6 +161,7 @@ export class PiSessionManager implements SessionResolver {
       serverVersion: options.serverVersion,
     });
     this.circuitBreakers = new CircuitBreakerManager(options.circuitBreakerConfig);
+    this.bashCircuitBreaker = new BashCircuitBreaker(options.bashCircuitBreakerConfig);
   }
 
   /**
@@ -166,6 +176,13 @@ export class PiSessionManager implements SessionResolver {
    */
   getCircuitBreakers(): CircuitBreakerManager {
     return this.circuitBreakers;
+  }
+
+  /**
+   * Get the bash circuit breaker for external access.
+   */
+  getBashCircuitBreaker(): BashCircuitBreaker {
+    return this.bashCircuitBreaker;
   }
 
   // ==========================================================================
@@ -698,6 +715,12 @@ export class PiSessionManager implements SessionResolver {
     if (staleBreakersRemoved > 0) {
       console.error(`[SessionManager] Cleaned up ${staleBreakersRemoved} stale circuit breakers`);
     }
+
+    // Clean up stale bash circuit breakers
+    const staleBashBreakersRemoved = this.bashCircuitBreaker.cleanupStale();
+    if (staleBashBreakersRemoved > 0) {
+      console.error(`[SessionManager] Cleaned up ${staleBashBreakersRemoved} stale bash circuit breakers`);
+    }
   }
 
   // ==========================================================================
@@ -820,6 +843,14 @@ export class PiSessionManager implements SessionResolver {
           };
         },
       }),
+      getBashCircuitBreaker: () => ({
+        canExecute: (sessionId: string) => this.bashCircuitBreaker.canExecute(sessionId),
+        recordSuccess: (sessionId: string) => this.bashCircuitBreaker.recordSuccess(sessionId),
+        recordTimeout: (sessionId: string) => this.bashCircuitBreaker.recordTimeout(sessionId),
+        recordSpawnError: (sessionId: string) => this.bashCircuitBreaker.recordSpawnError(sessionId),
+        hasOpenCircuit: () => this.bashCircuitBreaker.hasOpenCircuit(),
+        getMetrics: () => this.bashCircuitBreaker.getMetrics(),
+      }),
       getDefaultCommandTimeoutMs: () => this.defaultCommandTimeoutMs,
     };
   }
@@ -835,6 +866,7 @@ export class PiSessionManager implements SessionResolver {
     const lockStats = this.lockManager.getStats();
     const extensionUIStats = this.extensionUI.getStats();
     const circuitBreakerMetrics = this.circuitBreakers.getAllMetrics();
+    const bashCircuitBreakerMetrics = this.bashCircuitBreaker.getMetrics();
     const sessionStoreStats = {
       metadataResetCount: this.sessionStore.getMetadataResetCount(),
     };
@@ -853,6 +885,7 @@ export class PiSessionManager implements SessionResolver {
           sessionStore: sessionStoreStats,
         },
         circuitBreakers: circuitBreakerMetrics,
+        bashCircuitBreaker: bashCircuitBreakerMetrics,
       },
     };
   }
@@ -863,6 +896,16 @@ export class PiSessionManager implements SessionResolver {
   private buildHealthResponse(): RpcResponse {
     const health = this.governor.isHealthy();
     const hasOpenCircuit = this.circuitBreakers.hasOpenCircuit();
+    const hasOpenBashCircuit = this.bashCircuitBreaker.hasOpenCircuit();
+
+    const issues = [...health.issues];
+    if (hasOpenCircuit) {
+      issues.push("One or more LLM provider circuits are open");
+    }
+    if (hasOpenBashCircuit) {
+      issues.push("Bash command circuit breaker is open");
+    }
+
     return {
       type: "response",
       command: "health_check",
@@ -870,9 +913,8 @@ export class PiSessionManager implements SessionResolver {
       data: {
         ...health,
         hasOpenCircuit,
-        issues: hasOpenCircuit
-          ? [...health.issues, "One or more LLM provider circuits are open"]
-          : health.issues,
+        hasOpenBashCircuit,
+        issues,
       },
     };
   }
@@ -1219,7 +1261,16 @@ export class PiSessionManager implements SessionResolver {
         return llmResponse;
       }
 
-      // Non-LLM session commands: route without circuit breaker
+      // Bash circuit breaker protection
+      const bashResponse = await executeBashCommand(command, session, context);
+      if (bashResponse !== undefined) {
+        if (!bashResponse.success) {
+          return { ...bashResponse, id };
+        }
+        return bashResponse;
+      }
+
+      // Other session commands: route without circuit breaker
       const routed = routeSessionCommand(session, command, (sid) => this.getSessionInfo(sid));
       if (routed === undefined) {
         return failResponse(`Unknown command type: ${commandType}`);

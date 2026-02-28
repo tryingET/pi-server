@@ -71,6 +71,23 @@ export interface ServerCommandContext {
       recordFailure: (type: "timeout" | "error") => void;
     };
   };
+  /** Get bash circuit breaker */
+  getBashCircuitBreaker: () => {
+    canExecute: (sessionId: string) => { allowed: boolean; reason?: string };
+    recordSuccess: (sessionId: string) => void;
+    recordTimeout: (sessionId: string) => void;
+    recordSpawnError: (sessionId: string) => void;
+    hasOpenCircuit: () => boolean;
+    getMetrics: () => {
+      enabled: boolean;
+      globalState: string;
+      sessionCount: number;
+      openSessionCount: number;
+      totalCalls: number;
+      totalTimeouts: number;
+      totalRejected: number;
+    };
+  };
   /** Get default command timeout in ms */
   getDefaultCommandTimeoutMs: () => number;
 }
@@ -282,6 +299,83 @@ export async function executeLLMCommand(
       breaker.recordFailure("timeout");
     } else {
       breaker.recordFailure("error");
+    }
+    throw error;
+  }
+}
+
+// =============================================================================
+// BASH COMMAND EXECUTION HELPER
+// =============================================================================
+
+/**
+ * Execute a bash command with circuit breaker protection.
+ * Returns undefined if not a bash command (caller should route normally).
+ *
+ * Design: docs/design-bash-circuit-breaker.md
+ *
+ * Key difference from LLM circuit breaker:
+ * - Only TIMEOUT counts as failure (non-zero exit codes are often legitimate)
+ * - Hybrid protection: per-session + global circuit breakers
+ */
+export async function executeBashCommand(
+  command: any,
+  session: AgentSession,
+  context: ServerCommandContext
+): Promise<RpcResponse | undefined> {
+  const commandType = command.type;
+  const sessionId = command.sessionId;
+
+  // Not a bash command - let normal routing handle it
+  if (commandType !== "bash") {
+    return undefined;
+  }
+
+  const bashBreaker = context.getBashCircuitBreaker();
+  const breakerCheck = bashBreaker.canExecute(sessionId);
+
+  if (!breakerCheck.allowed) {
+    return {
+      id: command.id,
+      type: "response" as const,
+      command: commandType,
+      success: false,
+      error: breakerCheck.reason ?? "Bash circuit breaker open",
+    };
+  }
+
+  try {
+    const routed = context.routeSessionCommand(session, command, context.getSessionInfo);
+    if (routed === undefined) {
+      return undefined;
+    }
+
+    const response = await Promise.resolve(routed);
+
+    // Determine if this was a timeout
+    // Only TIMEOUT counts as failure - non-zero exit codes are legitimate
+    if (response.success) {
+      bashBreaker.recordSuccess(sessionId);
+    } else {
+      const errorMsg = (response.error ?? "").toLowerCase();
+      if (errorMsg.includes("timeout") || errorMsg.includes("timed out")) {
+        bashBreaker.recordTimeout(sessionId);
+      } else {
+        // Non-timeout error (e.g., exit code != 0) - record success
+        // The command executed, just didn't succeed
+        bashBreaker.recordSuccess(sessionId);
+      }
+    }
+
+    return response;
+  } catch (error) {
+    // Exception during execution - check if timeout
+    const errorMsg = error instanceof Error ? error.message.toLowerCase() : "";
+    if (errorMsg.includes("timeout") || errorMsg.includes("timed out")) {
+      bashBreaker.recordTimeout(sessionId);
+    } else {
+      // Spawn error or other - treat as error (not timeout)
+      bashBreaker.recordSpawnError(sessionId);
     }
     throw error;
   }
