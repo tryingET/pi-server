@@ -10,6 +10,9 @@
  */
 
 import assert from "assert";
+import { spawn } from "child_process";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 
 // =============================================================================
 // TEST UTILITIES
@@ -888,12 +891,21 @@ async function testExtensionUI() {
     const request = ui.createPendingRequest("s1", "input", { timeout: 50 });
     assert(request !== null, "createPendingRequest should not return null under normal conditions");
 
-    await assert.rejects(request.promise, (error: Error) => {
-      const elapsed = Date.now() - start;
-      assert(elapsed < 300, `Expected timeout near request timeout, got ${elapsed}ms`);
-      assert(error.message.includes("50ms"), "Error should report request-scoped timeout");
-      return true;
-    });
+    // ExtensionUIManager uses unref() on timeout timers; keep event loop alive long
+    // enough for the rejection to fire, otherwise Node may exit early in tests.
+    const rejection = request.promise.then(
+      () => {
+        throw new Error("Expected request to time out");
+      },
+      (error) => error as Error
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    const error = await rejection;
+    const elapsed = Date.now() - start;
+    assert(elapsed < 500, `Expected timeout near request timeout, got ${elapsed}ms`);
+    assert(error.message.includes("50ms"), "Error should report request-scoped timeout");
   });
 
   await test("extension-ui: rejects when pending limit reached", async () => {
@@ -1518,6 +1530,26 @@ async function testSessionManager() {
 // RUN ALL TESTS
 // =============================================================================
 
+async function runExternalTestScript(scriptName: string): Promise<void> {
+  const currentDir = dirname(fileURLToPath(import.meta.url));
+  const scriptPath = join(currentDir, scriptName);
+
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(process.execPath, ["--experimental-vm-modules", scriptPath], {
+      stdio: "inherit",
+    });
+
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`${scriptName} exited with code ${code ?? "unknown"}`));
+      }
+    });
+  });
+}
+
 async function main() {
   console.log("🧪 pi-server Tests\n");
 
@@ -1526,6 +1558,11 @@ async function main() {
   await testResourceGovernor();
   await testExtensionUI();
   await testSessionManager();
+
+  // Run standalone suite for bash circuit breaker
+  await test("bash-circuit-breaker: standalone suite", async () => {
+    await runExternalTestScript("test-bash-circuit-breaker.js");
+  });
 
   console.log("\n" + "=".repeat(50));
   console.log(`Results: ${testsPassed} passed, ${testsFailed} failed`);
