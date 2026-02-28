@@ -135,6 +135,10 @@ export class CircuitBreaker {
    * Record a successful call.
    * Note: Slow calls are tracked separately and contribute to failure count,
    * but do NOT increment totalFailures (to avoid double-counting).
+   *
+   * ADR-0015: Slow calls in half-open state are treated as failures to prevent
+   * the circuit from getting stuck. If a test call in half-open is slow, we
+   * reopen the circuit rather than consuming halfOpenCalls without progress.
    */
   recordSuccess(latencyMs: number): void {
     this.totalSuccesses++;
@@ -150,7 +154,14 @@ export class CircuitBreaker {
       });
       this.pruneFailures();
 
-      // Check if slow calls should open the circuit
+      // ADR-0015: In half-open state, slow calls reopen the circuit
+      // This prevents getting stuck when test calls are slow but "succeed"
+      if (this.state === "half_open") {
+        this.transitionTo("open");
+        return;
+      }
+
+      // Check if slow calls should open the circuit (in closed state)
       if (this.state === "closed" && this.failures.length >= this.config.failureThreshold) {
         this.transitionTo("open");
       }

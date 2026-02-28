@@ -99,6 +99,9 @@ const TIMESTAMP_CLEANUP_THRESHOLD = 10000;
 /** Rate limit window in ms (1 minute) */
 const RATE_WINDOW_MS = 60000;
 
+/** Default interval for periodic timestamp cleanup (5 minutes) */
+const DEFAULT_TIMESTAMP_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+
 /** Session ID max length */
 const SESSION_ID_MAX_LENGTH = 256;
 
@@ -111,6 +114,17 @@ const SESSION_ID_PATTERN = /^[a-zA-Z0-9_.-]+$/;
 /** Dangerous path patterns */
 const DANGEROUS_PATH_PATTERNS = [/\.\./, /^~/];
 
+/**
+ * Rate limit timestamp with generation marker.
+ * The generation ensures refundCommand removes the correct entry
+ * even when multiple commands have the same timestamp.
+ */
+interface RateLimitEntry {
+  timestamp: number;
+  /** Unique generation marker for this entry */
+  generation: number;
+}
+
 // ============================================================================
 // GOVERNOR CLASS
 // ============================================================================
@@ -119,16 +133,16 @@ const DANGEROUS_PATH_PATTERNS = [/\.\./, /^~/];
  * ResourceGovernor enforces resource limits for the server.
  *
  * Memory management:
- * - Rate limit timestamps are cleaned up when they exceed a threshold
+ * - Rate limit timestamps are cleaned up periodically via startPeriodicCleanup()
  * - Session-specific data is cleaned up when sessions are deleted
  * - Call cleanupStaleData() after deleting sessions
  */
 export class ResourceGovernor {
   private sessionCount = 0;
   private connectionCount = 0;
-  private commandTimestamps = new Map<string, number[]>();
-  private globalCommandTimestamps: number[] = [];
-  private extensionUIResponseTimestamps = new Map<string, number[]>();
+  private commandTimestamps = new Map<string, RateLimitEntry[]>();
+  private globalCommandTimestamps: RateLimitEntry[] = [];
+  private extensionUIResponseTimestamps = new Map<string, RateLimitEntry[]>();
   private lastHeartbeat = new Map<string, number>();
   private sessionCreatedAt = new Map<string, number>();
   private totalCommandsExecuted = 0;
@@ -143,6 +157,12 @@ export class ResourceGovernor {
   private zombieSessionsDetected = 0;
   private zombieSessionsCleaned = 0;
   private doubleUnregisterErrors = 0;
+
+  /** Generation counter for unique rate limit entry IDs */
+  private generationCounter = 0;
+
+  /** Periodic cleanup timer for stale timestamps */
+  private cleanupTimer: NodeJS.Timeout | null = null;
 
   constructor(private config: ResourceGovernorConfig = DEFAULT_CONFIG) {}
 
@@ -360,17 +380,23 @@ export class ResourceGovernor {
   /**
    * Check if a command can be executed for the given session.
    * Implements sliding window rate limiting (both per-session and global).
+   *
+   * @returns The generation marker for refund, or rejection result
    */
-  canExecuteCommand(sessionId: string): GovernorResult {
+  canExecuteCommand(sessionId: string): GovernorResult & { generation?: number } {
     const now = Date.now();
     const windowStart = now - RATE_WINDOW_MS;
 
     // Auto-cleanup if global timestamps exceed threshold
     if (this.globalCommandTimestamps.length > TIMESTAMP_CLEANUP_THRESHOLD) {
-      this.globalCommandTimestamps = this.globalCommandTimestamps.filter((t) => t > windowStart);
+      this.globalCommandTimestamps = this.globalCommandTimestamps.filter(
+        (e) => e.timestamp > windowStart
+      );
     } else {
       // Normal filter
-      this.globalCommandTimestamps = this.globalCommandTimestamps.filter((t) => t > windowStart);
+      this.globalCommandTimestamps = this.globalCommandTimestamps.filter(
+        (e) => e.timestamp > windowStart
+      );
     }
 
     // Check global rate limit first
@@ -383,16 +409,16 @@ export class ResourceGovernor {
     }
 
     // Check per-session rate limit
-    let timestamps = this.commandTimestamps.get(sessionId);
-    if (!timestamps) {
-      timestamps = [];
-      this.commandTimestamps.set(sessionId, timestamps);
+    let entries = this.commandTimestamps.get(sessionId);
+    if (!entries) {
+      entries = [];
+      this.commandTimestamps.set(sessionId, entries);
     } else {
-      timestamps = timestamps.filter((t) => t > windowStart);
-      this.commandTimestamps.set(sessionId, timestamps);
+      entries = entries.filter((e) => e.timestamp > windowStart);
+      this.commandTimestamps.set(sessionId, entries);
     }
 
-    if (timestamps.length >= this.config.maxCommandsPerMinute) {
+    if (entries.length >= this.config.maxCommandsPerMinute) {
       this.commandsRejected.rateLimit++;
       return {
         allowed: false,
@@ -400,29 +426,39 @@ export class ResourceGovernor {
       };
     }
 
-    // Record this command
-    timestamps.push(now);
-    this.globalCommandTimestamps.push(now);
+    // Record this command with unique generation marker
+    const generation = ++this.generationCounter;
+    const entry: RateLimitEntry = { timestamp: now, generation };
+    entries.push(entry);
+    this.globalCommandTimestamps.push(entry);
     this.totalCommandsExecuted++;
 
-    return { allowed: true };
+    return { allowed: true, generation };
   }
 
   /**
    * Refund a previously counted command (e.g. command failed before execution).
+   * Uses generation marker to ensure correct entry is removed.
    */
-  refundCommand(sessionId: string): void {
-    const sessionTimestamps = this.commandTimestamps.get(sessionId);
-    if (!sessionTimestamps || sessionTimestamps.length === 0) {
+  refundCommand(sessionId: string, generation: number): void {
+    const sessionEntries = this.commandTimestamps.get(sessionId);
+    if (!sessionEntries) {
       return;
     }
 
-    const refundedTimestamp = sessionTimestamps.pop()!;
-    if (sessionTimestamps.length === 0) {
+    // Find and remove the entry with matching generation
+    const sessionIdx = sessionEntries.findIndex((e) => e.generation === generation);
+    if (sessionIdx === -1) {
+      return; // Already removed or never existed
+    }
+
+    sessionEntries.splice(sessionIdx, 1);
+    if (sessionEntries.length === 0) {
       this.commandTimestamps.delete(sessionId);
     }
 
-    const globalIdx = this.globalCommandTimestamps.lastIndexOf(refundedTimestamp);
+    // Remove from global timestamps using generation marker
+    const globalIdx = this.globalCommandTimestamps.findIndex((e) => e.generation === generation);
     if (globalIdx !== -1) {
       this.globalCommandTimestamps.splice(globalIdx, 1);
     }
@@ -439,12 +475,13 @@ export class ResourceGovernor {
     const now = Date.now();
     const windowStart = now - RATE_WINDOW_MS;
 
-    const sessionTimestamps =
-      this.commandTimestamps.get(sessionId)?.filter((t) => t > windowStart) ?? [];
-    const globalCount = this.globalCommandTimestamps.filter((t) => t > windowStart).length;
+    const sessionCount =
+      this.commandTimestamps.get(sessionId)?.filter((e) => e.timestamp > windowStart).length ?? 0;
+    const globalCount = this.globalCommandTimestamps.filter((e) => e.timestamp > windowStart)
+      .length;
 
     return {
-      session: sessionTimestamps.length,
+      session: sessionCount,
       global: globalCount,
     };
   }
@@ -461,16 +498,16 @@ export class ResourceGovernor {
     const now = Date.now();
     const windowStart = now - RATE_WINDOW_MS;
 
-    let timestamps = this.extensionUIResponseTimestamps.get(sessionId);
-    if (!timestamps) {
-      timestamps = [];
-      this.extensionUIResponseTimestamps.set(sessionId, timestamps);
+    let entries = this.extensionUIResponseTimestamps.get(sessionId);
+    if (!entries) {
+      entries = [];
+      this.extensionUIResponseTimestamps.set(sessionId, entries);
     } else {
-      timestamps = timestamps.filter((t) => t > windowStart);
-      this.extensionUIResponseTimestamps.set(sessionId, timestamps);
+      entries = entries.filter((e) => e.timestamp > windowStart);
+      this.extensionUIResponseTimestamps.set(sessionId, entries);
     }
 
-    if (timestamps.length >= this.config.maxExtensionUIResponsePerMinute) {
+    if (entries.length >= this.config.maxExtensionUIResponsePerMinute) {
       this.commandsRejected.extensionUIResponseRateLimit++;
       return {
         allowed: false,
@@ -478,8 +515,9 @@ export class ResourceGovernor {
       };
     }
 
-    // Record this response
-    timestamps.push(now);
+    // Record this response with generation marker
+    const generation = ++this.generationCounter;
+    entries.push({ timestamp: now, generation });
     return { allowed: true };
   }
 
@@ -555,7 +593,8 @@ export class ResourceGovernor {
   getMetrics(): GovernorMetrics {
     const now = Date.now();
     const windowStart = now - RATE_WINDOW_MS;
-    const globalCount = this.globalCommandTimestamps.filter((t) => t > windowStart).length;
+    const globalCount = this.globalCommandTimestamps.filter((e) => e.timestamp > windowStart)
+      .length;
 
     return {
       sessionCount: this.sessionCount,
@@ -621,20 +660,63 @@ export class ResourceGovernor {
 
   /**
    * Clean up stale rate limit data.
+   * Also cleans extensionUIResponseTimestamps.
    */
   cleanupStaleTimestamps(): void {
     const now = Date.now();
     const windowStart = now - RATE_WINDOW_MS;
 
-    this.globalCommandTimestamps = this.globalCommandTimestamps.filter((t) => t > windowStart);
+    this.globalCommandTimestamps = this.globalCommandTimestamps.filter(
+      (e) => e.timestamp > windowStart
+    );
 
-    for (const [sessionId, timestamps] of this.commandTimestamps) {
-      const filtered = timestamps.filter((t) => t > windowStart);
+    for (const [sessionId, entries] of this.commandTimestamps) {
+      const filtered = entries.filter((e) => e.timestamp > windowStart);
       if (filtered.length === 0) {
         this.commandTimestamps.delete(sessionId);
       } else {
         this.commandTimestamps.set(sessionId, filtered);
       }
+    }
+
+    // Also clean extension UI response timestamps
+    for (const [sessionId, entries] of this.extensionUIResponseTimestamps) {
+      const filtered = entries.filter((e) => e.timestamp > windowStart);
+      if (filtered.length === 0) {
+        this.extensionUIResponseTimestamps.delete(sessionId);
+      } else {
+        this.extensionUIResponseTimestamps.set(sessionId, filtered);
+      }
+    }
+  }
+
+  /**
+   * Start periodic cleanup of stale timestamps.
+   * Call this during server startup to prevent memory leaks from inactive sessions.
+   * @param intervalMs Cleanup interval (default: 5 minutes)
+   */
+  startPeriodicCleanup(intervalMs = DEFAULT_TIMESTAMP_CLEANUP_INTERVAL_MS): void {
+    if (this.cleanupTimer) {
+      return; // Already running
+    }
+
+    this.cleanupTimer = setInterval(() => {
+      this.cleanupStaleTimestamps();
+    }, intervalMs);
+
+    // Don't prevent process exit
+    if (this.cleanupTimer.unref) {
+      this.cleanupTimer.unref();
+    }
+  }
+
+  /**
+   * Stop periodic cleanup.
+   */
+  stopPeriodicCleanup(): void {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
     }
   }
 

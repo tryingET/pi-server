@@ -220,6 +220,12 @@ export class CommandExecutionEngine {
   /**
    * Wait for dependency commands to complete.
    * Returns error if any dependency fails or times out.
+   *
+   * Note: Cross-lane dependency cycles (A→B, B→A) are detected by timeout
+   * rather than explicit cycle detection. This is acceptable because:
+   * 1. Cross-lane dependencies are rare
+   * 2. The dependencyWaitTimeoutMs (default 30s) prevents indefinite deadlock
+   * 3. Same-lane cycles are explicitly detected below
    */
   async awaitDependencies(
     dependsOn: string[],
@@ -232,6 +238,8 @@ export class CommandExecutionEngine {
 
       const inFlight = this.replayStore.getInFlight(dependencyId);
       if (inFlight) {
+        // Same-lane check: commands in the same lane execute sequentially,
+        // so waiting for a same-lane dependency would deadlock
         if (inFlight.laneKey === laneKey) {
           return {
             ok: false,
