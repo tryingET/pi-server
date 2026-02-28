@@ -17,7 +17,8 @@
     "pi-server",
     "session-multiplexer",
     "websocket",
-    "stdio"
+    "stdio",
+    "pi-package"
   ],
   "author": "tryingET",
   "main": "dist/server.js",
