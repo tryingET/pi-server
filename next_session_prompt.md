@@ -2,13 +2,14 @@
 
 **Operating mode:** Production ready  
 **Phase:** COMPLETE  
+**Version:** 1.0.0 (released)  
 **Formalization Level:** 2 (Bounded Run)
 
 ---
 
-## ATOMIC COMPLETION STATUS (2026-02-28)
+## SESSION STATUS (2026-02-28)
 
-### RESOLVED THIS PASS (Deep Review + Atomic Completion)
+### RESOLVED (Deep Review + Follow-up Stabilization)
 
 | Finding | Fix Applied | Files |
 |---|---|---|
@@ -17,8 +18,10 @@
 | `command_accepted` without `command_finished` on early rejects | Introduced unified `finalizeResponse()` and routed replay/rate-limit/busy exits through it | `src/session-manager.ts` |
 | `load_session` sessionVersion inconsistent/missing | Added explicit `load_session` handling to initialize and return `sessionVersion: 0` | `src/session-version-store.ts` |
 | Shutdown uptime metric dropped | Emit uptime gauge before final `metrics.flush()` | `src/server.ts` |
+| `create_session`/`load_session` flaky under `npm test` due to env leakage | Sanitized `npm_config_prefix`/`NPM_CONFIG_PREFIX` around `createAgentSession()` to prevent project-local global installs (`./lib/node_modules`) | `src/session-manager.ts` |
+| CI failed on format gate | Applied Biome normalization across source set | 11 formatting-only files |
 
-### TESTS ADDED/UPDATED THIS PASS
+### TESTS ADDED/UPDATED
 
 - `src/test.ts`
   - server busy rejection must not mutate state
@@ -26,16 +29,26 @@
   - admitted rate-limited commands emit `command_finished`
   - `load_session` initializes version to `0` (auto + explicit session id)
   - shutdown flush includes uptime metric
+  - `create_session` ignores leaked `npm_config_prefix`
 - `src/test-session-version-store.ts`
   - `load_session` initializes version to `0`
 
-### COMPLETION STATUS (THIS PASS)
+---
 
-- Total findings surfaced: **5**
-- Resolved: **5**
-- Deferred with contract: **0**
-- Hard-blocked: **0**
-- Abandoned (no contract): **0 ✅**
+## COMMITS (LATEST)
+
+1. `8ab9eec` — `Merge branch 'main' of https://github.com/tryingET/pi-server`
+   - Merged remote release-please PR (v1.0.0 release)
+2. `722e25b` — `chore(package): add pi-package keyword for discoverability`
+   - Added `pi-package` keyword to package.json for Pi package gallery
+3. `f603a9f` — `docs(readme): clarify package is standalone server`
+   - Added note clarifying this is not an extension/skills/themes bundle
+4. `d9eb6a8` — `style(format): apply biome normalization across source files`
+   - Formatting-only commit (11 files)
+5. `9f67477` — `fix(session): sanitize npm prefix during agent session creation`
+   - Functional fix + regression test (`src/session-manager.ts`, `src/test.ts`)
+
+(Previous deep-review atomic fix commits are already on `main`.)
 
 ---
 
@@ -48,47 +61,36 @@
 
 ---
 
-## VALIDATION SNAPSHOT (post-fix)
+## VALIDATION SNAPSHOT (CURRENT)
 
 | Check | Status |
 |---|---|
+| Version | **1.0.0** (released) |
 | `npm run check` | ✅ |
 | `npm run build` | ✅ |
-| `npm test` | ✅ 103 passed, 0 failed |
+| `npm test` | ✅ 104 passed, 0 failed |
 | `npm run test:integration` | ✅ 26 passed, 0 failed |
-| `node --experimental-vm-modules dist/test-session-version-store.js` | ✅ |
-
----
-
-## FILES CHANGED IN THIS PASS
-
-- `src/command-replay-store.ts`
-- `src/session-manager.ts`
-- `src/session-version-store.ts`
-- `src/server.ts`
-- `src/test.ts`
-- `src/test-session-version-store.ts`
-
-(Plus existing unrelated local change: `next_session_prompt.md` itself.)
+| `npm run test:fuzz` | ✅ 17 passed, 0 failed |
+| `npm run ci` | ✅ |
 
 ---
 
 ## NEXT STEPS
 
-1. Commit this atomic-completion patch set (runtime fixes + regression tests).
-2. Add ADR note (or update existing ADR) documenting unified terminalization path and lifecycle invariant:
-   - if `command_accepted` is emitted, `command_finished` must be emitted exactly once.
-3. Continue upstream AbortSignal proposal process.
+1. Continue development on `main` — release-please will create subsequent release PRs.
+2. Keep upstream AbortSignal proposal as top external unblocker.
+3. Optional: add small startup diagnostic log when npm prefix sanitization is applied (debug-only).
 
 ---
 
-## ROLLBACK (this pass only)
+## ROLLBACK (LATEST CHANGES)
 
 ```bash
-git restore src/command-replay-store.ts src/session-manager.ts src/session-version-store.ts src/server.ts src/test.ts src/test-session-version-store.ts
-npm run build
-npm test
-npm run test:integration
+# revert latest two commits only
+git revert d9eb6a8 9f67477
+
+# re-validate
+npm run ci
 ```
 
 ---
@@ -102,7 +104,8 @@ npm run test:integration
 | Busy rejection side-effect safety | ✅ Fixed + regression-tested |
 | Session version consistency on load | ✅ Fixed + regression-tested |
 | Final shutdown metrics flush correctness | ✅ Fixed + regression-tested |
+| npm env leakage resilience in session creation | ✅ Fixed + regression-tested |
 | Upstream AbortSignal gap | 🔵 Deferred upstream |
 | Backpressure API gap | 🟡 Deferred/YAGNI |
 
-**Verdict:** ✅ Ready for release candidate with current deferred contracts unchanged.
+**Verdict:** ✅ Release-candidate ready; no known open local correctness defects in current gate suite.
