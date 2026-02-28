@@ -382,9 +382,10 @@ export class SessionStore {
   ): Promise<{ cwd: string; sessionName?: string }> {
     const readline = await import("readline");
     const fileStream = fsRegular.createReadStream(filePath, { encoding: "utf-8" });
+    let rl: ReturnType<typeof readline.createInterface> | undefined;
 
     try {
-      const rl = readline.createInterface({
+      rl = readline.createInterface({
         input: fileStream,
         crlfDelay: Infinity,
       });
@@ -394,8 +395,6 @@ export class SessionStore {
         firstLine = line;
         break; // Only need the first line
       }
-
-      rl.close();
 
       if (!firstLine) {
         return { cwd: "/unknown" };
@@ -409,7 +408,9 @@ export class SessionStore {
     } catch {
       return { cwd: "/unknown" };
     } finally {
-      // Always destroy the stream, even on error
+      // Always close readline interface first, then destroy the stream
+      // This prevents resource leaks if the for-await loop throws
+      rl?.close();
       fileStream.destroy();
     }
   }
