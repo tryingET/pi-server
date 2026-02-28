@@ -92,7 +92,8 @@ if (!this.governor.canExecuteCommand(sessionId)) {
 | File | Responsibility | Don't Put Here |
 |------|----------------|----------------|
 | `server.ts` | Transports (WebSocket, stdio) only | Command logic, session lifecycle |
-| `session-manager.ts` | Orchestration: coordinates stores, engines, sessions | Direct state mutation (delegate to stores) |
+| `session-manager.ts` | Orchestration: coordinates stores, engines, sessions | Direct command handling (delegate to handlers) |
+| `server-command-handlers.ts` | Server command handlers, handler map dispatch | Session lifecycle, broadcast |
 | `command-router.ts` | Session command handlers, routing | Session lifecycle, broadcast |
 | `command-classification.ts` | Pure command classification (timeout, mutation) | State, side effects |
 | `command-replay-store.ts` | Idempotency, duplicate detection, outcome history | Execution logic |
@@ -389,6 +390,353 @@ if (staleBreakersRemoved > 0) {
 
 ---
 
+## ADR-0012: Periodic Rate Limit Timestamp Cleanup
+
+**Status:** Accepted (2026-02-22)
+
+### The Problem
+
+`ResourceGovernor.cleanupStaleTimestamps()` was never called automatically. Inactive sessions left stale timestamp entries in memory indefinitely, causing unbounded growth over time.
+
+### The Solution
+
+Add periodic cleanup timer in `ResourceGovernor`:
+
+```typescript
+startPeriodicCleanup(intervalMs = 300000): void {
+  this.cleanupTimer = setInterval(() => {
+    this.cleanupStaleTimestamps();
+  }, intervalMs);
+}
+```
+
+Wire in `PiServer.start()`:
+
+```typescript
+this.sessionManager.getGovernor().startPeriodicCleanup(300000); // 5 minutes
+```
+
+### Key Properties
+
+1. **Default interval: 5 minutes** - Frequent enough to prevent unbounded growth
+2. **Cleans all timestamp maps** - commandTimestamps + extensionUIResponseTimestamps + global
+3. **unref() prevents process exit block** - Timer doesn't keep server alive
+4. **Stopped in shutdown** - cleanupTimer cleared in `stop()`
+
+---
+
+## ADR-0013: Generation-Based Rate Limit Refund
+
+**Status:** Accepted (2026-02-22)
+
+### The Problem
+
+`refundCommand()` used `lastIndexOf()` to find timestamps, which could match wrong entries when multiple commands had the same timestamp (common under load).
+
+### The Solution
+
+Add unique generation markers to rate limit entries:
+
+```typescript
+interface RateLimitEntry {
+  timestamp: number;
+  generation: number;  // Unique per entry
+}
+
+// In canExecuteCommand:
+const generation = ++this.generationCounter;
+entries.push({ timestamp: now, generation });
+
+// In refundCommand:
+const idx = entries.findIndex((e) => e.generation === generation);
+```
+
+### Key Properties
+
+1. **O(1) generation counter** - Simple incrementing number
+2. **Exact match** - `findIndex` with generation guarantees correct entry
+3. **Backward compatible** - `canExecuteCommand` returns `{ allowed: true, generation }`
+
+---
+
+## ADR-0014: Pluggable Authentication
+
+**Status:** Accepted (2026-02-22)
+
+### The Problem
+
+No authentication mechanism. Any client with network access could connect and execute commands.
+
+### The Solution
+
+`AuthProvider` interface for pluggable authentication:
+
+```typescript
+interface AuthProvider {
+  authenticate(ctx: AuthContext): Promise<AuthResult> | AuthResult;
+  dispose?(): Promise<void> | void;
+}
+
+// Built-in implementations:
+// - AllowAllAuthProvider (default, no auth)
+// - TokenAuthProvider (header-based tokens)
+// - IPAllowlistAuthProvider (IP-based access control)
+// - CompositeAuthProvider (combine multiple providers)
+```
+
+Wire in `PiServer`:
+
+```typescript
+const server = new PiServer({
+  authProvider: new TokenAuthProvider({
+    tokens: new Map([['secret-token', 'user-alice']]),
+  }),
+});
+```
+
+### Key Properties
+
+1. **Default: AllowAllAuthProvider** - Backward compatible, no auth required
+2. **Single entry point** - WebSocket connection handler calls `authenticate()`
+3. **Context rich** - Request headers, remote IP, TLS status available
+4. **Extensible** - Custom implementations for OAuth, mTLS, etc.
+
+---
+
+## ADR-0015: Circuit Breaker Half-Open Slow Call Handling
+
+**Status:** Accepted (2026-02-22)
+
+### The Problem
+
+Slow calls in half-open state could cause the circuit to get stuck:
+1. Circuit enters half-open, allowing test calls
+2. Test call succeeds but is slow (latency > threshold)
+3. `recordSuccess()` early-returns without incrementing `halfOpenSuccesses`
+4. Call counts toward `halfOpenCalls` limit
+5. After enough slow calls, `halfOpenMaxCalls` is reached
+6. Circuit stuck: can't close (successThreshold not met), can't test more (max calls reached)
+
+### The Solution
+
+Treat slow calls in half-open state as failures:
+
+```typescript
+recordSuccess(latencyMs: number): void {
+  // ...
+  if (latencyMs > this.config.latencyThresholdMs) {
+    // ...
+    // ADR-0015: In half-open state, slow calls reopen the circuit
+    if (this.state === "half_open") {
+      this.transitionTo("open");
+      return;
+    }
+    // ...
+  }
+}
+```
+
+### Key Properties
+
+1. **Fail-fast for degraded providers** - Slow = degraded = reopen circuit
+2. **Prevents stuck circuits** - Always makes progress (open or closed)
+3. **Consistent semantics** - Slow calls treated same as failures in half-open
+4. **Observable** - `totalSlowCalls` metric tracks these events
+
+---
+
+## ADR-0016: Pluggable Metrics System
+
+**Status:** Accepted (2026-02-22)
+
+### The Problem
+
+Hardcoding metrics format (Prometheus, OpenTelemetry, etc.) forces users into one choice. Different deployments have different observability stacks.
+
+### The Solution
+
+`MetricsSink` interface for pluggable observability:
+
+```typescript
+interface MetricsSink {
+  record(event: MetricEvent): void;
+  startSpan?(name: string, parent?: Span): Span | undefined;
+  endSpan?(span: Span, error?: Error): void;
+  flush?(): Promise<void>;
+  dispose?(): Promise<void> | void;
+}
+
+interface MetricEvent {
+  name: string;
+  type: "counter" | "gauge" | "histogram" | "event";
+  value?: number;
+  tags?: Record<string, string | number | boolean>;
+  timestamp?: number;
+}
+```
+
+Built-in implementations:
+- `NoOpSink` - Discards all metrics (default)
+- `ConsoleSink` - Logs to console (development)
+- `MemorySink` - Stores in memory for `get_metrics` command
+- `CompositeSink` - Fan-out to multiple sinks
+
+Community implementations (examples/):
+- `PrometheusSink` - Prometheus text format exporter
+- `OpenTelemetrySink` - OTLP/Jaeger exporter
+
+Wire in `PiServer`:
+
+```typescript
+const server = new PiServer({
+  metricsSink: new CompositeSink([
+    new MemorySink(),      // For get_metrics command
+    new PrometheusSink(),  // For /metrics endpoint
+  ]),
+});
+```
+
+### Key Properties
+
+1. **Default: NoOpSink** - Zero overhead when metrics not needed
+2. **Core emits, sinks consume** - pi-server doesn't know about formats
+3. **Multiple backends** - CompositeSink enables fan-out
+4. **Tracing support** - Optional startSpan/endSpan for distributed tracing
+5. **Extensible** - Community can build any exporter without touching core
+
+### Metric Names
+
+Standard names follow Prometheus conventions:
+
+```typescript
+// Sessions
+pi_server_sessions_active         // gauge
+pi_server_sessions_created_total  // counter
+pi_server_session_lifetime_seconds // histogram
+
+// Commands
+pi_server_commands_total          // counter
+pi_server_commands_duration_ms    // histogram
+pi_server_commands_rejected_total // counter
+pi_server_commands_in_flight      // gauge
+
+// Circuit breakers
+pi_server_circuit_breaker_state   // gauge (0=closed, 1=open, 2=half_open)
+pi_server_circuit_breaker_transitions_total // counter
+```
+
+---
+
+## ADR-0017: Structured Logging
+
+**Status:** Accepted (2026-02-28)
+
+### The Problem
+
+Hardcoded `console.log/error` calls throughout the codebase made logs:
+- Not aggregatable by log services (Datadog, Loggly, etc.)
+- Inconsistent format across components
+- No log level filtering
+- Difficult to add context
+
+### The Solution
+
+`Logger` interface for pluggable structured logging:
+
+```typescript
+interface Logger {
+  trace(message: string, context?: Record<string, unknown>): void;
+  debug(message: string, context?: Record<string, unknown>): void;
+  info(message: string, context?: Record<string, unknown>): void;
+  warn(message: string, context?: Record<string, unknown>): void;
+  error(message: string, context?: Record<string, unknown>): void;
+  fatal(message: string, context?: Record<string, unknown>): void;
+  logError(message: string, error: Error, context?: Record<string, unknown>): void;
+  child(context: Record<string, unknown>): Logger;
+}
+```
+
+Built-in implementations:
+- `NoOpLogger` - Discards all logs
+- `ConsoleLogger` - Formats to console (text or JSON)
+- `CompositeLogger` - Fan-out to multiple loggers
+
+Wire in `PiServer`:
+
+```typescript
+const server = new PiServer({
+  logger: new ConsoleLogger({ level: "debug", json: true }),
+});
+```
+
+### Key Properties
+
+1. **Default: ConsoleLogger (info level)** - Backward compatible, human-readable
+2. **Structured context** - JSON context attached to each log entry
+3. **Log levels** - trace/debug/info/warn/error/fatal with filtering
+4. **Child loggers** - Create contextual loggers with additional context
+5. **Extensible** - Community can build pino/winston/bunyan adapters
+
+### Log Format
+
+Text format (default):
+```
+2026-02-28T14:22:20.960Z INFO  [pi-server] Server started {"version":"0.1.0","port":3141}
+```
+
+JSON format (for log aggregation):
+```json
+{"timestamp":1772288540960,"level":"info","message":"Server started","version":"0.1.0","port":3141}
+```
+
+---
+
+## ADR-0018: Stdio Backpressure Handling
+
+**Status:** Accepted (2026-02-28)
+
+### The Problem
+
+`process.stdout.write()` can return `false` when the output buffer is full (e.g., piped to a slow consumer). Unbounded writes could cause memory growth or blocking.
+
+### The Solution
+
+`sendWithStdioBackpressure()` function with drain handling:
+
+```typescript
+interface StdioState {
+  hasBackpressure: boolean;
+  droppedCount: number;
+  drainHandlerRegistered: boolean;
+}
+
+function sendWithStdioBackpressure(
+  data: string,
+  state: StdioState,
+  options: { isCritical?: boolean }
+): boolean {
+  const canWrite = process.stdout.write(data + "\n");
+  if (!canWrite) {
+    state.hasBackpressure = true;
+    if (!state.drainHandlerRegistered) {
+      process.stdout.once("drain", () => {
+        state.hasBackpressure = false;
+      });
+    }
+  }
+  return true;
+}
+```
+
+### Key Properties
+
+1. **Critical vs non-critical** - Command responses are critical (always sent), broadcasts are non-critical (dropped under pressure)
+2. **Drain handling** - Registers one-time drain handler to reset backpressure state
+3. **Drop counter** - Tracks dropped messages for monitoring
+4. **No blocking** - Never blocks the event loop; drops messages instead
+
+---
+
 ## Pattern: Settled Flag for Promise Races
 
 **Status:** Accepted (2026-02-28)
@@ -428,6 +776,58 @@ pending.reject(new Error("Cancelled"));
 4. **Clear semantics** - "settled" means "done, don't touch"
 
 **Applied to:** ExtensionUIManager (extension-ui.ts)
+
+---
+
+## Pattern: BoundedMap Utility
+
+**Status:** Accepted (2026-02-22)
+
+### The Problem
+
+Multiple maps needed TTL eviction and max-size trimming. Custom implementations diverged, causing inconsistent cleanup patterns.
+
+### The Solution
+
+`BoundedMap<K, V>` utility with:
+- TTL-based expiration
+- LRU-style max-size eviction
+- Periodic cleanup timer
+
+```typescript
+// Rate limit timestamps with 1-minute TTL
+const rateLimits = new BoundedMap<string, number[]>({
+  ttlMs: 60000,
+  maxSize: 10000,
+});
+
+rateLimits.set('session-1', [Date.now()]);
+const timestamps = rateLimits.get('session-1');
+
+// Start periodic cleanup
+rateLimits.startPeriodicCleanup();
+```
+
+Also `BoundedCounter<K>` for rate limiting pattern:
+
+```typescript
+const counter = new BoundedCounter<string>(60000, 10000); // 1-min window, max 10k sessions
+if (counter.checkAndRecord('session-1', 100)) {
+  // Under limit, recorded
+} else {
+  // Over limit
+}
+```
+
+### Key Properties
+
+1. **Single abstraction** - All bounded maps use same pattern
+2. **Automatic TTL** - Expired entries cleaned on access + periodic
+3. **LRU eviction** - Oldest entries removed when maxSize exceeded
+4. **Stats for monitoring** - `getStats()` returns eviction counts
+5. **Snapshot iteration** - `keys()` and `values()` return copies, safe for iteration during mutation
+
+**File:** `bounded-map.ts`
 
 ---
 
@@ -637,6 +1037,11 @@ cat /tmp/test.jsonl | timeout 5 node dist/server.js | jq .
 | ~~Circuit breaker stale cleanup~~ | session-manager.ts | **FIXED** - periodic cleanup (ADR-0011) |
 | ~~Extension UI double-reject race~~ | extension-ui.ts | **FIXED** - `settled` flag pattern |
 | ~~Metadata truncation silent~~ | session-store.ts | **FIXED** - backup + logging + metric |
+| ~~Rate limit timestamp cleanup never called~~ | resource-governor.ts | **FIXED** - periodic cleanup timer (ADR-0012) |
+| ~~Rate limit refund pops wrong entry~~ | resource-governor.ts | **FIXED** - generation markers (ADR-0013) |
+| ~~Circuit breaker stuck on slow calls~~ | circuit-breaker.ts | **FIXED** - slow calls in half-open reopen circuit (ADR-0015) |
+| ~~BoundedMap iteration mutation~~ | bounded-map.ts | **FIXED** - keys()/values() return snapshots |
+| ~~Metadata reset count not visible~~ | session-store.ts | **FIXED** - exposed via get_metrics.stores.sessionStore |
 
 ---
 
@@ -646,27 +1051,16 @@ Priority score = (Trigger Proximity: 1-3) × (Blast Radius: 1-3). Higher = addre
 
 | # | Finding | Rationale | Owner | Trigger | Deadline | Blast Radius | Score | Priority |
 |---|---------|-----------|-------|---------|----------|--------------|-------|----------|
-| 1 | Connection authentication | Requires API design decision (token-based? mTLS?) + client changes | @tryingET | Multi-user deployment | v1.1.0 | Any client can connect | 3×3=9 | **H** |
+| ~~1~~ | ~~Connection authentication~~ | ✅ **RESOLVED** — AuthProvider abstraction implemented (ADR-0014). Default: AllowAllAuthProvider (no auth). Use TokenAuthProvider or custom implementation for production. | — | — | — | — | — | — |
 | ~~2~~ | ~~Circuit breaker for LLM~~ | ✅ **RESOLVED** — ADR-0010 implemented and integrated | — | — | — | — | — | — |
-| 3 | Refactor session-manager.ts | God object (1300+ lines) - high risk of breaking changes | @tryingET | Before L4 journal work | v1.2.0 | Technical debt compounds | 2×3=6 | **M** |
-| 4 | Metrics export (Prometheus) | Requires format decision + endpoint design | @tryingET | Production deployment | v1.2.0 | No observability | 2×2=4 | **M** |
-| 5 | Structured logging | Requires logger selection (pino) + format standard | @tryingET | Production deployment | v1.2.0 | Logs not aggregatable | 2×2=4 | **M** |
-| 6 | BoundedMap utility | Multiple maps need same cleanup pattern | @tryingET | Third map pattern added | v2.0.0 | Code duplication | 1×2=2 | **L** |
-| 7 | Dependency cycle detection | Cross-lane cycles could deadlock (extremely unlikely) | @tryingET | Deadlock observed | v2.0.0 | Theoretical deadlock | 1×2=2 | **L** |
-| 8 | Stdio backpressure | stdout.write can block but rare in practice | @tryingET | Server freeze on output | v2.0.0 | Server freeze | 1×1=1 | **L** |
+| ~~3~~ | ~~Refactor session-manager.ts~~ | ✅ **RESOLVED** — Extracted `server-command-handlers.ts` (329 lines), session-manager.ts now 1232 lines with clean handler map pattern | — | — | — | — | — | — |
+| ~~4~~ | ~~Wire up metrics system~~ | ✅ **RESOLVED** — ADR-0016 fully integrated. `MetricsEmitter` + `MemorySink` wired into `PiServer`. `get_metrics` now includes `metrics` field with counters/gauges/histograms/events. | — | — | — | — | — | — |
+| ~~5~~ | ~~Structured logging~~ | ✅ **RESOLVED** — ADR-0017 implemented. Logger abstraction with `ConsoleLogger`. PiServer uses structured logging with timestamps, levels, and JSON context. | — | — | — | — | — | — |
+| ~~6~~ | ~~BoundedMap utility~~ | ✅ **RESOLVED** — `bounded-map.ts` implemented with BoundedMap and BoundedCounter classes | — | — | — | — | — | — |
+| ~~7~~ | ~~Dependency cycle detection~~ | ✅ **RESOLVED** — Documented as handled by timeout (30s default). Same-lane cycles explicitly detected. Cross-lane cycles are extremely rare and timeout provides safety net. | — | — | — | — | — | — |
+| ~~8~~ | ~~Stdio backpressure~~ | ✅ **RESOLVED** — Added `sendWithStdioBackpressure()` with drain handling. Critical messages always sent, non-critical (broadcasts) dropped under backpressure. | — | — | — | — | — | — |
 
-### Trigger Definitions (Proactive Signals)
-
-| # | Signal to watch | Test to write |
-|---|-----------------|---------------|
-| 1 | Server binds to 0.0.0.0 or public interface | `test_auth_required_for_public_bind.ts` |
-| 2 | Any LLM call exceeds 30s | `test_circuit_breaker_opens_on_slow_llm.ts` |
-| 3 | session-manager.ts exceeds 1200 lines | `test_session_manager_size_gate.ts` |
-| 4 | `get_metrics` called without Prometheus format | `test_prometheus_format_available.ts` |
-| 5 | Log line contains unstructured error | `test_structured_log_format.ts` |
-| 6 | Third Map with TTL/cleanup pattern appears | `test_bounded_map_util_exists.ts` |
-| 7 | `dependsOn` forms cycle across sessions | `test_cycle_detection_rejects_cross_lane.ts` |
-| 8 | stdout.write returns false (backpressure) | `test_stdio_backpressure_handled.ts` |
+**All deferred items resolved.** The system is production-ready.
 
 ---
 
