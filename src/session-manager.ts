@@ -41,6 +41,7 @@ import { SessionVersionStore } from "./session-version-store.js";
 import { CommandExecutionEngine } from "./command-execution-engine.js";
 import { SessionLockManager } from "./session-lock-manager.js";
 import { SessionStore, type StoredSessionInfo } from "./session-store.js";
+import { CircuitBreakerManager, type CircuitBreakerConfig } from "./circuit-breaker.js";
 
 /** Default timeout for session commands (5 minutes for LLM operations) */
 const DEFAULT_COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
@@ -61,6 +62,8 @@ export interface SessionManagerRuntimeOptions {
   idempotencyTtlMs?: number;
   /** Server version for session metadata tracking */
   serverVersion?: string;
+  /** Circuit breaker configuration (optional, uses defaults if not provided) */
+  circuitBreakerConfig?: Partial<Omit<CircuitBreakerConfig, "providerName">>;
 }
 
 export class PiSessionManager implements SessionResolver {
@@ -80,6 +83,8 @@ export class PiSessionManager implements SessionResolver {
   private lockManager: SessionLockManager;
   /** Session metadata store for persistence across restarts (ADR-0007). */
   private sessionStore: SessionStore;
+  /** Circuit breaker for LLM providers (ADR-0010). */
+  private circuitBreakers: CircuitBreakerManager;
 
   // Shutdown state (single source of truth - server.ts delegates to this)
   private isShuttingDown = false;
@@ -130,6 +135,7 @@ export class PiSessionManager implements SessionResolver {
     this.sessionStore = new SessionStore({
       serverVersion: options.serverVersion,
     });
+    this.circuitBreakers = new CircuitBreakerManager(options.circuitBreakerConfig);
   }
 
   /**
@@ -137,6 +143,13 @@ export class PiSessionManager implements SessionResolver {
    */
   getGovernor(): ResourceGovernor {
     return this.governor;
+  }
+
+  /**
+   * Get the circuit breaker manager for external access (e.g., admin operations).
+   */
+  getCircuitBreakers(): CircuitBreakerManager {
+    return this.circuitBreakers;
   }
 
   // ==========================================================================
@@ -641,6 +654,7 @@ export class PiSessionManager implements SessionResolver {
 
   /**
    * Clean up sessions that have exceeded maxSessionLifetimeMs.
+   * Also cleans up stale circuit breakers for unused providers.
    */
   private async cleanupExpiredSessions(): Promise<void> {
     const expiredIds = this.governor.getExpiredSessions();
@@ -653,6 +667,12 @@ export class PiSessionManager implements SessionResolver {
         // Session may have been deleted already or deletion failed
         console.error(`[SessionManager] Failed to delete expired session ${sessionId}:`, error);
       }
+    }
+
+    // Clean up stale circuit breakers (ADR-0011)
+    const staleBreakersRemoved = this.circuitBreakers.cleanupStaleBreakers();
+    if (staleBreakersRemoved > 0) {
+      console.error(`[SessionManager] Cleaned up ${staleBreakersRemoved} stale circuit breakers`);
     }
   }
 
@@ -1102,6 +1122,7 @@ export class PiSessionManager implements SessionResolver {
           const executionStats = this.executionEngine.getStats();
           const lockStats = this.lockManager.getStats();
           const extensionUIStats = this.extensionUI.getStats();
+          const circuitBreakerMetrics = this.circuitBreakers.getAllMetrics();
           return {
             id,
             type: "response",
@@ -1116,18 +1137,26 @@ export class PiSessionManager implements SessionResolver {
                 lock: lockStats,
                 extensionUI: extensionUIStats,
               },
+              circuitBreakers: circuitBreakerMetrics,
             },
           };
         }
 
         case "health_check": {
           const health = this.governor.isHealthy();
+          const hasOpenCircuit = this.circuitBreakers.hasOpenCircuit();
           return {
             id,
             type: "response",
             command: "health_check",
             success: true,
-            data: health,
+            data: {
+              ...health,
+              hasOpenCircuit,
+              issues: hasOpenCircuit
+                ? [...health.issues, "One or more LLM provider circuits are open"]
+                : health.issues,
+            },
           };
         }
 
@@ -1195,7 +1224,65 @@ export class PiSessionManager implements SessionResolver {
         return failResponse(result.error ?? "Unknown error", "extension_ui_response");
       }
 
-      // Route to command handler
+      // ADR-0010: Circuit breaker for LLM commands
+      // These commands make LLM calls and should be protected
+      const LLM_COMMANDS = new Set(["prompt", "steer", "follow_up", "compact"]);
+      const provider = session.model?.provider;
+
+      if (LLM_COMMANDS.has(commandType) && provider) {
+        const breaker = this.circuitBreakers.getBreaker(provider);
+        const breakerCheck = breaker.canExecute();
+
+        if (!breakerCheck.allowed) {
+          return {
+            id,
+            type: "response",
+            command: commandType,
+            success: false,
+            error: breakerCheck.reason,
+          };
+        }
+
+        // Execute with circuit breaker tracking
+        const startTime = Date.now();
+        try {
+          const routed = routeSessionCommand(session, command, (sid) => this.getSessionInfo(sid));
+          if (routed === undefined) {
+            return failResponse(`Unknown command type: ${commandType}`);
+          }
+
+          const response = await Promise.resolve(routed);
+          const elapsedMs = Date.now() - startTime;
+
+          if (response.success) {
+            breaker.recordSuccess(elapsedMs);
+          } else {
+            // Distinguish between timeout and other errors
+            const errorMsg = response.error?.toLowerCase() ?? "";
+            if (errorMsg.includes("timeout") || errorMsg.includes("timed out")) {
+              breaker.recordFailure("timeout");
+            } else {
+              breaker.recordFailure("error");
+            }
+          }
+
+          if (!response.success) {
+            return failResponse(response.error ?? "Unknown error", response.command);
+          }
+          return response;
+        } catch (error) {
+          const elapsedMs = Date.now() - startTime;
+          const errorMsg = error instanceof Error ? error.message.toLowerCase() : "";
+          if (errorMsg.includes("timeout") || elapsedMs >= this.defaultCommandTimeoutMs) {
+            breaker.recordFailure("timeout");
+          } else {
+            breaker.recordFailure("error");
+          }
+          throw error;
+        }
+      }
+
+      // Non-LLM commands: route without circuit breaker
       const routed = routeSessionCommand(session, command, (sid) => this.getSessionInfo(sid));
       if (routed === undefined) {
         return failResponse(`Unknown command type: ${commandType}`);

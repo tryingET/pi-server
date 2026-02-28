@@ -8,6 +8,7 @@ import type { AgentSessionEvent } from "@mariozechner/pi-coding-agent";
 import type { ImageContent, Model } from "@mariozechner/pi-ai";
 import type { SessionStats } from "@mariozechner/pi-coding-agent";
 import type { CompactionResult } from "@mariozechner/pi-coding-agent";
+import type { CircuitBreakerMetrics } from "./circuit-breaker.js";
 
 // ============================================================================
 // SESSION INFO
@@ -199,12 +200,19 @@ export type ServerResponse =
             rejectedCount: number;
           };
         };
+        /** Circuit breaker metrics per provider (ADR-0010) */
+        circuitBreakers: CircuitBreakerMetrics[];
       };
     })
   | (RpcResponseBase & {
       command: "health_check";
       success: true;
-      data: { healthy: boolean; issues: string[] };
+      data: {
+        healthy: boolean;
+        issues: string[];
+        /** Whether any LLM provider circuit is open (ADR-0010) */
+        hasOpenCircuit: boolean;
+      };
     })
   // ADR-0007: Session persistence
   | (RpcResponseBase & {
