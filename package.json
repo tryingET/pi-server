@@ -1,6 +1,6 @@
 {
   "name": "pi-app-server",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "type": "module",
   "description": "Session multiplexer for pi-coding-agent",
   "license": "MIT",
