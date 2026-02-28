@@ -84,7 +84,8 @@ async function runTests() {
     alertSink.record(event);
 
     const metrics = memorySink.getMetrics();
-    assert.strictEqual((metrics.gauges as Record<string, number | undefined>)["test_metric"], 10);
+    const gauges = metrics.gauges as Record<string, number | undefined>;
+    assert.strictEqual(gauges.test_metric, 10);
   });
 
   await test("passes unwatched metrics through without alerting", async () => {
@@ -95,7 +96,8 @@ async function runTests() {
 
     assert.strictEqual(alertHandlerCalls.length, 0);
     const metrics = memorySink.getMetrics();
-    assert.strictEqual((metrics.gauges as Record<string, number | undefined>)["unwatched_metric"], 999);
+    const gauges = metrics.gauges as Record<string, number | undefined>;
+    assert.strictEqual(gauges.unwatched_metric, 999);
   });
 
   // ==========================================================================
