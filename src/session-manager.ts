@@ -85,6 +85,9 @@ export class PiSessionManager implements SessionResolver {
   private isShuttingDown = false;
   private inFlightCommands = new Set<Promise<unknown>>();
 
+  // Periodic cleanup timers
+  private sessionExpirationTimer: NodeJS.Timeout | null = null;
+
   private readonly defaultCommandTimeoutMs: number;
   private readonly shortCommandTimeoutMs: number;
   private readonly dependencyWaitTimeoutMs: number;
@@ -580,11 +583,12 @@ export class PiSessionManager implements SessionResolver {
   }
 
   /**
-   * Start periodic cleanup of orphaned session metadata.
+   * Start periodic cleanup of orphaned session metadata and expired sessions.
    * @param intervalMs Cleanup interval in milliseconds (default: 1 hour)
    */
   startSessionCleanup(intervalMs?: number): void {
     this.sessionStore.startPeriodicCleanup(intervalMs);
+    this.startSessionExpirationCheck(intervalMs);
   }
 
   /**
@@ -592,13 +596,64 @@ export class PiSessionManager implements SessionResolver {
    */
   stopSessionCleanup(): void {
     this.sessionStore.stopPeriodicCleanup();
+    this.stopSessionExpirationCheck();
   }
 
   /**
-   * Run a one-time cleanup of orphaned session metadata.
+   * Run a one-time cleanup of orphaned session metadata and expired sessions.
    */
   async cleanupSessions(): Promise<{ removed: number; kept: number }> {
+    // Clean up expired sessions first
+    await this.cleanupExpiredSessions();
+    // Then clean up orphaned metadata
     return this.sessionStore.cleanup();
+  }
+
+  /**
+   * Start periodic check for expired sessions (maxSessionLifetimeMs).
+   */
+  private startSessionExpirationCheck(intervalMs = 3600000): void {
+    if (this.sessionExpirationTimer) {
+      return; // Already running
+    }
+
+    this.sessionExpirationTimer = setInterval(() => {
+      this.cleanupExpiredSessions().catch((error) => {
+        console.error("[SessionManager] Session expiration cleanup failed:", error);
+      });
+    }, intervalMs);
+
+    // Don't prevent process exit
+    if (this.sessionExpirationTimer.unref) {
+      this.sessionExpirationTimer.unref();
+    }
+  }
+
+  /**
+   * Stop periodic session expiration check.
+   */
+  private stopSessionExpirationCheck(): void {
+    if (this.sessionExpirationTimer) {
+      clearInterval(this.sessionExpirationTimer);
+      this.sessionExpirationTimer = null;
+    }
+  }
+
+  /**
+   * Clean up sessions that have exceeded maxSessionLifetimeMs.
+   */
+  private async cleanupExpiredSessions(): Promise<void> {
+    const expiredIds = this.governor.getExpiredSessions();
+
+    for (const sessionId of expiredIds) {
+      try {
+        console.error(`[SessionManager] Deleting expired session: ${sessionId}`);
+        await this.deleteSession(sessionId);
+      } catch (error) {
+        // Session may have been deleted already or deletion failed
+        console.error(`[SessionManager] Failed to delete expired session ${sessionId}:`, error);
+      }
+    }
   }
 
   // ==========================================================================
