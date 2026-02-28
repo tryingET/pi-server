@@ -361,6 +361,76 @@ Clients that want replay/deduplication MUST provide explicit `id` fields:
 
 ---
 
+## ADR-0011: Stale Circuit Breaker Cleanup
+
+**Status:** Accepted (2026-02-28)
+
+### The Problem
+
+`CircuitBreakerManager` creates breakers on-demand for each LLM provider but never cleaned up stale ones. Unused provider breakers persisted forever in memory.
+
+### The Solution
+
+Add periodic cleanup call in `PiSessionManager.cleanupExpiredSessions()`:
+
+```typescript
+const staleBreakersRemoved = this.circuitBreakers.cleanupStaleBreakers();
+if (staleBreakersRemoved > 0) {
+  console.error(`[SessionManager] Cleaned up ${staleBreakersRemoved} stale circuit breakers`);
+}
+```
+
+### Key Properties
+
+1. **Stale timeout: 1 hour** - Breakers unused for 1 hour are removed
+2. **Automatic cleanup** - Runs during periodic session cleanup (default: hourly)
+3. **No data loss** - Breaker state is ephemeral; removal is safe
+4. **Metrics preserved** - Removed breakers' metrics are lost, but this is acceptable
+
+---
+
+## Pattern: Settled Flag for Promise Races
+
+**Status:** Accepted (2026-02-28)
+
+### The Problem
+
+When multiple async callbacks can resolve/reject the same promise (e.g., timeout + cancel), race conditions cause double-resolution. JavaScript silently swallows second rejects, but this is confusing for debugging.
+
+### The Solution
+
+Add a `settled` boolean to pending request records:
+
+```typescript
+interface PendingUIRequest {
+  // ... other fields
+  settled: boolean;
+}
+
+// In timeout callback:
+if (!pending || pending.settled) return;
+pending.settled = true;
+this.pendingRequests.delete(requestId);
+pending.reject(new Error("Timed out"));
+
+// In cancel callback:
+if (pending.settled) return;
+pending.settled = true;
+clearTimeout(pending.timeout);
+pending.reject(new Error("Cancelled"));
+```
+
+### Key Properties
+
+1. **Guard at entry** - Check `settled` before any state change
+2. **Set first** - Set `settled = true` before other mutations
+3. **Idempotent** - Second call is safe no-op
+4. **Clear semantics** - "settled" means "done, don't touch"
+
+**Applied to:** ExtensionUIManager (extension-ui.ts)
+
+---
+
 ## Protocol Patterns
 
 ### Command → Response Correlation
@@ -564,21 +634,39 @@ cat /tmp/test.jsonl | timeout 5 node dist/server.js | jq .
 | ~~No max session lifetime~~ | resource-governor.ts | **FIXED** - `maxSessionLifetimeMs` config + periodic enforcement |
 | ~~Readline interface leak on stream error~~ | session-store.ts | **FIXED** - `rl?.close()` in finally block |
 | ~~Type guards in types.ts~~ | types.ts | **FIXED** - extracted to type-guards.ts with re-exports |
+| ~~Circuit breaker stale cleanup~~ | session-manager.ts | **FIXED** - periodic cleanup (ADR-0011) |
+| ~~Extension UI double-reject race~~ | extension-ui.ts | **FIXED** - `settled` flag pattern |
+| ~~Metadata truncation silent~~ | session-store.ts | **FIXED** - backup + logging + metric |
 
 ---
 
 ## Deferred Items (Explicit Contracts)
 
-| Finding | Rationale | Owner | Trigger | Deadline | Blast Radius |
-|---------|-----------|-------|---------|----------|--------------|
-| Connection authentication | Requires API design decision (token-based? mTLS?) + client changes | @tryingET | When multi-user deployment needed | When feature requested | Any client can connect |
-| Metrics export (Prometheus) | Requires format decision + endpoint design | @tryingET | When ops team needs monitoring | When deployed to production | No observability |
-| Circuit breaker for LLM | Requires per-provider tuning + fallback design | @tryingET | When latency spikes cause cascades | After production incident | Slow LLM blocks all sessions |
-| Structured logging | Requires logger selection (pino? winston?) + format standard | @tryingET | When log aggregation needed | When deployed at scale | Logs not aggregatable |
-| Refactor session-manager.ts | God object (700+ lines) - high risk of breaking changes | @tryingET | When adding major new feature | Before v2.0.0 | Technical debt compounds |
-| BoundedMap utility | Multiple maps need same cleanup pattern | @tryingET | When third map with same pattern added | Low priority | Code duplication |
-| Dependency cycle detection | Cross-lane cycles could deadlock but extremely unlikely (requires explicit IDs + simultaneous in-flight + mutual reference) | @tryingET | If deadlock observed in production | Low priority | Theoretical deadlock |
-| Stdio backpressure | stdout.write can block but rare in practice | @tryingET | If server freezes on output | Low priority | Server freeze on fast events |
+Priority score = (Trigger Proximity: 1-3) × (Blast Radius: 1-3). Higher = address sooner.
+
+| # | Finding | Rationale | Owner | Trigger | Deadline | Blast Radius | Score | Priority |
+|---|---------|-----------|-------|---------|----------|--------------|-------|----------|
+| 1 | Connection authentication | Requires API design decision (token-based? mTLS?) + client changes | @tryingET | Multi-user deployment | v1.1.0 | Any client can connect | 3×3=9 | **H** |
+| ~~2~~ | ~~Circuit breaker for LLM~~ | ✅ **RESOLVED** — ADR-0010 implemented and integrated | — | — | — | — | — | — |
+| 3 | Refactor session-manager.ts | God object (1300+ lines) - high risk of breaking changes | @tryingET | Before L4 journal work | v1.2.0 | Technical debt compounds | 2×3=6 | **M** |
+| 4 | Metrics export (Prometheus) | Requires format decision + endpoint design | @tryingET | Production deployment | v1.2.0 | No observability | 2×2=4 | **M** |
+| 5 | Structured logging | Requires logger selection (pino) + format standard | @tryingET | Production deployment | v1.2.0 | Logs not aggregatable | 2×2=4 | **M** |
+| 6 | BoundedMap utility | Multiple maps need same cleanup pattern | @tryingET | Third map pattern added | v2.0.0 | Code duplication | 1×2=2 | **L** |
+| 7 | Dependency cycle detection | Cross-lane cycles could deadlock (extremely unlikely) | @tryingET | Deadlock observed | v2.0.0 | Theoretical deadlock | 1×2=2 | **L** |
+| 8 | Stdio backpressure | stdout.write can block but rare in practice | @tryingET | Server freeze on output | v2.0.0 | Server freeze | 1×1=1 | **L** |
+
+### Trigger Definitions (Proactive Signals)
+
+| # | Signal to watch | Test to write |
+|---|-----------------|---------------|
+| 1 | Server binds to 0.0.0.0 or public interface | `test_auth_required_for_public_bind.ts` |
+| 2 | Any LLM call exceeds 30s | `test_circuit_breaker_opens_on_slow_llm.ts` |
+| 3 | session-manager.ts exceeds 1200 lines | `test_session_manager_size_gate.ts` |
+| 4 | `get_metrics` called without Prometheus format | `test_prometheus_format_available.ts` |
+| 5 | Log line contains unstructured error | `test_structured_log_format.ts` |
+| 6 | Third Map with TTL/cleanup pattern appears | `test_bounded_map_util_exists.ts` |
+| 7 | `dependsOn` forms cycle across sessions | `test_cycle_detection_rejects_cross_lane.ts` |
+| 8 | stdout.write returns false (backpressure) | `test_stdio_backpressure_handled.ts` |
 
 ---
 
