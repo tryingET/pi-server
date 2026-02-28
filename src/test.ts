@@ -743,18 +743,41 @@ async function testResourceGovernor() {
     assert(governor.validateCwd(tooLong)?.includes("too long"));
   });
 
-  await test("governor: refundCommand restores counters", () => {
+  await test("governor: refundCommand restores counters with generation marker", () => {
     const governor = new ResourceGovernor({ ...DEFAULT_CONFIG, maxCommandsPerMinute: 2 });
-    assert.strictEqual(governor.canExecuteCommand("s1").allowed, true);
-    assert.strictEqual(governor.canExecuteCommand("s1").allowed, true);
+    const result1 = governor.canExecuteCommand("s1");
+    assert.strictEqual(result1.allowed, true);
+    const gen1 = result1.generation;
+
+    const result2 = governor.canExecuteCommand("s1");
+    assert.strictEqual(result2.allowed, true);
+    const gen2 = result2.generation;
 
     let metrics = governor.getMetrics();
     assert.strictEqual(metrics.totalCommandsExecuted, 2);
 
-    governor.refundCommand("s1");
+    // Refund using generation marker (removes correct entry even with same timestamp)
+    governor.refundCommand("s1", gen1!);
     metrics = governor.getMetrics();
     assert.strictEqual(metrics.totalCommandsExecuted, 1);
     assert.strictEqual(governor.getRateLimitUsage("s1").session, 1);
+
+    // Second refund with different generation
+    governor.refundCommand("s1", gen2!);
+    metrics = governor.getMetrics();
+    assert.strictEqual(metrics.totalCommandsExecuted, 0);
+    assert.strictEqual(governor.getRateLimitUsage("s1").session, 0);
+  });
+
+  await test("governor: refundCommand ignores unknown generation", () => {
+    const governor = new ResourceGovernor({ ...DEFAULT_CONFIG, maxCommandsPerMinute: 2 });
+    const result = governor.canExecuteCommand("s1");
+    assert.strictEqual(result.allowed, true);
+
+    // Try to refund with wrong generation
+    governor.refundCommand("s1", 99999);
+    const metrics = governor.getMetrics();
+    assert.strictEqual(metrics.totalCommandsExecuted, 1); // Unchanged
   });
 
   // Test: Connection limits
