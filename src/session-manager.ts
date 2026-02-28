@@ -56,10 +56,7 @@ import { CommandExecutionEngine } from "./command-execution-engine.js";
 import { SessionLockManager } from "./session-lock-manager.js";
 import { SessionStore, type StoredSessionInfo } from "./session-store.js";
 import { CircuitBreakerManager, type CircuitBreakerConfig } from "./circuit-breaker.js";
-import {
-  BashCircuitBreaker,
-  type BashCircuitBreakerConfig,
-} from "./bash-circuit-breaker.js";
+import { BashCircuitBreaker, type BashCircuitBreakerConfig } from "./bash-circuit-breaker.js";
 
 /** Default timeout for session commands (5 minutes for LLM operations) */
 const DEFAULT_COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
@@ -72,6 +69,13 @@ const SHORT_COMMAND_TIMEOUT_MS = 30 * 1000;
 
 /** Max time to wait for a dependency command to complete. */
 const DEPENDENCY_WAIT_TIMEOUT_MS = 30 * 1000;
+
+/**
+ * npm env keys inherited from npm scripts that can hijack global installs.
+ * When present (e.g. npm_config_prefix=<project>), createAgentSession's
+ * package manager may install "global" packages into the project directory.
+ */
+const SANITIZED_NPM_ENV_KEYS = ["npm_config_prefix", "NPM_CONFIG_PREFIX"] as const;
 
 export interface SessionManagerRuntimeOptions {
   defaultCommandTimeoutMs?: number;
@@ -388,7 +392,7 @@ export class PiSessionManager implements SessionResolver {
       }
 
       try {
-        const { session } = await createAgentSession({
+        const { session } = await this.createAgentSessionWithSanitizedNpmEnv({
           cwd: cwd ?? process.cwd(),
         });
 
@@ -571,7 +575,7 @@ export class PiSessionManager implements SessionResolver {
 
       try {
         // Create session and switch to the specified file
-        const { session } = await createAgentSession({
+        const { session } = await this.createAgentSessionWithSanitizedNpmEnv({
           cwd: process.cwd(),
         });
 
@@ -719,7 +723,9 @@ export class PiSessionManager implements SessionResolver {
     // Clean up stale bash circuit breakers
     const staleBashBreakersRemoved = this.bashCircuitBreaker.cleanupStale();
     if (staleBashBreakersRemoved > 0) {
-      console.error(`[SessionManager] Cleaned up ${staleBashBreakersRemoved} stale bash circuit breakers`);
+      console.error(
+        `[SessionManager] Cleaned up ${staleBashBreakersRemoved} stale bash circuit breakers`
+      );
     }
   }
 
@@ -847,7 +853,8 @@ export class PiSessionManager implements SessionResolver {
         canExecute: (sessionId: string) => this.bashCircuitBreaker.canExecute(sessionId),
         recordSuccess: (sessionId: string) => this.bashCircuitBreaker.recordSuccess(sessionId),
         recordTimeout: (sessionId: string) => this.bashCircuitBreaker.recordTimeout(sessionId),
-        recordSpawnError: (sessionId: string) => this.bashCircuitBreaker.recordSpawnError(sessionId),
+        recordSpawnError: (sessionId: string) =>
+          this.bashCircuitBreaker.recordSpawnError(sessionId),
         hasOpenCircuit: () => this.bashCircuitBreaker.hasOpenCircuit(),
         getMetrics: () => this.bashCircuitBreaker.getMetrics(),
       }),
@@ -1268,6 +1275,42 @@ export class PiSessionManager implements SessionResolver {
   // ==========================================================================
   // UTILITIES
   // ==========================================================================
+
+  /**
+   * Create an AgentSession while sanitizing npm prefix env leakage from npm scripts.
+   *
+   * npm sets npm_config_prefix for child processes. If inherited here,
+   * pi-coding-agent's global package installation can be redirected into the
+   * current project (e.g. ./lib/node_modules), causing flaky session creation.
+   */
+  private async createAgentSessionWithSanitizedNpmEnv(
+    options: Parameters<typeof createAgentSession>[0]
+  ): Promise<Awaited<ReturnType<typeof createAgentSession>>> {
+    const snapshots = SANITIZED_NPM_ENV_KEYS.map((key) => ({
+      key,
+      had: Object.hasOwn(process.env, key),
+      value: process.env[key],
+    }));
+
+    for (const snapshot of snapshots) {
+      if (snapshot.had) {
+        delete process.env[snapshot.key];
+      }
+    }
+
+    try {
+      return await createAgentSession(options);
+    } finally {
+      for (const snapshot of snapshots) {
+        if (!snapshot.had) continue;
+        if (snapshot.value === undefined) {
+          delete process.env[snapshot.key];
+        } else {
+          process.env[snapshot.key] = snapshot.value;
+        }
+      }
+    }
+  }
 
   private generateSessionId(): string {
     // Use crypto for collision-safe ID generation

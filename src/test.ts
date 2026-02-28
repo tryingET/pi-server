@@ -1277,7 +1277,11 @@ async function testSessionManager() {
 
     assert.strictEqual(response.success, false, "Command should be rejected as busy");
     assert(response.error?.includes("Server busy"), `Unexpected error: ${response.error}`);
-    assert.strictEqual(localManager.getSession("busy-ghost"), undefined, "Session must not be created on rejection");
+    assert.strictEqual(
+      localManager.getSession("busy-ghost"),
+      undefined,
+      "Session must not be created on rejection"
+    );
   });
 
   await test("session-manager: idempotency replay preserves timeout terminal outcome", async () => {
@@ -1346,10 +1350,16 @@ async function testSessionManager() {
     };
     localManager.addSubscriber(subscriber);
 
-    const first = await localManager.executeCommand({ id: "rl-lifecycle-1", type: "list_sessions" } as any);
+    const first = await localManager.executeCommand({
+      id: "rl-lifecycle-1",
+      type: "list_sessions",
+    } as any);
     assert.strictEqual(first.success, true);
 
-    const second = await localManager.executeCommand({ id: "rl-lifecycle-2", type: "list_sessions" } as any);
+    const second = await localManager.executeCommand({
+      id: "rl-lifecycle-2",
+      type: "list_sessions",
+    } as any);
     assert.strictEqual(second.success, false);
     assert(second.error?.includes("Rate limit"));
 
@@ -1365,6 +1375,36 @@ async function testSessionManager() {
     assert.strictEqual(finished.data.success, false, "Finished event should report failure");
 
     localManager.removeSubscriber(subscriber);
+  });
+
+  await test("session-manager: create_session ignores npm_config_prefix leakage", async () => {
+    const previousPrefix = process.env.npm_config_prefix;
+    process.env.npm_config_prefix = process.cwd();
+
+    const localManager = new PiSessionManager();
+    try {
+      const created = await localManager.executeCommand({
+        type: "create_session",
+        sessionId: "prefix-sanitize",
+      });
+
+      assert.strictEqual(
+        created.success,
+        true,
+        `Session creation should succeed with sanitized npm prefix: ${created.error}`
+      );
+
+      await localManager.executeCommand({
+        type: "delete_session",
+        sessionId: "prefix-sanitize",
+      });
+    } finally {
+      if (previousPrefix === undefined) {
+        delete process.env.npm_config_prefix;
+      } else {
+        process.env.npm_config_prefix = previousPrefix;
+      }
+    }
   });
 
   await test("session-manager: load_session initializes version at 0", async () => {
@@ -1386,7 +1426,11 @@ async function testSessionManager() {
       sessionPath,
     } as any);
     assert.strictEqual(loadedAutoId.success, true);
-    assert.strictEqual(loadedAutoId.sessionVersion, 0, "Auto-id load_session should start at version 0");
+    assert.strictEqual(
+      loadedAutoId.sessionVersion,
+      0,
+      "Auto-id load_session should start at version 0"
+    );
 
     await localManager.executeCommand({
       type: "delete_session",
@@ -1399,7 +1443,11 @@ async function testSessionManager() {
       sessionPath,
     } as any);
     assert.strictEqual(loadedExplicitId.success, true);
-    assert.strictEqual(loadedExplicitId.sessionVersion, 0, "Explicit-id load_session should start at version 0");
+    assert.strictEqual(
+      loadedExplicitId.sessionVersion,
+      0,
+      "Explicit-id load_session should start at version 0"
+    );
 
     await localManager.executeCommand({ type: "delete_session", sessionId: "load-explicit" });
   });
