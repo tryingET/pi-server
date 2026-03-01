@@ -2,7 +2,7 @@
 
 **Operating mode:** Production ready  
 **Phase:** COMPLETE  
-**Version:** 2.0.0 (released)  
+**Version:** 2.0.0 (pending release)  
 **Formalization Level:** 2 (Bounded Run)
 
 ---
@@ -72,7 +72,7 @@
 
 | Check | Status |
 |---|---|
-| Version | **2.0.0** (released) |
+| Version | **2.0.0** (pending release) |
 | `npm run check` | ✅ |
 | `npm run build` | ✅ |
 | `npm test` | ✅ 112 passed, 0 failed |

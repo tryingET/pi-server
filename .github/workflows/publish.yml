@@ -46,8 +46,11 @@ jobs:
             exit 1
           fi
 
-      - name: Build
+      - name: Install dependencies
         run: npm ci
+
+      - name: Build
+        run: npm run build
 
       - name: Run release checks
         run: npm run release:check
