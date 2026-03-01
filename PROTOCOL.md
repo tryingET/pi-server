@@ -449,10 +449,55 @@ Emitted before server closes. Clients should expect connection termination.
 | `switch_session_file` | Switch to different file |
 | `fork` | Fork from message |
 | `get_fork_messages` | Get fork preview |
+| `navigate_tree` | Navigate session tree to target entry |
 | `get_last_assistant_text` | Get last response |
 | `get_context_usage` | Get token usage info |
 
-### 17.3 Extension UI commands
+### 17.3 `navigate_tree` details
+
+Navigate the session tree to a target entry, optionally summarizing the branch.
+
+**Request:**
+```json
+{
+  "type": "navigate_tree",
+  "sessionId": "session-123",
+  "targetId": "entry-456",
+  "options": {
+    "summarize": true,
+    "customInstructions": "Focus on API changes",
+    "replaceInstructions": false,
+    "label": "API work"
+  }
+}
+```
+
+**Parameters:**
+- `targetId` (required) — Entry ID to navigate to
+- `options.summarize` — Whether to summarize the branch being left (default: `false`)
+- `options.customInstructions` — Custom instructions for the summarizer
+- `options.replaceInstructions` — If `true`, custom instructions replace the default prompt
+- `options.label` — Label to attach to the branch summary entry
+
+**Response:**
+```json
+{
+  "command": "navigate_tree",
+  "success": true,
+  "data": {
+    "editorText": "User message text (if target was user message)",
+    "cancelled": false,
+    "aborted": false
+  }
+}
+```
+
+**Response fields:**
+- `editorText` — Text of the target entry if it was a user message (useful for pre-filling editor)
+- `cancelled` — `true` if navigation was cancelled (e.g., by extension)
+- `aborted` — `true` if summarization was aborted
+
+### 17.4 Extension UI commands
 
 See [Section 18](#18-extension-ui-protocol).
 

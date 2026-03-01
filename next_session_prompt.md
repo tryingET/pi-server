@@ -9,6 +9,12 @@
 
 ## SESSION STATUS (2026-03-01)
 
+### LATEST ADDITION
+
+| Feature | Description | Files |
+|---|---|---|
+| `navigate_tree` RPC command | Session tree navigation with optional branch summarization | `src/types.ts`, `src/command-router.ts`, `PROTOCOL.md` |
+
 ### RESOLVED (Deep Review + Follow-up Stabilization)
 
 | Finding | Fix Applied | Files |
@@ -39,20 +45,25 @@
 
 ## COMMITS (LATEST)
 
-1. `62d2d04` — `security: add path validation to load_session + protocol docs`
+1. `navigate_tree` — `feat: add navigate_tree RPC command for session tree navigation`
+   - New command: `navigate_tree` with `targetId` and optional `options` (summarize, customInstructions, replaceInstructions, label)
+   - Response includes `editorText`, `cancelled`, `aborted`
+   - Protocol docs: §17.3 with full request/response examples
+   - Wire: `src/types.ts`, `src/command-router.ts`
+2. `62d2d04` — `security: add path validation to load_session + protocol docs`
    - Security fix: path traversal prevention in `load_session`
    - Protocol docs: §2.1, §16-22 (401 lines)
    - ADR-0007: session persistence documentation
    - 8 new tests (112 total)
-2. `8ab9eec` — `Merge branch 'main' of https://github.com/tryingET/pi-server`
+3. `8ab9eec` — `Merge branch 'main' of https://github.com/tryingET/pi-server`
    - Merged remote release-please PR (v1.0.0 release)
-3. `722e25b` — `chore(package): add pi-package keyword for discoverability`
+4. `722e25b` — `chore(package): add pi-package keyword for discoverability`
    - Added `pi-package` keyword to package.json for Pi package gallery
-4. `f603a9f` — `docs(readme): clarify package is standalone server`
+5. `f603a9f` — `docs(readme): clarify package is standalone server`
    - Added note clarifying this is not an extension/skills/themes bundle
-5. `d9eb6a8` — `style(format): apply biome normalization across source files`
+6. `d9eb6a8` — `style(format): apply biome normalization across source files`
    - Formatting-only commit (11 files)
-6. `9f67477` — `fix(session): sanitize npm prefix during agent session creation`
+7. `9f67477` — `fix(session): sanitize npm prefix during agent session creation`
    - Functional fix + regression test (`src/session-manager.ts`, `src/test.ts`)
 
 (Previous deep-review atomic fix commits are already on `main`.)
@@ -87,6 +98,7 @@
 1. Continue development on `main` — release-please will create subsequent release PRs.
 2. Keep upstream AbortSignal proposal as top external unblocker.
 3. Optional: add small startup diagnostic log when npm prefix sanitization is applied (debug-only).
+4. Submit `upstream-proposal-pi-protocol.md` to pi-mono maintainers for shared protocol types.
 
 ---
 
@@ -117,3 +129,14 @@ npm run ci
 | Backpressure API gap | 🟡 Deferred/YAGNI |
 
 **Verdict:** ✅ Release-candidate ready; no known open local correctness defects in current gate suite.
+
+---
+
+## UPSTREAM PROPOSALS
+
+See `~/programming/pi-extensions/issue-tracker/pi-mono-upstream/` for pending upstream change requests:
+- `extension-ui-wouldexceedlimit.md` — ExtensionUIContext.wouldExceedLimit() method
+- `shared-protocol-package.md` — Shared @mariozechner/pi-protocol package extraction
+
+Historical proposals archived in this repo:
+- `upstream-proposal-abortcontroller.md` — AbortSignal integration

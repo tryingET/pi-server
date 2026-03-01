@@ -240,6 +240,21 @@ const handleGetForkMessages: CommandHandler = (session, command) => {
   };
 };
 
+const handleNavigateTree: CommandHandler = async (session, command) => {
+  const result = await session.navigateTree(command.targetId, command.options);
+  return {
+    id: command.id,
+    type: "response",
+    command: "navigate_tree",
+    success: true,
+    data: {
+      editorText: result.editorText,
+      cancelled: result.cancelled,
+      aborted: result.aborted,
+    },
+  };
+};
+
 const handleGetLastAssistantText: CommandHandler = (session, command) => {
   const text = session.getLastAssistantText();
   return {
@@ -421,6 +436,7 @@ export const sessionCommandHandlers: Record<string, CommandHandler> = {
   switch_session_file: handleSwitchSessionFile,
   fork: handleFork,
   get_fork_messages: handleGetForkMessages,
+  navigate_tree: handleNavigateTree,
   get_last_assistant_text: handleGetLastAssistantText,
   get_context_usage: handleGetContextUsage,
 };

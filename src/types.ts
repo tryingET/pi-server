@@ -97,6 +97,18 @@ export type SessionCommand =
   | { id?: string; sessionId: string; type: "switch_session_file"; sessionPath: string }
   | { id?: string; sessionId: string; type: "fork"; entryId: string }
   | { id?: string; sessionId: string; type: "get_fork_messages" }
+  | {
+      id?: string;
+      sessionId: string;
+      type: "navigate_tree";
+      targetId: string;
+      options?: {
+        summarize?: boolean;
+        customInstructions?: string;
+        replaceInstructions?: boolean;
+        label?: string;
+      };
+    }
   | { id?: string; sessionId: string; type: "get_last_assistant_text" }
   | { id?: string; sessionId: string; type: "get_context_usage" };
 
@@ -345,6 +357,11 @@ export type SessionResponse =
       command: "get_fork_messages";
       success: true;
       data: { messages: Array<{ entryId: string; text: string }> };
+    })
+  | (RpcResponseBase & {
+      command: "navigate_tree";
+      success: true;
+      data: { editorText?: string; cancelled: boolean; aborted?: boolean };
     })
   | (RpcResponseBase & {
       command: "get_last_assistant_text";

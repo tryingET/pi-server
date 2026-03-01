@@ -73,6 +73,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `navigate_tree` command for session tree navigation with optional branch summarization
 - Initial release of pi-server session multiplexer
 - WebSocket transport (port 3141)
 - stdio transport (JSON lines)
