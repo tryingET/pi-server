@@ -422,6 +422,66 @@ async function testValidation() {
 }
 
 // =============================================================================
+// SESSION PATH VALIDATION TESTS
+// =============================================================================
+
+import { validateSessionPath } from "./validation.js";
+
+async function testSessionPathValidation() {
+  console.log("\n=== Session Path Validation Tests ===\n");
+
+  const home = process.env.HOME || "/home/user";
+
+  // Test: Valid path under ~/.pi/agent/sessions/
+  await test("sessionPath: accepts valid path under .pi/agent/sessions", () => {
+    const error = validateSessionPath(`${home}/.pi/agent/sessions/2026-02-28/session.jsonl`);
+    assert(error === null, `Should accept valid session path, got: ${error}`);
+  });
+
+  // Test: Valid project-local path
+  await test("sessionPath: accepts valid project-local .pi/sessions path", () => {
+    const error = validateSessionPath("/home/user/project/.pi/sessions/session.jsonl");
+    assert(error === null, `Should accept project-local session path, got: ${error}`);
+  });
+
+  // Test: Reject relative path
+  await test("sessionPath: rejects relative path", () => {
+    const error = validateSessionPath("sessions/session.jsonl");
+    assert(error?.includes("absolute"), `Should reject relative path, got: ${error}`);
+  });
+
+  // Test: Reject path traversal
+  await test("sessionPath: rejects path traversal with ..", () => {
+    const error = validateSessionPath(`${home}/.pi/agent/sessions/../../../etc/passwd`);
+    assert(error?.includes("dangerous"), `Should reject path traversal, got: ${error}`);
+  });
+
+  // Test: Reject null byte injection
+  await test("sessionPath: rejects null byte injection", () => {
+    const error = validateSessionPath(`${home}/.pi/agent/sessions/session\0.jsonl`);
+    assert(error?.includes("dangerous"), `Should reject null byte, got: ${error}`);
+  });
+
+  // Test: Reject non-session file extension
+  await test("sessionPath: rejects non-session file extension", () => {
+    const error = validateSessionPath(`${home}/.pi/agent/sessions/session.txt`);
+    assert(error?.includes(".jsonl"), `Should reject non-session extension, got: ${error}`);
+  });
+
+  // Test: Reject path outside allowed directories
+  await test("sessionPath: rejects path outside allowed directories", () => {
+    const error = validateSessionPath(`/etc/sessions/session.jsonl`);
+    assert(error?.includes("allowed"), `Should reject path outside allowed dirs, got: ${error}`);
+  });
+
+  // Test: Accept .json extension
+  await test("sessionPath: accepts .json extension", () => {
+    const error = validateSessionPath(`${home}/.pi/agent/sessions/session.json`);
+    assert(error === null, `Should accept .json extension, got: ${error}`);
+  });
+}
+
+// =============================================================================
 // COMMAND ROUTER TESTS
 // =============================================================================
 
@@ -1786,6 +1846,7 @@ async function main() {
   console.log("🧪 pi-server Tests\n");
 
   await testValidation();
+  await testSessionPathValidation();
   await testCommandRouter();
   await testResourceGovernor();
   await testExtensionUI();

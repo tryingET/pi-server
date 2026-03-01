@@ -12,6 +12,7 @@ export interface ValidationError {
   message: string;
 }
 
+import path from "path";
 import { SYNTHETIC_ID_PREFIX } from "./command-replay-store.js";
 
 const MAX_PROMPT_MESSAGE_LENGTH = 200_000;
@@ -53,6 +54,68 @@ function validatePath(path: string, fieldName: string): string | null {
     }
   }
   return null;
+}
+
+/**
+ * Validate that a session path is within allowed directories.
+ * This prevents path traversal attacks when loading sessions.
+ *
+ * Allowed directories:
+ * - ~/.pi/agent/sessions/ (default session storage)
+ * - Project-local .pi/sessions/ directories
+ *
+ * @param sessionPath - The path to validate
+ * @param allowedDirs - Optional array of allowed directories (defaults to standard locations)
+ * @returns Error message if invalid, null if valid
+ */
+export function validateSessionPath(sessionPath: string, allowedDirs?: string[]): string | null {
+  // First check for dangerous path components
+  const pathError = validatePath(sessionPath, "sessionPath");
+  if (pathError) return pathError;
+
+  // Require absolute path
+  if (!path.isAbsolute(sessionPath)) {
+    return "sessionPath must be an absolute path";
+  }
+
+  // Resolve to canonical path (removes . and .. components)
+  let resolvedPath: string;
+  try {
+    resolvedPath = path.resolve(sessionPath);
+  } catch {
+    return "sessionPath could not be resolved";
+  }
+
+  // Default allowed directories
+  const home = process.env.HOME ?? "";
+  const defaultAllowedDirs = [path.join(home, ".pi", "agent", "sessions")];
+
+  // Check if path ends with .jsonl (session file extension)
+  if (!resolvedPath.endsWith(".jsonl") && !resolvedPath.endsWith(".json")) {
+    return "sessionPath must point to a .jsonl or .json session file";
+  }
+
+  // Use provided allowed dirs or defaults
+  const dirsToCheck = allowedDirs ?? defaultAllowedDirs;
+
+  // Check if resolved path is under an allowed directory
+  for (const allowedDir of dirsToCheck) {
+    const resolvedAllowed = path.resolve(allowedDir);
+    if (resolvedPath.startsWith(resolvedAllowed + path.sep) || resolvedPath === resolvedAllowed) {
+      return null; // Valid path
+    }
+  }
+
+  // Also allow any .pi/sessions directory (project-local)
+  const pathParts = resolvedPath.split(path.sep);
+  const piSessionsIndex = pathParts.findIndex(
+    (part, i) => part === ".pi" && pathParts[i + 1] === "sessions"
+  );
+  if (piSessionsIndex !== -1) {
+    return null; // Valid project-local path
+  }
+
+  return `sessionPath must be under an allowed session directory (e.g., ~/.pi/agent/sessions/ or .pi/sessions/)`;
 }
 
 /**

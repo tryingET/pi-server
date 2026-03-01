@@ -187,7 +187,10 @@ This validates:
 |----------|---------|
 | [AGENTS.md](./AGENTS.md) | Crystallized learnings, patterns, anti-patterns |
 | [PROTOCOL.md](./PROTOCOL.md) | Normative wire contract |
-| [ADR-0001](./docs/adr/0001-atomic-outcome-storage.md) | Atomic outcome storage decision |
+| [ADR-0001](./docs/adr/0001-atomic-outcome-storage.md) | Atomic outcome storage (timeout semantics) |
+| [ADR-0007](./docs/adr/0007-session-persistence.md) | Session persistence |
+| [ADR-0009](./docs/adr/0009-connection-authentication.md) | Connection authentication (planned) |
+| [ADR-0010](./docs/adr/0010-circuit-breaker.md) | Circuit breaker for LLM calls |
 | [ROADMAP.md](./ROADMAP.md) | Phase tracking and milestones |
 
 ## License

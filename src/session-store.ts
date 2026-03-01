@@ -40,8 +40,10 @@ export type SaveSessionInput = Omit<StoredSessionMetadata, "serverVersion">;
 
 /** Session with resolved metadata (combines stored + file system info). */
 export interface StoredSessionInfo extends SessionInfo {
-  /** Path to the session file */
+  /** Path to the session file (use this for load_session command) */
   sessionFile: string;
+  /** Alias for sessionFile (for consistency with load_session's sessionPath parameter) */
+  sessionPath: string;
   /** Working directory */
   cwd: string;
   /** Whether the session file still exists on disk */
@@ -308,6 +310,7 @@ export class SessionStore {
         sessionId: meta.sessionId,
         sessionName: meta.sessionName,
         sessionFile: meta.sessionFile,
+        sessionPath: meta.sessionFile, // Alias for consistency with load_session
         cwd: meta.cwd,
         createdAt: meta.createdAt,
         // These may be stale/undefined - will be refreshed when session is loaded
@@ -364,6 +367,7 @@ export class SessionStore {
             results.push({
               sessionId,
               sessionFile: filePath,
+              sessionPath: filePath, // Alias for consistency with load_session
               cwd,
               sessionName,
               createdAt,
