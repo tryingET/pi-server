@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0/).
 
+## [2.0.0](https://github.com/tryingET/pi-server/compare/v1.1.0...v2.0.0) (2026-03-01)
+
+
+### ⚠ BREAKING CHANGES
+
+* **security:** load_session now rejects paths outside allowed directories
+
+### Bug Fixes
+
+* **security:** add path validation to load_session + protocol docs ([29024d0](https://github.com/tryingET/pi-server/commit/29024d021a9fa1c0b61f93b7f0c237d75f52eb46))
+
 ## [1.1.0](https://github.com/tryingET/pi-server/compare/v1.0.0...v1.1.0) (2026-02-28)
 
 
