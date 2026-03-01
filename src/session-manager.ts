@@ -44,7 +44,7 @@ import {
 } from "./server-command-handlers.js";
 import { ExtensionUIManager } from "./extension-ui.js";
 import { createServerUIContext } from "./server-ui-context.js";
-import { validateCommand, formatValidationErrors } from "./validation.js";
+import { validateCommand, formatValidationErrors, validateSessionPath } from "./validation.js";
 import { ResourceGovernor, DEFAULT_CONFIG } from "./resource-governor.js";
 import {
   CommandReplayStore,
@@ -549,12 +549,20 @@ export class PiSessionManager implements SessionResolver {
   /**
    * Load a session from a stored session file.
    * Creates a new in-memory session that reads from the existing session file.
+   *
+   * Security: sessionPath must be under an allowed directory to prevent path traversal.
    */
   async loadSession(sessionId: string, sessionPath: string): Promise<SessionInfo> {
     // Validate session ID
     const sessionIdError = this.governor.validateSessionId(sessionId);
     if (sessionIdError) {
       throw new Error(sessionIdError);
+    }
+
+    // Validate session path (prevents path traversal)
+    const sessionPathError = validateSessionPath(sessionPath);
+    if (sessionPathError) {
+      throw new Error(sessionPathError);
     }
 
     // Acquire lock for this session ID

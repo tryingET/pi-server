@@ -2,12 +2,12 @@
 
 **Operating mode:** Production ready  
 **Phase:** COMPLETE  
-**Version:** 1.0.0 (released)  
+**Version:** 2.0.0 (released)  
 **Formalization Level:** 2 (Bounded Run)
 
 ---
 
-## SESSION STATUS (2026-02-28)
+## SESSION STATUS (2026-03-01)
 
 ### RESOLVED (Deep Review + Follow-up Stabilization)
 
@@ -20,6 +20,7 @@
 | Shutdown uptime metric dropped | Emit uptime gauge before final `metrics.flush()` | `src/server.ts` |
 | `create_session`/`load_session` flaky under `npm test` due to env leakage | Sanitized `npm_config_prefix`/`NPM_CONFIG_PREFIX` around `createAgentSession()` to prevent project-local global installs (`./lib/node_modules`) | `src/session-manager.ts` |
 | CI failed on format gate | Applied Biome normalization across source set | 11 formatting-only files |
+| **Path traversal vulnerability in load_session** | Added `validateSessionPath()` to reject `..`, relative paths, null bytes, paths outside allowed directories | `src/validation.ts`, `src/session-manager.ts` |
 
 ### TESTS ADDED/UPDATED
 
@@ -30,6 +31,7 @@
   - `load_session` initializes version to `0` (auto + explicit session id)
   - shutdown flush includes uptime metric
   - `create_session` ignores leaked `npm_config_prefix`
+  - **8 path validation tests** (relative, traversal, null byte, extension, allowed dirs)
 - `src/test-session-version-store.ts`
   - `load_session` initializes version to `0`
 
@@ -37,15 +39,20 @@
 
 ## COMMITS (LATEST)
 
-1. `8ab9eec` — `Merge branch 'main' of https://github.com/tryingET/pi-server`
+1. `62d2d04` — `security: add path validation to load_session + protocol docs`
+   - Security fix: path traversal prevention in `load_session`
+   - Protocol docs: §2.1, §16-22 (401 lines)
+   - ADR-0007: session persistence documentation
+   - 8 new tests (112 total)
+2. `8ab9eec` — `Merge branch 'main' of https://github.com/tryingET/pi-server`
    - Merged remote release-please PR (v1.0.0 release)
-2. `722e25b` — `chore(package): add pi-package keyword for discoverability`
+3. `722e25b` — `chore(package): add pi-package keyword for discoverability`
    - Added `pi-package` keyword to package.json for Pi package gallery
-3. `f603a9f` — `docs(readme): clarify package is standalone server`
+4. `f603a9f` — `docs(readme): clarify package is standalone server`
    - Added note clarifying this is not an extension/skills/themes bundle
-4. `d9eb6a8` — `style(format): apply biome normalization across source files`
+5. `d9eb6a8` — `style(format): apply biome normalization across source files`
    - Formatting-only commit (11 files)
-5. `9f67477` — `fix(session): sanitize npm prefix during agent session creation`
+6. `9f67477` — `fix(session): sanitize npm prefix during agent session creation`
    - Functional fix + regression test (`src/session-manager.ts`, `src/test.ts`)
 
 (Previous deep-review atomic fix commits are already on `main`.)
@@ -65,10 +72,10 @@
 
 | Check | Status |
 |---|---|
-| Version | **1.0.0** (released) |
+| Version | **2.0.0** (released) |
 | `npm run check` | ✅ |
 | `npm run build` | ✅ |
-| `npm test` | ✅ 104 passed, 0 failed |
+| `npm test` | ✅ 112 passed, 0 failed |
 | `npm run test:integration` | ✅ 26 passed, 0 failed |
 | `npm run test:fuzz` | ✅ 17 passed, 0 failed |
 | `npm run ci` | ✅ |
@@ -86,8 +93,8 @@
 ## ROLLBACK (LATEST CHANGES)
 
 ```bash
-# revert latest two commits only
-git revert d9eb6a8 9f67477
+# revert latest security commit
+git revert 62d2d04
 
 # re-validate
 npm run ci
@@ -105,6 +112,7 @@ npm run ci
 | Session version consistency on load | ✅ Fixed + regression-tested |
 | Final shutdown metrics flush correctness | ✅ Fixed + regression-tested |
 | npm env leakage resilience in session creation | ✅ Fixed + regression-tested |
+| **Path traversal protection in load_session** | ✅ Fixed + regression-tested |
 | Upstream AbortSignal gap | 🔵 Deferred upstream |
 | Backpressure API gap | 🟡 Deferred/YAGNI |
 

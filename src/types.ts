@@ -246,7 +246,10 @@ export type ServerResponse =
 
 // ADR-0007: Stored session info (extends SessionInfo with persistence metadata)
 export interface StoredSessionInfo extends SessionInfo {
+  /** Path to the session file (use this for load_session command) */
   sessionFile: string;
+  /** Alias for sessionFile (for consistency with load_session's sessionPath parameter) */
+  sessionPath: string;
   cwd: string;
   fileExists: boolean;
 }
