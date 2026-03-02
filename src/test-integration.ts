@@ -163,6 +163,12 @@ interface WSMessage {
   [key: string]: unknown;
 }
 
+interface IdentifiedCommand {
+  id: string;
+  type: string;
+  [key: string]: unknown;
+}
+
 class TestClient {
   private ws: WebSocket | null = null;
   private messages: WSMessage[] = [];
@@ -210,6 +216,30 @@ class TestClient {
         else resolve();
       });
     });
+  }
+
+  async waitForResponseById(id: string, timeoutMs = 5000): Promise<WSMessage> {
+    return this.waitForMessage((msg) => msg.type === "response" && msg.id === id, timeoutMs);
+  }
+
+  async sendAndWaitForResponse(command: IdentifiedCommand, timeoutMs = 5000): Promise<WSMessage> {
+    await this.send(command);
+    const response = await this.waitForResponseById(command.id, timeoutMs);
+    assert.strictEqual(response.command, command.type);
+    return response;
+  }
+
+  async sendAndExpectSuccess(
+    command: IdentifiedCommand,
+    options?: { timeoutMs?: number; successMessage?: string }
+  ): Promise<WSMessage> {
+    const response = await this.sendAndWaitForResponse(command, options?.timeoutMs);
+    assert.strictEqual(
+      response.success,
+      true,
+      options?.successMessage ?? `${command.type} command should succeed`
+    );
+    return response;
   }
 
   /**
@@ -331,13 +361,11 @@ async function testCommandResponse() {
       await client.connect(ctx.port);
       client.clearMessages(); // Clear server_ready
 
-      await client.send({ type: "list_sessions" });
-
-      const response = await client.waitForMessage(
-        (msg) => msg.type === "response" && msg.command === "list_sessions"
-      );
-
-      assert.strictEqual(response.success, true);
+      const listCommandId = "list-empty";
+      const response = await client.sendAndExpectSuccess({
+        id: listCommandId,
+        type: "list_sessions",
+      });
       assert.ok(Array.isArray(response.data?.sessions), "Should have sessions array");
       assert.strictEqual(response.data.sessions.length, 0, "Should be empty initially");
 
@@ -349,18 +377,25 @@ async function testCommandResponse() {
       await client.connect(ctx.port);
       client.clearMessages();
 
-      await client.send({ type: "create_session", sessionId: "test-session-1" });
-
-      const response = await client.waitForMessage(
-        (msg) => msg.type === "response" && msg.command === "create_session"
-      );
-
-      assert.strictEqual(response.success, true);
+      const createCommandId = "test-session-1:create";
+      const response = await client.sendAndExpectSuccess({
+        id: createCommandId,
+        type: "create_session",
+        sessionId: "test-session-1",
+      });
       assert.strictEqual(response.data?.sessionId, "test-session-1");
       assert.ok(response.data?.sessionInfo, "Should have sessionInfo");
 
       // Cleanup
-      await client.send({ type: "delete_session", sessionId: "test-session-1" });
+      const deleteCommandId = "test-session-1:delete";
+      await client.sendAndExpectSuccess(
+        {
+          id: deleteCommandId,
+          type: "delete_session",
+          sessionId: "test-session-1",
+        },
+        { successMessage: "delete_session cleanup should succeed" }
+      );
 
       client.close();
     });
@@ -371,23 +406,31 @@ async function testCommandResponse() {
       client.clearMessages();
 
       // Create
-      await client.send({ type: "create_session", sessionId: "test-session-2" });
-      await client.waitForMessage((msg) => msg.command === "create_session");
-
-      // Delete
-      await client.send({ type: "delete_session", sessionId: "test-session-2" });
-      const response = await client.waitForMessage(
-        (msg) => msg.type === "response" && msg.command === "delete_session"
+      const createCommandId = "test-session-2:create";
+      await client.sendAndExpectSuccess(
+        {
+          id: createCommandId,
+          type: "create_session",
+          sessionId: "test-session-2",
+        },
+        { successMessage: "create_session precondition should succeed" }
       );
 
-      assert.strictEqual(response.success, true);
+      // Delete
+      const deleteCommandId = "test-session-2:delete";
+      const response = await client.sendAndExpectSuccess({
+        id: deleteCommandId,
+        type: "delete_session",
+        sessionId: "test-session-2",
+      });
       assert.strictEqual(response.data?.deleted, true);
 
       // Verify gone
-      await client.send({ type: "list_sessions" });
-      const listResponse = await client.waitForMessage(
-        (msg) => msg.type === "response" && msg.command === "list_sessions"
-      );
+      const listCommandId = "test-session-2:list";
+      const listResponse = await client.sendAndExpectSuccess({
+        id: listCommandId,
+        type: "list_sessions",
+      });
       assert.ok(listResponse.data?.sessions, "Should have sessions");
       assert.strictEqual(listResponse.data!.sessions!.length, 0);
 
@@ -451,25 +494,21 @@ async function testCommandResponse() {
       client.clearMessages();
 
       const sessionId = `tree-known-${Date.now()}`;
-      await client.send({ type: "create_session", sessionId });
-      await client.waitForMessage(
-        (msg) => msg.type === "response" && msg.command === "create_session",
-        10000
+      const createCommandId = `${sessionId}:create`;
+      await client.sendAndExpectSuccess(
+        { id: createCommandId, type: "create_session", sessionId },
+        { timeoutMs: 10000, successMessage: "create_session precondition should succeed" }
       );
 
-      await client.send({
-        id: "tree-known-probe",
-        type: "navigate_tree",
-        sessionId,
-        targetId: "entry-does-not-exist",
-      });
-
-      const navigateResponse = await client.waitForMessage(
-        (msg) => msg.type === "response" && msg.id === "tree-known-probe",
+      const navigateResponse = await client.sendAndWaitForResponse(
+        {
+          id: "tree-known-probe",
+          type: "navigate_tree",
+          sessionId,
+          targetId: "entry-does-not-exist",
+        },
         10000
       );
-
-      assert.strictEqual(navigateResponse.command, "navigate_tree");
       const navigateError = String(navigateResponse.error || "");
       assert.strictEqual(
         navigateError.includes("Unknown command type"),
@@ -477,10 +516,10 @@ async function testCommandResponse() {
         "navigate_tree must not be rejected as unknown command"
       );
 
-      await client.send({ type: "delete_session", sessionId });
-      await client.waitForMessage(
-        (msg) => msg.type === "response" && msg.command === "delete_session",
-        10000
+      const deleteCommandId = `${sessionId}:delete`;
+      await client.sendAndExpectSuccess(
+        { id: deleteCommandId, type: "delete_session", sessionId },
+        { timeoutMs: 10000, successMessage: "delete_session cleanup should succeed" }
       );
       client.close();
     });
@@ -504,15 +543,22 @@ async function testCommandResponse() {
         message: "next",
       });
 
-      const createResp = await client.waitForMessage((msg) => msg.id === "burst-1", 15000);
-      const steerResp = await client.waitForMessage((msg) => msg.id === "burst-2", 15000);
-      const followResp = await client.waitForMessage((msg) => msg.id === "burst-3", 15000);
+      const createResp = await client.waitForResponseById("burst-1", 15000);
+      const steerResp = await client.waitForResponseById("burst-2", 15000);
+      const followResp = await client.waitForResponseById("burst-3", 15000);
 
       assert.strictEqual(createResp.success, true, "create_session should succeed");
       assert.strictEqual(steerResp.success, true, "steer should execute after create");
       assert.strictEqual(followResp.success, true, "follow_up should execute after create");
 
-      await client.send({ type: "delete_session", sessionId: "burst-order" });
+      await client.sendAndExpectSuccess(
+        {
+          id: "burst-delete",
+          type: "delete_session",
+          sessionId: "burst-order",
+        },
+        { timeoutMs: 15000, successMessage: "delete_session cleanup should succeed" }
+      );
       client.close();
     });
 
@@ -549,8 +595,10 @@ async function testCommandResponse() {
       await client.connect(ctx.port);
       client.clearMessages();
 
-      await client.send({ id: "dup-int", type: "list_sessions" });
-      await client.waitForMessage((msg) => msg.id === "dup-int" && msg.success === true, 8000);
+      await client.sendAndExpectSuccess(
+        { id: "dup-int", type: "list_sessions" },
+        { timeoutMs: 8000 }
+      );
 
       await client.send({ id: "dup-int", type: "health_check" });
       const conflict = await client.waitForMessage(
@@ -568,8 +616,10 @@ async function testCommandResponse() {
       await client.connect(ctx.port);
       client.clearMessages();
 
-      await client.send({ id: "idem-int-1", type: "list_sessions", idempotencyKey: "idem-int" });
-      await client.waitForMessage((msg) => msg.id === "idem-int-1" && msg.success === true, 8000);
+      await client.sendAndExpectSuccess(
+        { id: "idem-int-1", type: "list_sessions", idempotencyKey: "idem-int" },
+        { timeoutMs: 8000 }
+      );
 
       await client.send({ id: "idem-int-2", type: "health_check", idempotencyKey: "idem-int" });
       const conflict = await client.waitForMessage(
@@ -593,10 +643,15 @@ async function testBroadcasts() {
       await client.connect(ctx.port);
       client.clearMessages();
 
-      await client.send({ type: "create_session", sessionId: "broadcast-test-1" });
-
-      // Wait for response
-      await client.waitForMessage((msg) => msg.command === "create_session");
+      const createCommandId = "broadcast-test-1:create";
+      await client.sendAndExpectSuccess(
+        {
+          id: createCommandId,
+          type: "create_session",
+          sessionId: "broadcast-test-1",
+        },
+        { successMessage: "create_session precondition should succeed" }
+      );
 
       // Wait for broadcast
       const broadcast = await client.waitForMessage((msg) => msg.type === "session_created");
@@ -613,13 +668,27 @@ async function testBroadcasts() {
       client.clearMessages();
 
       // Create
-      await client.send({ type: "create_session", sessionId: "broadcast-test-2" });
-      await client.waitForMessage((msg) => msg.command === "create_session");
+      const createCommandId = "broadcast-test-2:create";
+      await client.sendAndExpectSuccess(
+        {
+          id: createCommandId,
+          type: "create_session",
+          sessionId: "broadcast-test-2",
+        },
+        { successMessage: "create_session precondition should succeed" }
+      );
       client.clearMessages();
 
       // Delete
-      await client.send({ type: "delete_session", sessionId: "broadcast-test-2" });
-      await client.waitForMessage((msg) => msg.command === "delete_session");
+      const deleteCommandId = "broadcast-test-2:delete";
+      await client.sendAndExpectSuccess(
+        {
+          id: deleteCommandId,
+          type: "delete_session",
+          sessionId: "broadcast-test-2",
+        },
+        { successMessage: "delete_session precondition should succeed" }
+      );
 
       // Wait for broadcast
       const broadcast = await client.waitForMessage((msg) => msg.type === "session_deleted");
@@ -670,13 +739,11 @@ async function testConnectionLimit() {
       await client.connect(ctx.port);
       client.clearMessages();
 
-      await client.send({ type: "get_metrics" });
-
-      const response = await client.waitForMessage(
-        (msg) => msg.type === "response" && msg.command === "get_metrics"
-      );
-
-      assert.strictEqual(response.success, true);
+      const metricsCommandId = "metrics-connection-count";
+      const response = await client.sendAndExpectSuccess({
+        id: metricsCommandId,
+        type: "get_metrics",
+      });
       assert.ok(typeof response.data?.connectionCount === "number", "Should have connectionCount");
       assert.ok(response.data.connectionCount >= 1, "Should have at least 1 connection");
 
@@ -695,17 +762,22 @@ async function testMetrics() {
       client.clearMessages();
 
       // Create a session
-      await client.send({ type: "create_session", sessionId: "metrics-test" });
-      await client.waitForMessage((msg) => msg.command === "create_session");
+      const createCommandId = "metrics-test:create";
+      await client.sendAndExpectSuccess(
+        {
+          id: createCommandId,
+          type: "create_session",
+          sessionId: "metrics-test",
+        },
+        { successMessage: "create_session precondition should succeed" }
+      );
       client.clearMessages();
 
-      await client.send({ type: "get_metrics" });
-
-      const response = await client.waitForMessage(
-        (msg) => msg.type === "response" && msg.command === "get_metrics"
-      );
-
-      assert.strictEqual(response.success, true);
+      const metricsCommandId = "metrics-complete";
+      const response = await client.sendAndExpectSuccess({
+        id: metricsCommandId,
+        type: "get_metrics",
+      });
       assert.ok(typeof response.data?.sessionCount === "number");
       assert.ok(typeof response.data?.connectionCount === "number");
       assert.ok(typeof response.data?.totalCommandsExecuted === "number");
@@ -727,13 +799,11 @@ async function testHealthCheck() {
       await client.connect(ctx.port);
       client.clearMessages();
 
-      await client.send({ type: "health_check" });
-
-      const response = await client.waitForMessage(
-        (msg) => msg.type === "response" && msg.command === "health_check"
-      );
-
-      assert.strictEqual(response.success, true);
+      const healthCommandId = "health-check";
+      const response = await client.sendAndExpectSuccess({
+        id: healthCommandId,
+        type: "health_check",
+      });
       assert.ok(typeof response.data?.healthy === "boolean");
       assert.ok(Array.isArray(response.data?.issues));
 
@@ -780,11 +850,10 @@ async function testCommandId() {
       await client.connect(ctx.port);
       client.clearMessages();
 
-      await client.send({ type: "list_sessions", id: "test-id-123" });
-
-      const response = await client.waitForMessage(
-        (msg) => msg.type === "response" && msg.command === "list_sessions"
-      );
+      const response = await client.sendAndExpectSuccess({
+        type: "list_sessions",
+        id: "test-id-123",
+      });
 
       assert.strictEqual(response.id, "test-id-123");
 
@@ -833,17 +902,15 @@ async function testConcurrentClients() {
         })
       );
 
-      await Promise.all(clients.map((c) => c.send({ type: "list_sessions" })));
-
-      const responses = await Promise.all(
-        clients.map((c) =>
-          c.waitForMessage((msg) => msg.type === "response" && msg.command === "list_sessions")
+      const commandIds = clients.map((_, i) => `concurrent-list-${i}`);
+      await Promise.all(
+        clients.map((c, i) =>
+          c.sendAndExpectSuccess({
+            id: commandIds[i],
+            type: "list_sessions",
+          })
         )
       );
-
-      for (const r of responses) {
-        assert.strictEqual(r.success, true);
-      }
 
       for (const c of clients) c.close();
     });
@@ -862,11 +929,17 @@ async function testSessionEventSubscription() {
       clientA.clearMessages();
       clientB.clearMessages();
 
-      await clientA.send({ type: "create_session", sessionId: "evt-1" });
-      await clientA.waitForMessage((msg) => msg.command === "create_session");
+      const createCommandId = "evt-1:create";
+      await clientA.sendAndExpectSuccess(
+        { id: createCommandId, type: "create_session", sessionId: "evt-1" },
+        { successMessage: "create_session precondition should succeed" }
+      );
 
-      await clientA.send({ type: "switch_session", sessionId: "evt-1" });
-      await clientA.waitForMessage((msg) => msg.command === "switch_session");
+      const switchCommandId = "evt-1:switch";
+      await clientA.sendAndExpectSuccess(
+        { id: switchCommandId, type: "switch_session", sessionId: "evt-1" },
+        { successMessage: "switch_session precondition should succeed" }
+      );
 
       // Inject a synthetic event through internal manager to test subscription filtering.
       (ctx.server.getSessionManager() as any).broadcastEvent("evt-1", { type: "test_event" });
@@ -883,7 +956,11 @@ async function testSessionEventSubscription() {
         "Unsubscribed client should not receive session events"
       );
 
-      await clientA.send({ type: "delete_session", sessionId: "evt-1" });
+      const deleteCommandId = "evt-1:delete";
+      await clientA.sendAndExpectSuccess(
+        { id: deleteCommandId, type: "delete_session", sessionId: "evt-1" },
+        { successMessage: "delete_session cleanup should succeed" }
+      );
       clientA.close();
       clientB.close();
     });
@@ -899,8 +976,11 @@ async function testRateLimitingUnderLoad() {
       await client.connect(ctx.port);
       client.clearMessages();
 
-      await client.send({ type: "create_session", sessionId: "rl-1" });
-      await client.waitForMessage((msg) => msg.command === "create_session");
+      const createCommandId = "rl-1:create";
+      await client.sendAndExpectSuccess(
+        { id: createCommandId, type: "create_session", sessionId: "rl-1" },
+        { successMessage: "create_session precondition should succeed" }
+      );
       client.clearMessages();
 
       for (let i = 0; i < 120; i++) {
@@ -923,7 +1003,17 @@ async function testRateLimitingUnderLoad() {
 
       assert.strictEqual(gotRateLimit, true, "Expected at least one rate-limit rejection");
 
-      await client.send({ type: "delete_session", sessionId: "rl-1" });
+      const deleteCommandId = "rl-1:delete";
+      const deleteResponse = await client.sendAndWaitForResponse(
+        { id: deleteCommandId, type: "delete_session", sessionId: "rl-1" },
+        10000
+      );
+      if (!deleteResponse.success) {
+        assert.ok(
+          String(deleteResponse.error || "").includes("Rate limit"),
+          "delete_session may be rate-limited after saturation"
+        );
+      }
       client.close();
     });
   });
