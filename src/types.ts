@@ -215,6 +215,20 @@ export type ServerResponse =
             /** Count of metadata file resets due to corruption/oversize */
             metadataResetCount: number;
           };
+          /** Durable command journal stats (Level 4 foundation). */
+          journal: {
+            enabled: boolean;
+            initialized: boolean;
+            journalPath: string;
+            schemaVersion: number;
+            entriesWritten: number;
+            writeErrors: number;
+            entriesScanned: number;
+            malformedEntries: number;
+            unsupportedVersionEntries: number;
+            recoveredOutcomes: number;
+            recoveredInFlightFailures: number;
+          };
         };
         /** Circuit breaker metrics per provider (ADR-0010) */
         circuitBreakers: CircuitBreakerMetrics[];

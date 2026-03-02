@@ -337,7 +337,7 @@ Conformant clients:
 
 1. No global total ordering (lane determinism only).
 2. Timeout does not prove cancellation completed.
-3. Durable journal/replay is future work (Level 4).
+3. Durable replay beyond process lifetime is partially implemented behind a feature flag (`durableJournal.enabled`); full history/replay APIs remain Level 4 work.
 
 ---
 

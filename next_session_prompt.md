@@ -1,7 +1,7 @@
 # pi-server: Next Session Prompt
 
 **Operating mode:** Production-ready, reliability-first  
-**Current phase:** Level 4 (Durable command journal + replay) — active planning  
+**Current phase:** Level 4 (Durable command journal + replay) — active execution  
 **Version:** 2.0.1 (current)  
 **Formalization Level:** 2 (Bounded Run)
 
@@ -13,38 +13,44 @@
 
 | Feature | Description | Files |
 |---|---|---|
-| 10,000ft project vision | Added deep-review-based strategic vision doc with Horizon A/B/C plan | `docs/project/vision.md` |
-| Runtime version truth unification | Removed hardcoded server version; runtime now reads from `package.json` for `server_ready` and server metadata defaults | `src/server.ts`, `src/session-store.ts` |
-| Authentication docs alignment | Marked ADR-0009 as superseded, added ADR-0014 (implemented auth), updated README/PROTOCOL/docs index | `docs/adr/0009-connection-authentication.md`, `docs/adr/0014-pluggable-authentication.md`, `README.md`, `PROTOCOL.md`, `docs/README.md` |
-| Program status alignment | Roadmap now reflects Level 4 active planning instead of Level 3 current-phase messaging | `ROADMAP.md` |
-| Version/docs drift gate | New consistency checker validates runtime/package/docs alignment; wired into local CI script + GitHub CI workflow | `scripts/check-version-docs.mjs`, `package.json`, `.github/workflows/ci.yml` |
+| Durable command journal foundation | Added append-only JSONL journal with per-lane sequence numbers and lifecycle persistence (`accepted`/`started`/`finished`) behind `durableJournal.enabled` | `src/command-journal.ts`, `src/session-manager.ts`, `src/server.ts` |
+| Deterministic startup rehydration | On startup, completed explicit outcomes are rehydrated; pre-crash in-flight explicit commands are deterministically marked failed and journaled | `src/command-journal.ts`, `src/session-manager.ts` |
+| Journal observability surface | `get_metrics.stores.journal` now exposes journal stats and recovery counters | `src/session-manager.ts`, `src/types.ts` |
+| Level 4 architecture decision | Documented backend choice (JSONL), schema v1, migration guardrails, and recovery policy | `docs/adr/0019-durable-command-journal-foundation.md` |
+| Test coverage for restart semantics | Added tests for durable replay across restart and in-flight recovery classification | `src/test.ts` |
+| Packaging/build updates | Added `command-journal` to build entries and published artifact list | `package.json` |
+| Docs updates | Added ADR index + README references; protocol limitation updated to feature-flagged durable status | `docs/README.md`, `README.md`, `PROTOCOL.md` |
 
 ---
 
-## RESOLVED IN THIS SESSION (Horizon A)
+## RESOLVED IN THIS SESSION (Horizon B kickoff)
 
 | Finding | Fix Applied | Files |
 |---|---|---|
-| Runtime/server version drift (`0.1.0` vs package version) | Version now loaded from `package.json` at runtime with safe fallback | `src/server.ts`, `src/session-store.ts` |
-| Authentication narrative drift | Replaced “planned” messaging with implemented ADR-0014 references | `README.md`, `PROTOCOL.md`, `docs/README.md` |
-| Stale ADR status | Rewrote ADR-0009 as historical/superseded; created ADR-0014 as current source of truth | `docs/adr/0009-connection-authentication.md`, `docs/adr/0014-pluggable-authentication.md` |
-| No automated drift detection | Added machine-enforced check for version/auth/roadmap doc consistency | `scripts/check-version-docs.mjs`, `package.json`, `.github/workflows/ci.yml` |
+| L4 backend decision unresolved | Chosen append-only JSONL for foundation, documented as ADR-0019 | `docs/adr/0019-durable-command-journal-foundation.md` |
+| No durable command lifecycle substrate | Added journal store with schema-versioned lifecycle records and per-lane monotonic sequencing | `src/command-journal.ts` |
+| No startup recovery rehydration | Added one-time startup initialization path in session manager/server startup | `src/session-manager.ts`, `src/server.ts` |
+| Crash leaves in-flight commands indeterminate after restart | Recovery pass now classifies pre-crash in-flight explicit commands as deterministic failed outcomes | `src/command-journal.ts` |
+| No runtime visibility into journal health | Added journal metrics fields to `get_metrics` response contract | `src/session-manager.ts`, `src/types.ts` |
 
 ---
 
 ## TEST / VERIFICATION SNAPSHOT (CURRENT)
 
-All of the following were run after the Horizon A changes:
+Executed after Horizon B foundation changes:
 
 | Check | Status |
 |---|---|
+| `npm run typecheck` | ✅ |
+| `npm run lint` | ✅ |
+| `npm run format:check` | ✅ |
+| `npm run build` | ✅ |
+| `npm test` | ✅ 119 passed, 0 failed |
 | `npm run check:consistency` | ✅ |
-| `npm run ci` | ✅ |
-| `npm run test:integration` | ✅ 27 passed, 0 failed |
-| `npm run test:fuzz` | ✅ 17 passed, 0 failed |
 
-Notable runtime verification:
-- `server_ready.data.serverVersion` now emits **`2.0.1`** (aligned with `package.json`).
+Notable functional verification:
+- Explicit command outcomes now replay across manager restart when durable journal is enabled.
+- Pre-crash in-flight explicit command IDs are replayed as deterministic recovery failures.
 
 ---
 
@@ -52,7 +58,8 @@ Notable runtime verification:
 
 | Finding | Rationale | Owner | Trigger | Deadline | Blast Radius |
 |---|---|---|---|---|---|
-| **Durable command journal + recovery model (Level 4)** | Needed for crash survivability, audit/replay beyond process lifetime | Maintainer | Level 4 execution start | Current phase | Global correctness across restarts |
+| **Level 4 completion: history API + replay extraction** | Durable substrate exists; external query/export APIs still missing | Maintainer | L4.3 execution | Current phase | Auditability / incident tooling |
+| **Retention + compaction policy** | JSONL growth is unbounded without retention/compaction controls | Maintainer | L4.4 execution | Current phase | Disk pressure / long-term ops |
 | **AbortController integration upstream** | Requires `@mariozechner/pi-coding-agent` API support for caller-provided `AbortSignal` | Maintainer | Upstream accepts proposal (`upstream-proposal-abortcontroller.md`) | Next major version | Timeout semantic mismatch + wasted LLM tokens |
 | **AgentSession backpressure API** | Deferred as YAGNI at current throughput; revisit with telemetry evidence | Maintainer | Sustained high `ws.bufferedAmount` / memory pressure metrics | When needed | Potential OOM under pathological slow consumers |
 
@@ -60,48 +67,55 @@ Notable runtime verification:
 
 ## NEXT STEPS (PRIORITIZED)
 
-1. **Start Horizon B / Level 4 foundation**
-   - Decide journal backend (append-only JSONL vs SQLite)
-   - Define on-disk schema + migration policy
-   - Implement deterministic startup rehydration path
+1. **L4.2 recovery surface completion**
+   - Expose startup recovery summary via protocol event or dedicated command
+   - Add deterministic fixture tests for repeated boot equivalence
 
-2. **Preserve truth alignment discipline**
-   - Keep `check:consistency` green in all PRs
-   - Extend checker once Level 4 artifacts land (journal schema version checks)
+2. **L4.3 replay/history API**
+   - Define `get_command_history` contract (filters: session, commandId, time window)
+   - Implement server handler backed by durable journal scan/index
 
-3. **Optional near-term hardening**
-   - Continue reducing `console.*` in core runtime paths in favor of structured `Logger`
-   - Add a release-time docs freshness checklist entry (if not automated)
+3. **L4.4 retention + compaction**
+   - Add time/size retention policy
+   - Add compaction pass with replay-equivalence tests
+
+4. **Durability mode hardening**
+   - Decide strict write-failure behavior (fail-open vs fail-closed) for journal append errors
+   - Add chaos tests for partial writes/corrupt lines and schema-version mismatch behavior
+
+5. **Validation + CI expansion**
+   - Re-run full extended gates (`npm run test:integration`, `npm run test:fuzz`) after next L4 increments
+   - Consider adding journal schema checks to `check:consistency`
 
 ---
 
 ## ROLLBACK (THIS SESSION)
 
 ```bash
-# Revert latest alignment + consistency-gate changes (after commit)
-# Replace <new-commit-sha> with actual SHA
+# Revert latest durable-journal foundation commit(s)
+# Replace <new-commit-sha> with actual SHA(s)
 
 git revert <new-commit-sha>
 
 # Re-validate
-npm run ci
-npm run test:integration
-npm run test:fuzz
+npm run build
+npm test
+npm run check:consistency
 ```
 
 ---
 
-## PRODUCTION READINESS (POST-HORIZON-A)
+## PRODUCTION READINESS (POST-HORIZON-B FOUNDATION)
 
 | Check | Status |
 |---|---|
 | Runtime/package version alignment | ✅ enforced by check script |
 | Auth docs/source-of-truth alignment | ✅ ADR-0014 canonicalized |
-| Roadmap phase alignment | ✅ Level 4 active planning reflected |
-| Deterministic replay/timeouts invariants | ✅ retained |
-| Full test gates | ✅ green |
+| Durable journal foundation | ✅ implemented behind feature flag |
+| Startup deterministic rehydration | ✅ implemented for explicit command IDs |
+| Full local quality gates run this session | ✅ green |
 
-**Verdict:** ✅ Ready to proceed into Level 4 implementation with a cleaner truth surface and automated drift protection.
+**Verdict:** ✅ Level 4 foundation is in place; proceed with history/replay API and retention/compaction completion.
 
 ---
 

@@ -1114,6 +1114,7 @@ async function testExtensionUI() {
 
 import { PiSessionManager } from "./session-manager.js";
 import { PiServer } from "./server.js";
+import { DurableCommandJournal } from "./command-journal.js";
 import { MetricNames, type MetricEvent, type MetricsSink } from "./metrics-types.js";
 
 class BufferedTestSink implements MetricsSink {
@@ -1491,6 +1492,84 @@ async function testSessionManager() {
     assert.strictEqual(second.success, false, "Replay should preserve terminal timeout outcome");
     assert.strictEqual(second.timedOut, true, "Replay should stay timedOut");
     assert.strictEqual(second.replayed, true, "Replay should be served from cache");
+  });
+
+  await test("session-manager: durable journal rehydrates completed outcomes across restart", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-completed-"));
+
+    try {
+      const firstManager = new PiSessionManager(undefined, {
+        durableJournal: { enabled: true, dataDir: journalDir },
+      });
+      await firstManager.initialize();
+
+      const first = await firstManager.executeCommand({
+        id: "durable-replay-1",
+        type: "list_sessions",
+      });
+      assert.strictEqual(first.success, true);
+
+      firstManager.disposeAllSessions();
+
+      const secondManager = new PiSessionManager(undefined, {
+        durableJournal: { enabled: true, dataDir: journalDir },
+      });
+      await secondManager.initialize();
+
+      const second = await secondManager.executeCommand({
+        id: "durable-replay-1",
+        type: "list_sessions",
+      });
+      assert.strictEqual(second.success, true);
+      assert.strictEqual(second.replayed, true, "Expected replay from durable recovery cache");
+
+      secondManager.disposeAllSessions();
+    } finally {
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-manager: durable journal marks pre-crash in-flight commands as failed", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-inflight-"));
+
+    try {
+      const seededJournal = new DurableCommandJournal({
+        enabled: true,
+        dataDir: journalDir,
+      });
+      await seededJournal.initialize();
+
+      seededJournal.appendLifecycle({
+        phase: "command_accepted",
+        commandId: "crash-inflight-1",
+        commandType: "list_sessions",
+        laneKey: "server",
+        fingerprint: JSON.stringify({ type: "list_sessions" }),
+        explicitId: true,
+      });
+
+      const recoveredManager = new PiSessionManager(undefined, {
+        durableJournal: { enabled: true, dataDir: journalDir },
+      });
+      await recoveredManager.initialize();
+
+      const replay = await recoveredManager.executeCommand({
+        id: "crash-inflight-1",
+        type: "list_sessions",
+      });
+
+      assert.strictEqual(replay.success, false, "Recovered in-flight command should be failed");
+      assert.strictEqual(
+        replay.replayed,
+        true,
+        "Recovered failure should replay deterministically"
+      );
+      assert.ok(replay.error?.includes("did not finish before previous shutdown"));
+
+      recoveredManager.disposeAllSessions();
+    } finally {
+      rmSync(journalDir, { recursive: true, force: true });
+    }
   });
 
   await test("session-manager: emits command_finished for admitted rate-limited commands", async () => {

@@ -13,6 +13,7 @@ import fs from "fs";
 import * as readline from "readline";
 import { WebSocketServer, WebSocket } from "ws";
 import { PiSessionManager } from "./session-manager.js";
+import type { DurableCommandJournalOptions } from "./command-journal.js";
 import type { RpcCommand, RpcResponse, Subscriber, RpcBroadcast } from "./types.js";
 import { getSessionId as getSessionIdFromCmd, isCreateSessionResponse } from "./types.js";
 import { type AuthProvider, type AuthContext, AllowAllAuthProvider } from "./auth.js";
@@ -292,10 +293,12 @@ export interface PiServerOptions {
   onAlert?: (alert: Alert) => void | Promise<void>;
   /** Called when an alert clears (optional) */
   onAlertClear?: (alert: Alert) => void | Promise<void>;
+  /** Durable command journal options (Level 4 foundation, feature-flagged). */
+  durableJournal?: DurableCommandJournalOptions;
 }
 
 export class PiServer {
-  private sessionManager = new PiSessionManager(undefined, { serverVersion: SERVER_VERSION });
+  private sessionManager: PiSessionManager;
   private wss: WebSocketServer | null = null;
   private stdinInterface: readline.Interface | null = null;
   private authProvider: AuthProvider;
@@ -313,6 +316,10 @@ export class PiServer {
 
   constructor(options: PiServerOptions = {}) {
     this.authProvider = options.authProvider ?? new AllowAllAuthProvider();
+    this.sessionManager = new PiSessionManager(undefined, {
+      serverVersion: SERVER_VERSION,
+      durableJournal: options.durableJournal,
+    });
 
     // Setup logger
     this.logger =
@@ -385,6 +392,9 @@ export class PiServer {
   }
 
   async start(port: number = DEFAULT_PORT): Promise<void> {
+    // Run one-time startup initialization (durable journal rehydration, etc.)
+    await this.sessionManager.initialize();
+
     // Start WebSocket server
     this.wss = new WebSocketServer({ port });
     this.setupWebSocket(this.wss);

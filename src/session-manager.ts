@@ -57,6 +57,11 @@ import { SessionLockManager } from "./session-lock-manager.js";
 import { SessionStore, type StoredSessionInfo } from "./session-store.js";
 import { CircuitBreakerManager, type CircuitBreakerConfig } from "./circuit-breaker.js";
 import { BashCircuitBreaker, type BashCircuitBreakerConfig } from "./bash-circuit-breaker.js";
+import {
+  DurableCommandJournal,
+  type CommandJournalRecoverySummary,
+  type DurableCommandJournalOptions,
+} from "./command-journal.js";
 
 /** Default timeout for session commands (5 minutes for LLM operations) */
 const DEFAULT_COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
@@ -88,6 +93,8 @@ export interface SessionManagerRuntimeOptions {
   circuitBreakerConfig?: Partial<Omit<CircuitBreakerConfig, "providerName">>;
   /** Bash circuit breaker configuration (optional, uses defaults if not provided) */
   bashCircuitBreakerConfig?: Partial<BashCircuitBreakerConfig>;
+  /** Durable command journal options (Level 4 foundation, feature-flagged) */
+  durableJournal?: DurableCommandJournalOptions;
 }
 
 export class PiSessionManager implements SessionResolver {
@@ -111,6 +118,12 @@ export class PiSessionManager implements SessionResolver {
   private circuitBreakers: CircuitBreakerManager;
   /** Circuit breaker for bash commands. */
   private bashCircuitBreaker: BashCircuitBreaker;
+  /** Durable command journal (Level 4 foundation, feature-flagged). */
+  private commandJournal: DurableCommandJournal;
+  /** Recovery summary from durable journal startup rehydration. */
+  private commandJournalRecovery: CommandJournalRecoverySummary | null = null;
+  /** One-time initialization promise for durable journal startup rehydration. */
+  private durableInitPromise: Promise<void> | null = null;
 
   // Shutdown state (single source of truth - server.ts delegates to this)
   private isShuttingDown = false;
@@ -170,6 +183,10 @@ export class PiSessionManager implements SessionResolver {
     });
     this.circuitBreakers = new CircuitBreakerManager(options.circuitBreakerConfig);
     this.bashCircuitBreaker = new BashCircuitBreaker(options.bashCircuitBreakerConfig);
+    this.commandJournal = new DurableCommandJournal({
+      serverVersion: options.serverVersion,
+      ...options.durableJournal,
+    });
   }
 
   /**
@@ -191,6 +208,90 @@ export class PiSessionManager implements SessionResolver {
    */
   getBashCircuitBreaker(): BashCircuitBreaker {
     return this.bashCircuitBreaker;
+  }
+
+  /**
+   * One-time startup initialization.
+   * Rehydrates durable command outcomes when the journal feature flag is enabled.
+   */
+  async initialize(): Promise<void> {
+    await this.ensureDurableJournalInitialized();
+  }
+
+  /**
+   * Ensure durable journal recovery has completed (idempotent).
+   */
+  private async ensureDurableJournalInitialized(): Promise<void> {
+    if (!this.commandJournal.isEnabled()) {
+      return;
+    }
+
+    if (this.durableInitPromise) {
+      await this.durableInitPromise;
+      return;
+    }
+
+    this.durableInitPromise = (async () => {
+      const recovery = await this.commandJournal.initialize();
+
+      for (const outcome of recovery.recoveredOutcomes) {
+        this.replayStore.storeCommandOutcome(outcome);
+      }
+
+      this.commandJournalRecovery = recovery;
+
+      if (
+        recovery.recoveredOutcomes.length > 0 ||
+        recovery.recoveredInFlightFailures > 0 ||
+        recovery.malformedEntries > 0
+      ) {
+        this.debugLogger?.("Durable command journal recovery completed", {
+          journalPath: recovery.journalPath,
+          entriesScanned: recovery.entriesScanned,
+          malformedEntries: recovery.malformedEntries,
+          unsupportedVersionEntries: recovery.unsupportedVersionEntries,
+          recoveredOutcomes: recovery.recoveredOutcomes.length,
+          recoveredInFlightFailures: recovery.recoveredInFlightFailures,
+        });
+      }
+    })();
+
+    await this.durableInitPromise;
+  }
+
+  /**
+   * Append command lifecycle transition to the durable journal (best-effort).
+   */
+  private appendCommandLifecycleToJournal(input: {
+    phase: "command_accepted" | "command_started" | "command_finished";
+    commandId: string;
+    commandType: string;
+    laneKey: string;
+    fingerprint: string;
+    explicitId: boolean;
+    sessionId?: string;
+    dependsOn?: string[];
+    ifSessionVersion?: number;
+    idempotencyKey?: string;
+    success?: boolean;
+    error?: string;
+    sessionVersion?: number;
+    replayed?: boolean;
+    timedOut?: boolean;
+    response?: RpcResponse;
+  }): void {
+    if (!this.commandJournal.isEnabled()) {
+      return;
+    }
+
+    try {
+      this.commandJournal.appendLifecycle(input);
+    } catch (error) {
+      console.error(
+        `[SessionManager] Failed to append command journal entry (${input.phase}) for ${input.commandId}:`,
+        error
+      );
+    }
   }
 
   // ==========================================================================
@@ -899,6 +1000,10 @@ export class PiSessionManager implements SessionResolver {
     const sessionStoreStats = {
       metadataResetCount: this.sessionStore.getMetadataResetCount(),
     };
+    const journalStats = this.commandJournal.getStats();
+    const recoveredOutcomeCount = this.commandJournalRecovery?.recoveredOutcomes.length ?? 0;
+    const recoveredInFlightFailures = this.commandJournalRecovery?.recoveredInFlightFailures ?? 0;
+
     return {
       type: "response",
       command: "get_metrics",
@@ -912,6 +1017,19 @@ export class PiSessionManager implements SessionResolver {
           lock: lockStats,
           extensionUI: extensionUIStats,
           sessionStore: sessionStoreStats,
+          journal: {
+            enabled: journalStats.enabled,
+            initialized: journalStats.initialized,
+            journalPath: journalStats.journalPath,
+            schemaVersion: journalStats.schemaVersion,
+            entriesWritten: journalStats.entriesWritten,
+            writeErrors: journalStats.writeErrors,
+            entriesScanned: journalStats.entriesScanned,
+            malformedEntries: journalStats.malformedEntries,
+            unsupportedVersionEntries: journalStats.unsupportedVersionEntries,
+            recoveredOutcomes: recoveredOutcomeCount,
+            recoveredInFlightFailures,
+          },
         },
         circuitBreakers: circuitBreakerMetrics,
         bashCircuitBreaker: bashCircuitBreakerMetrics,
@@ -955,6 +1073,18 @@ export class PiSessionManager implements SessionResolver {
   async executeCommand(command: RpcCommand): Promise<RpcResponse> {
     const id = getCommandId(command);
     const commandType = getCommandType(command);
+
+    try {
+      await this.ensureDurableJournalInitialized();
+    } catch (error) {
+      return {
+        id,
+        type: "response",
+        command: commandType ?? "unknown",
+        success: false,
+        error: `Durable journal initialization failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
     const sessionId = getSessionId(command);
     const commandId = this.replayStore.getOrCreateCommandId(command);
     const dependsOn = getCommandDependsOn(command) ?? [];
@@ -962,6 +1092,7 @@ export class PiSessionManager implements SessionResolver {
     const idempotencyKey = getCommandIdempotencyKey(command);
     const laneKey = this.executionEngine.getLaneKey(command);
     const fingerprint = this.replayStore.getCommandFingerprint(command);
+    const isExplicitId = typeof id === "string" && !id.startsWith(SYNTHETIC_ID_PREFIX);
 
     // Check for shutdown - reject new commands during shutdown
     if (this.isShuttingDown) {
@@ -996,6 +1127,18 @@ export class PiSessionManager implements SessionResolver {
       ifSessionVersion,
       idempotencyKey,
     });
+    this.appendCommandLifecycleToJournal({
+      phase: "command_accepted",
+      commandId,
+      commandType,
+      laneKey,
+      fingerprint,
+      explicitId: isExplicitId,
+      sessionId,
+      dependsOn,
+      ifSessionVersion,
+      idempotencyKey,
+    });
 
     const finalizeResponse = (response: RpcResponse): RpcResponse => {
       this.broadcastCommandLifecycle("command_finished", {
@@ -1009,6 +1152,24 @@ export class PiSessionManager implements SessionResolver {
         error: response.success ? undefined : response.error,
         sessionVersion: response.sessionVersion,
         replayed: response.replayed,
+      });
+      this.appendCommandLifecycleToJournal({
+        phase: "command_finished",
+        commandId,
+        commandType,
+        laneKey,
+        fingerprint,
+        explicitId: isExplicitId,
+        sessionId,
+        dependsOn,
+        ifSessionVersion,
+        idempotencyKey,
+        success: response.success,
+        error: response.success ? undefined : response.error,
+        sessionVersion: response.sessionVersion,
+        replayed: response.replayed,
+        timedOut: response.timedOut,
+        response,
       });
       return response;
     };
@@ -1059,7 +1220,6 @@ export class PiSessionManager implements SessionResolver {
 
     // Reject before starting execution if we cannot track this explicit command ID.
     // This prevents side effects from commands that are rejected as "server busy".
-    const isExplicitId = typeof id === "string" && !id.startsWith(SYNTHETIC_ID_PREFIX);
     if (isExplicitId && !this.replayStore.canRegisterInFlight(id)) {
       return finalizeResponse({
         id,
@@ -1077,6 +1237,18 @@ export class PiSessionManager implements SessionResolver {
         this.broadcastCommandLifecycle("command_started", {
           commandId,
           commandType,
+          sessionId,
+          dependsOn,
+          ifSessionVersion,
+          idempotencyKey,
+        });
+        this.appendCommandLifecycleToJournal({
+          phase: "command_started",
+          commandId,
+          commandType,
+          laneKey,
+          fingerprint,
+          explicitId: isExplicitId,
           sessionId,
           dependsOn,
           ifSessionVersion,

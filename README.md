@@ -193,6 +193,7 @@ This validates:
 | [ADR-0009](./docs/adr/0009-connection-authentication.md) | Historical authentication proposal (superseded) |
 | [ADR-0010](./docs/adr/0010-circuit-breaker.md) | Circuit breaker for LLM calls |
 | [ADR-0014](./docs/adr/0014-pluggable-authentication.md) | Pluggable connection authentication (implemented) |
+| [ADR-0019](./docs/adr/0019-durable-command-journal-foundation.md) | Durable command journal foundation (Level 4) |
 | [ROADMAP.md](./ROADMAP.md) | Phase tracking and milestones |
 
 ## License

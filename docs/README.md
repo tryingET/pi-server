@@ -22,3 +22,4 @@ This directory holds focused documentation for different audiences.
 - **ADR-0009 (Connection auth proposal, superseded):** [`adr/0009-connection-authentication.md`](./adr/0009-connection-authentication.md)
 - **ADR-0010 (Circuit breaker):** [`adr/0010-circuit-breaker.md`](./adr/0010-circuit-breaker.md)
 - **ADR-0014 (Pluggable authentication):** [`adr/0014-pluggable-authentication.md`](./adr/0014-pluggable-authentication.md)
+- **ADR-0019 (Durable command journal foundation):** [`adr/0019-durable-command-journal-foundation.md`](./adr/0019-durable-command-journal-foundation.md)
