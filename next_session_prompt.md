@@ -2,18 +2,20 @@
 
 **Operating mode:** Production ready  
 **Phase:** COMPLETE  
-**Version:** 2.0.0 (pending release)  
+**Version:** 2.0.0 (current)  
 **Formalization Level:** 2 (Bounded Run)
 
 ---
 
-## SESSION STATUS (2026-03-01)
+## SESSION STATUS (2026-03-02)
 
-### LATEST ADDITION
+### LATEST ADDITIONS
 
 | Feature | Description | Files |
 |---|---|---|
-| `navigate_tree` RPC command | Session tree navigation with optional branch summarization | `src/types.ts`, `src/command-router.ts`, `PROTOCOL.md` |
+| Validation hardening pass | Added `navigate_tree` validation, canonical `sessionPath` checks (symlink-safe), and validator/router parity guard | `src/validation.ts`, `src/test.ts` |
+| Debug diagnostics for npm env sanitization | Added one-time debug-level diagnostic when npm prefix env keys are sanitized during `createAgentSession()` | `src/session-manager.ts`, `src/server.ts`, `src/test.ts` |
+| Navigate-tree acceptance guard | Added explicit router assertion + WebSocket integration probe to ensure `navigate_tree` is treated as a known command (not unknown-command drift) | `src/test.ts`, `src/test-integration.ts` |
 
 ### RESOLVED (Deep Review + Follow-up Stabilization)
 
@@ -25,8 +27,12 @@
 | `load_session` sessionVersion inconsistent/missing | Added explicit `load_session` handling to initialize and return `sessionVersion: 0` | `src/session-version-store.ts` |
 | Shutdown uptime metric dropped | Emit uptime gauge before final `metrics.flush()` | `src/server.ts` |
 | `create_session`/`load_session` flaky under `npm test` due to env leakage | Sanitized `npm_config_prefix`/`NPM_CONFIG_PREFIX` around `createAgentSession()` to prevent project-local global installs (`./lib/node_modules`) | `src/session-manager.ts` |
-| CI failed on format gate | Applied Biome normalization across source set | 11 formatting-only files |
-| **Path traversal vulnerability in load_session** | Added `validateSessionPath()` to reject `..`, relative paths, null bytes, paths outside allowed directories | `src/validation.ts`, `src/session-manager.ts` |
+| **Path traversal vulnerability in load_session** | Added `validateSessionPath()` to reject `..`, relative paths, null bytes, and paths outside allowed directories | `src/validation.ts`, `src/session-manager.ts` |
+| `navigate_tree` rejected as unknown command | Added `navigate_tree` to validation command set | `src/validation.ts` |
+| `navigate_tree` payload not runtime-validated | Added validation for `targetId` and typed `options` fields | `src/validation.ts` |
+| `sessionPath` symlink escape under allowed directory | Switched to canonical path checks (`realpath`) for both target path and allowlisted roots | `src/validation.ts` |
+| Validation/router drift risk for session commands | Added parity test ensuring all router commands are recognized by validator | `src/test.ts` |
+| npm prefix sanitization was not observable | Added debug logger hook + one-time sanitization diagnostic and test | `src/session-manager.ts`, `src/server.ts`, `src/test.ts` |
 
 ### TESTS ADDED/UPDATED
 
@@ -37,7 +43,13 @@
   - `load_session` initializes version to `0` (auto + explicit session id)
   - shutdown flush includes uptime metric
   - `create_session` ignores leaked `npm_config_prefix`
-  - **8 path validation tests** (relative, traversal, null byte, extension, allowed dirs)
+  - `navigate_tree` validation (valid command, missing `targetId`, invalid `options`)
+  - `sessionPath` symlink escape rejection
+  - router/validator parity guard for all session commands
+  - router expected command list now explicitly requires `navigate_tree`
+  - one-time npm sanitization debug diagnostic assertion
+- `src/test-integration.ts`
+  - `navigate_tree` must be accepted as a known command over WebSocket (guards against unknown-command regression)
 - `src/test-session-version-store.ts`
   - `load_session` initializes version to `0`
 
@@ -45,28 +57,24 @@
 
 ## COMMITS (LATEST)
 
-1. `navigate_tree` — `feat: add navigate_tree RPC command for session tree navigation`
-   - New command: `navigate_tree` with `targetId` and optional `options` (summarize, customInstructions, replaceInstructions, label)
+1. `22162d4` — `feat(session-manager): emit debug diagnostics for npm env sanitization`
+   - Added optional debug logger hook to `PiSessionManager`
+   - Emits one-time diagnostic when npm env keys are sanitized
+   - Wired to server structured logger at debug level
+2. `13c3e36` — `fix(validation): harden session path and navigate_tree checks`
+   - Added `navigate_tree` to validator command set + payload checks
+   - Hardened `validateSessionPath()` with canonical path checks against symlink escapes
+   - Added regression tests including router/validator parity
+3. `7a0f604` — `feat(protocol): add navigate_tree RPC command for session tree navigation`
+   - New command: `navigate_tree` with `targetId` and optional `options`
    - Response includes `editorText`, `cancelled`, `aborted`
-   - Protocol docs: §17.3 with full request/response examples
-   - Wire: `src/types.ts`, `src/command-router.ts`
-2. `62d2d04` — `security: add path validation to load_session + protocol docs`
-   - Security fix: path traversal prevention in `load_session`
-   - Protocol docs: §2.1, §16-22 (401 lines)
-   - ADR-0007: session persistence documentation
-   - 8 new tests (112 total)
-3. `8ab9eec` — `Merge branch 'main' of https://github.com/tryingET/pi-server`
-   - Merged remote release-please PR (v1.0.0 release)
-4. `722e25b` — `chore(package): add pi-package keyword for discoverability`
-   - Added `pi-package` keyword to package.json for Pi package gallery
-5. `f603a9f` — `docs(readme): clarify package is standalone server`
-   - Added note clarifying this is not an extension/skills/themes bundle
-6. `d9eb6a8` — `style(format): apply biome normalization across source files`
-   - Formatting-only commit (11 files)
-7. `9f67477` — `fix(session): sanitize npm prefix during agent session creation`
-   - Functional fix + regression test (`src/session-manager.ts`, `src/test.ts`)
-
-(Previous deep-review atomic fix commits are already on `main`.)
+   - Protocol docs: §17.3 with request/response examples
+4. `5ab6870` — `fix(ci): add explicit build step to publish workflow`
+   - Ensures publish workflow has built artifacts
+5. `0638f05` — `chore(main): release 2.0.0`
+   - release-please managed release commit
+6. `29024d0` — `fix(security)!: add path validation to load_session + protocol docs`
+   - Initial path traversal prevention + protocol documentation update
 
 ---
 
@@ -83,11 +91,11 @@
 
 | Check | Status |
 |---|---|
-| Version | **2.0.0** (pending release) |
+| Version | **2.0.0** |
 | `npm run check` | ✅ |
 | `npm run build` | ✅ |
-| `npm test` | ✅ 112 passed, 0 failed |
-| `npm run test:integration` | ✅ 26 passed, 0 failed |
+| `npm test` | ✅ 117 passed, 0 failed |
+| `npm run test:integration` | ✅ 27 passed, 0 failed |
 | `npm run test:fuzz` | ✅ 17 passed, 0 failed |
 | `npm run ci` | ✅ |
 
@@ -96,20 +104,24 @@
 ## NEXT STEPS
 
 1. Continue development on `main` — release-please will create subsequent release PRs.
-2. Keep upstream AbortSignal proposal as top external unblocker.
-3. Optional: add small startup diagnostic log when npm prefix sanitization is applied (debug-only).
-4. Submit `upstream-proposal-pi-protocol.md` to pi-mono maintainers for shared protocol types.
+2. For pi-web hard enforcement, point harness to this built checkout (`PI_SERVER_DIR=...`) and require `navigate_tree` support unconditionally.
+3. Keep upstream AbortSignal proposal as top external unblocker.
+4. Submit `shared-protocol-package.md` to pi-mono maintainers for shared protocol types.
+5. Optional: document new debug sanitization diagnostic behavior in operator-facing docs.
 
 ---
 
 ## ROLLBACK (LATEST CHANGES)
 
 ```bash
-# revert latest security commit
-git revert 62d2d04
+# revert latest diagnostics + validation hardening commits
+git revert 22162d4
+git revert 13c3e36
 
 # re-validate
 npm run ci
+npm run test:integration
+npm run test:fuzz
 ```
 
 ---
@@ -124,7 +136,9 @@ npm run ci
 | Session version consistency on load | ✅ Fixed + regression-tested |
 | Final shutdown metrics flush correctness | ✅ Fixed + regression-tested |
 | npm env leakage resilience in session creation | ✅ Fixed + regression-tested |
-| **Path traversal protection in load_session** | ✅ Fixed + regression-tested |
+| `navigate_tree` validator compatibility + payload validation | ✅ Fixed + regression-tested |
+| `sessionPath` symlink escape prevention | ✅ Fixed + regression-tested |
+| npm sanitization observability | ✅ Added debug diagnostic + test |
 | Upstream AbortSignal gap | 🔵 Deferred upstream |
 | Backpressure API gap | 🟡 Deferred/YAGNI |
 
