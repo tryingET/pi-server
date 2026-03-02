@@ -445,6 +445,40 @@ async function testCommandResponse() {
       client.close();
     });
 
+    await test("integration: navigate_tree is accepted as a known command", async () => {
+      const client = new TestClient();
+      await client.connect(ctx.port);
+      client.clearMessages();
+
+      const sessionId = `tree-known-${Date.now()}`;
+      await client.send({ type: "create_session", sessionId });
+      await client.waitForMessage((msg) => msg.type === "response" && msg.command === "create_session", 10000);
+
+      await client.send({
+        id: "tree-known-probe",
+        type: "navigate_tree",
+        sessionId,
+        targetId: "entry-does-not-exist",
+      });
+
+      const navigateResponse = await client.waitForMessage(
+        (msg) => msg.type === "response" && msg.id === "tree-known-probe",
+        10000
+      );
+
+      assert.strictEqual(navigateResponse.command, "navigate_tree");
+      const navigateError = String(navigateResponse.error || "");
+      assert.strictEqual(
+        navigateError.includes("Unknown command type"),
+        false,
+        "navigate_tree must not be rejected as unknown command"
+      );
+
+      await client.send({ type: "delete_session", sessionId });
+      await client.waitForMessage((msg) => msg.type === "response" && msg.command === "delete_session", 10000);
+      client.close();
+    });
+
     await test("integration: serializes create -> steer -> follow_up on same session lane", async () => {
       const client = new TestClient();
       await client.connect(ctx.port);

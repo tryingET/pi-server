@@ -575,6 +575,7 @@ async function testCommandRouter() {
     assert(commands.includes("get_state"), "Should have get_state");
     assert(commands.includes("set_model"), "Should have set_model");
     assert(commands.includes("get_available_models"), "Should have get_available_models");
+    assert(commands.includes("navigate_tree"), "Should have navigate_tree");
     assert(commands.length >= 25, `Should have at least 25 commands, got ${commands.length}`);
   });
 
