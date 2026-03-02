@@ -7,7 +7,7 @@ Each unchecked item requires an **owner**, an **acceptance test**, and a **decis
 
 - [Program status](#program-status)
 - [Level 3 — Causal Command Protocol (complete)](#level-3--causal-command-protocol-complete)
-- [Level 4 — Durable command journal + replay (next)](#level-4--durable-command-journal--replay-next)
+- [Level 4 — Durable command journal + replay (active planning)](#level-4--durable-command-journal--replay-active-planning)
 - [Level 5 — Formal invariants + chaos harness](#level-5--formal-invariants--chaos-harness)
 - [Decision ledger (open)](#decision-ledger-open)
 - [Operating discipline](#operating-discipline)
@@ -16,8 +16,8 @@ Each unchecked item requires an **owner**, an **acceptance test**, and a **decis
 
 ## Program status
 
-- **Current phase:** Level 3 (Causal Command Protocol)
-- **State:** ✅ **Complete**
+- **Current phase:** Level 4 (Durable command journal + replay)
+- **State:** 🚧 **Active planning** (Level 3 complete)
 - **Protocol baseline:** `1.0.0`
 - **Normative contract:** `PROTOCOL.md`
 
@@ -77,7 +77,7 @@ Each unchecked item requires an **owner**, an **acceptance test**, and a **decis
 
 ---
 
-## Level 4 — Durable command journal + replay (next)
+## Level 4 — Durable command journal + replay (active planning)
 
 > Goal: make causality crash-survivable and replay-auditable.
 

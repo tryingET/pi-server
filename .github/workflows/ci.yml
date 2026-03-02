@@ -33,6 +33,9 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Version/docs consistency check
+        run: npm run check:consistency
+
       - name: Unit tests
         run: npm test
 

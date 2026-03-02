@@ -9,6 +9,7 @@
  * The protocol IS the architecture.
  */
 
+import fs from "fs";
 import * as readline from "readline";
 import { WebSocketServer, WebSocket } from "ws";
 import { PiSessionManager } from "./session-manager.js";
@@ -32,7 +33,22 @@ import { type Logger, ConsoleLogger, type LogLevel } from "./logger-index.js";
 // CONSTANTS
 // ============================================================================
 
-const SERVER_VERSION = "0.1.0";
+const UNKNOWN_SERVER_VERSION = "0.0.0-unknown";
+
+function readPackageVersion(): string {
+  try {
+    const packageJsonPath = new URL("../package.json", import.meta.url);
+    const raw = fs.readFileSync(packageJsonPath, "utf-8");
+    const parsed = JSON.parse(raw) as { version?: unknown };
+    return typeof parsed.version === "string" && parsed.version.length > 0
+      ? parsed.version
+      : UNKNOWN_SERVER_VERSION;
+  } catch {
+    return UNKNOWN_SERVER_VERSION;
+  }
+}
+
+const SERVER_VERSION = readPackageVersion();
 const PROTOCOL_VERSION = "1.0.0";
 const DEFAULT_PORT = 3141;
 
@@ -279,7 +295,7 @@ export interface PiServerOptions {
 }
 
 export class PiServer {
-  private sessionManager = new PiSessionManager();
+  private sessionManager = new PiSessionManager(undefined, { serverVersion: SERVER_VERSION });
   private wss: WebSocketServer | null = null;
   private stdinInterface: readline.Interface | null = null;
   private authProvider: AuthProvider;

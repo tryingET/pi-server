@@ -18,3 +18,7 @@ This directory holds focused documentation for different audiences.
 ## Architecture decisions
 
 - **ADR-0001 (Atomic outcome storage):** [`adr/0001-atomic-outcome-storage.md`](./adr/0001-atomic-outcome-storage.md)
+- **ADR-0007 (Session persistence):** [`adr/0007-session-persistence.md`](./adr/0007-session-persistence.md)
+- **ADR-0009 (Connection auth proposal, superseded):** [`adr/0009-connection-authentication.md`](./adr/0009-connection-authentication.md)
+- **ADR-0010 (Circuit breaker):** [`adr/0010-circuit-breaker.md`](./adr/0010-circuit-breaker.md)
+- **ADR-0014 (Pluggable authentication):** [`adr/0014-pluggable-authentication.md`](./adr/0014-pluggable-authentication.md)

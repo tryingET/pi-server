@@ -16,6 +16,7 @@ Session multiplexer for [pi-coding-agent](https://www.npmjs.com/package/@marioze
 - **Optimistic concurrency**: Session versioning for conflict detection
 - **Extension UI**: Full round-trip support for `select`, `confirm`, `input`, `editor`, `interview`
 - **Resource governance**: Rate limiting, session limits, message size limits
+- **Pluggable authentication**: `AuthProvider` abstraction (allow-all, token, IP allowlist, composite)
 - **Graceful shutdown**: Drain in-flight commands, notify clients
 - **Protocol versioning**: `serverVersion` + `protocolVersion` for compatibility checks
 
@@ -189,8 +190,9 @@ This validates:
 | [PROTOCOL.md](./PROTOCOL.md) | Normative wire contract |
 | [ADR-0001](./docs/adr/0001-atomic-outcome-storage.md) | Atomic outcome storage (timeout semantics) |
 | [ADR-0007](./docs/adr/0007-session-persistence.md) | Session persistence |
-| [ADR-0009](./docs/adr/0009-connection-authentication.md) | Connection authentication (planned) |
+| [ADR-0009](./docs/adr/0009-connection-authentication.md) | Historical authentication proposal (superseded) |
 | [ADR-0010](./docs/adr/0010-circuit-breaker.md) | Circuit breaker for LLM calls |
+| [ADR-0014](./docs/adr/0014-pluggable-authentication.md) | Pluggable connection authentication (implemented) |
 | [ROADMAP.md](./ROADMAP.md) | Phase tracking and milestones |
 
 ## License

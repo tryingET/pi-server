@@ -72,8 +72,24 @@ export interface SessionStoreConfig {
   serverVersion?: string;
 }
 
+/** Fallback server version if package.json cannot be read */
+const UNKNOWN_SERVER_VERSION = "0.0.0-unknown";
+
 /** Default server version if not provided */
-const DEFAULT_SERVER_VERSION = "0.1.0";
+function readPackageVersion(): string {
+  try {
+    const packageJsonPath = new URL("../package.json", import.meta.url);
+    const raw = fsRegular.readFileSync(packageJsonPath, "utf-8");
+    const parsed = JSON.parse(raw) as { version?: unknown };
+    return typeof parsed.version === "string" && parsed.version.length > 0
+      ? parsed.version
+      : UNKNOWN_SERVER_VERSION;
+  } catch {
+    return UNKNOWN_SERVER_VERSION;
+  }
+}
+
+const DEFAULT_SERVER_VERSION = readPackageVersion();
 
 /** Metadata file name */
 const METADATA_FILE = "sessions-metadata.json";

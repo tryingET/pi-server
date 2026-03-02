@@ -26,6 +26,8 @@
 - [20. Session persistence](#20-session-persistence-adr-0007)
 - [21. Circuit breaker](#21-circuit-breaker-adr-0010)
 - [22. Error responses](#22-error-responses)
+- [23. Connection authentication](#23-connection-authentication-adr-0014)
+- [24. Companion documents](#24-companion-documents)
 
 ---
 
@@ -738,12 +740,33 @@ Clients SHOULD:
 
 ---
 
-## 23. Companion documents
+## 23. Connection authentication (ADR-0014)
+
+Authentication is transport-level and pluggable via `AuthProvider`.
+
+- **Default behavior:** `AllowAllAuthProvider` (no auth; backward-compatible)
+- **Built-in options:** token-based and IP allowlist providers
+- **Composition:** `CompositeAuthProvider` supports multi-check policies
+
+### 23.1 WebSocket behavior
+
+For WebSocket connections, authentication runs during connection setup:
+
+- On success, connection proceeds normally.
+- On failure, server closes the socket with close code `1008` (policy violation).
+
+### 23.2 Stdio behavior
+
+Stdio is a local process transport and does not have a remote handshake context.
+Deployments requiring strong remote authentication SHOULD use WebSocket with an `AuthProvider` and network controls.
+
+## 24. Companion documents
 
 - `README.md` — architecture-level overview
 - `docs/quickstart.md` — operator quickstart
 - `docs/client-guide.md` — integration best practices
 - `ROADMAP.md` — execution plan and decision gates
 - `docs/adr/0001-atomic-outcome-storage.md` — timeout semantics
-- `docs/adr/0009-connection-authentication.md` — authentication (planned)
+- `docs/adr/0009-connection-authentication.md` — superseded historical proposal
 - `docs/adr/0010-circuit-breaker.md` — circuit breaker design
+- `docs/adr/0014-pluggable-authentication.md` — implemented auth architecture
