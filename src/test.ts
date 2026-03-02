@@ -1541,22 +1541,40 @@ async function testSessionManager() {
     process.env.npm_config_prefix = process.cwd();
 
     const localManager = new PiSessionManager();
+    const diagnostics: Array<{ message: string; context?: Record<string, unknown> }> = [];
+    localManager.setDebugLogger((message, context) => {
+      diagnostics.push({ message, context });
+    });
+
     try {
-      const created = await localManager.executeCommand({
-        type: "create_session",
-        sessionId: "prefix-sanitize",
-      });
+      for (const sessionId of ["prefix-sanitize", "prefix-sanitize-2"]) {
+        const created = await localManager.executeCommand({
+          type: "create_session",
+          sessionId,
+        });
+
+        assert.strictEqual(
+          created.success,
+          true,
+          `Session creation should succeed with sanitized npm prefix: ${created.error}`
+        );
+
+        await localManager.executeCommand({
+          type: "delete_session",
+          sessionId,
+        });
+      }
 
       assert.strictEqual(
-        created.success,
-        true,
-        `Session creation should succeed with sanitized npm prefix: ${created.error}`
+        diagnostics.length,
+        1,
+        "Expected npm prefix sanitization diagnostic to be emitted once"
       );
-
-      await localManager.executeCommand({
-        type: "delete_session",
-        sessionId: "prefix-sanitize",
-      });
+      assert.strictEqual(
+        diagnostics[0]?.message,
+        "Sanitized npm prefix env for AgentSession creation"
+      );
+      assert.deepStrictEqual((diagnostics[0]?.context as any)?.keys, ["npm_config_prefix"]);
     } finally {
       if (previousPrefix === undefined) {
         delete process.env.npm_config_prefix;

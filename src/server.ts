@@ -306,6 +306,11 @@ export class PiServer {
         component: "pi-server",
       });
 
+    // Wire session-manager diagnostics to debug-level logging.
+    this.sessionManager.setDebugLogger((message, context) => {
+      this.logger.debug(message, context);
+    });
+
     // Default alert thresholds for built-in monitoring
     const defaultAlertThresholds: Record<string, ThresholdConfig> = {
       [MetricNames.RATE_LIMIT_GENERATION_COUNTER]: {

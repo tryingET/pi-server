@@ -130,6 +130,10 @@ export class PiSessionManager implements SessionResolver {
 
   /** Optional memory metrics provider (set by server for ADR-0016) */
   private memoryMetricsProvider: (() => Record<string, unknown> | undefined) | null = null;
+  /** Optional debug logger (wired by server logger at debug level). */
+  private debugLogger: ((message: string, context?: Record<string, unknown>) => void) | null = null;
+  /** Ensures npm prefix sanitization diagnostic is emitted at most once per process. */
+  private npmSanitizationDiagnosticLogged = false;
 
   constructor(governor?: ResourceGovernor, options: SessionManagerRuntimeOptions = {}) {
     this.governor = governor ?? new ResourceGovernor(DEFAULT_CONFIG);
@@ -206,6 +210,16 @@ export class PiSessionManager implements SessionResolver {
    */
   setMemoryMetricsProvider(provider: () => Record<string, unknown> | undefined): void {
     this.memoryMetricsProvider = provider;
+  }
+
+  /**
+   * Set optional debug logger used for low-noise diagnostics.
+   * PiServer wires this to logger.debug(), so output is level-gated.
+   */
+  setDebugLogger(
+    logger: ((message: string, context?: Record<string, unknown>) => void) | null
+  ): void {
+    this.debugLogger = logger;
   }
 
   /**
@@ -1299,6 +1313,17 @@ export class PiSessionManager implements SessionResolver {
       had: Object.hasOwn(process.env, key),
       value: process.env[key],
     }));
+    const sanitizedKeys = snapshots
+      .filter((snapshot) => snapshot.had)
+      .map((snapshot) => snapshot.key);
+
+    if (sanitizedKeys.length > 0 && !this.npmSanitizationDiagnosticLogged) {
+      this.npmSanitizationDiagnosticLogged = true;
+      this.debugLogger?.("Sanitized npm prefix env for AgentSession creation", {
+        keys: sanitizedKeys,
+        reason: "Prevent npm script env leakage from redirecting global installs",
+      });
+    }
 
     for (const snapshot of snapshots) {
       if (snapshot.had) {
