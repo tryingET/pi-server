@@ -452,7 +452,10 @@ async function testCommandResponse() {
 
       const sessionId = `tree-known-${Date.now()}`;
       await client.send({ type: "create_session", sessionId });
-      await client.waitForMessage((msg) => msg.type === "response" && msg.command === "create_session", 10000);
+      await client.waitForMessage(
+        (msg) => msg.type === "response" && msg.command === "create_session",
+        10000
+      );
 
       await client.send({
         id: "tree-known-probe",
@@ -475,7 +478,10 @@ async function testCommandResponse() {
       );
 
       await client.send({ type: "delete_session", sessionId });
-      await client.waitForMessage((msg) => msg.type === "response" && msg.command === "delete_session", 10000);
+      await client.waitForMessage(
+        (msg) => msg.type === "response" && msg.command === "delete_session",
+        10000
+      );
       client.close();
     });
 
