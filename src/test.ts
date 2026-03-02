@@ -11,6 +11,8 @@
 
 import assert from "assert";
 import { spawn } from "child_process";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "fs";
+import { tmpdir } from "os";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 
@@ -407,6 +409,62 @@ async function testValidation() {
     );
   });
 
+  await test("validation: accepts valid navigate_tree command", () => {
+    const errors = validateCommand({
+      type: "navigate_tree",
+      sessionId: "test",
+      targetId: "msg-123",
+      options: {
+        summarize: true,
+        customInstructions: "Keep concise",
+        replaceInstructions: false,
+        label: "summary",
+      },
+    });
+    assert.strictEqual(errors.length, 0, "Should accept valid navigate_tree command");
+  });
+
+  await test("validation: rejects navigate_tree without targetId", () => {
+    const errors = validateCommand({
+      type: "navigate_tree",
+      sessionId: "test",
+    });
+    assert(
+      errors.some((e) => e.field === "targetId" && e.message.includes("Required")),
+      "Should reject navigate_tree without targetId"
+    );
+  });
+
+  await test("validation: rejects navigate_tree with invalid options", () => {
+    const errors = validateCommand({
+      type: "navigate_tree",
+      sessionId: "test",
+      targetId: "msg-123",
+      options: {
+        summarize: "yes",
+        customInstructions: 42,
+        replaceInstructions: "no",
+        label: true,
+      },
+    });
+    assert(
+      errors.some((e) => e.field === "options.summarize"),
+      "Should validate summarize"
+    );
+    assert(
+      errors.some((e) => e.field === "options.customInstructions"),
+      "Should validate customInstructions"
+    );
+    assert(
+      errors.some((e) => e.field === "options.replaceInstructions"),
+      "Should validate replaceInstructions"
+    );
+    assert(
+      errors.some((e) => e.field === "options.label"),
+      "Should validate label"
+    );
+  });
+
   // Test: Path validation for switch_session_file
   await test("validation: rejects path traversal in switch_session_file", () => {
     const errors = validateCommand({
@@ -474,6 +532,26 @@ async function testSessionPathValidation() {
     assert(error?.includes("allowed"), `Should reject path outside allowed dirs, got: ${error}`);
   });
 
+  // Test: Reject symlink escape from allowed directory
+  await test("sessionPath: rejects symlink escape outside allowed directory", () => {
+    const base = mkdtempSync(join(tmpdir(), "pi-sessionpath-"));
+    try {
+      const allowed = join(base, "allowed");
+      const outside = join(base, "outside");
+      mkdirSync(allowed, { recursive: true });
+      mkdirSync(outside, { recursive: true });
+
+      const escapeLink = join(allowed, "escape");
+      symlinkSync(outside, escapeLink, "dir");
+
+      const candidate = join(escapeLink, "session.jsonl");
+      const error = validateSessionPath(candidate, [allowed]);
+      assert(error?.includes("allowed"), `Should reject symlink escape, got: ${error}`);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   // Test: Accept .json extension
   await test("sessionPath: accepts .json extension", () => {
     const error = validateSessionPath(`${home}/.pi/agent/sessions/session.json`);
@@ -498,6 +576,27 @@ async function testCommandRouter() {
     assert(commands.includes("set_model"), "Should have set_model");
     assert(commands.includes("get_available_models"), "Should have get_available_models");
     assert(commands.length >= 25, `Should have at least 25 commands, got ${commands.length}`);
+  });
+
+  await test("router: all session commands are recognized by validation", () => {
+    const commands = getSupportedSessionCommands();
+
+    for (const commandType of commands) {
+      const errors = validateCommand({
+        type: commandType,
+        sessionId: "validator-probe",
+      });
+
+      const hasUnknownTypeError = errors.some(
+        (error) => error.field === "type" && error.message.includes("Unknown command type")
+      );
+
+      assert.strictEqual(
+        hasUnknownTypeError,
+        false,
+        `Validator must recognize router command '${commandType}'`
+      );
+    }
   });
 }
 

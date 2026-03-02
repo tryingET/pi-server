@@ -12,6 +12,7 @@ export interface ValidationError {
   message: string;
 }
 
+import fs from "fs";
 import path from "path";
 import { SYNTHETIC_ID_PREFIX } from "./command-replay-store.js";
 
@@ -38,6 +39,29 @@ function hasControlCharacters(value: string): boolean {
     if (code <= 31 || code === 127) return true;
   }
   return false;
+}
+
+/**
+ * Resolve to canonical path when possible (follows symlinks).
+ * Falls back to absolute normalized path when path/parents don't exist.
+ */
+function resolveCanonicalPath(candidatePath: string): string {
+  const resolved = path.resolve(candidatePath);
+
+  try {
+    return fs.realpathSync.native(resolved);
+  } catch {
+    // If the full path doesn't exist yet, resolve the parent directory
+    // to collapse symlinks and then re-attach the basename.
+    const dir = path.dirname(resolved);
+    const base = path.basename(resolved);
+    try {
+      const realDir = fs.realpathSync.native(dir);
+      return path.join(realDir, base);
+    } catch {
+      return resolved;
+    }
+  }
 }
 
 /**
@@ -78,36 +102,43 @@ export function validateSessionPath(sessionPath: string, allowedDirs?: string[])
     return "sessionPath must be an absolute path";
   }
 
-  // Resolve to canonical path (removes . and .. components)
+  // Resolve to canonical path (removes . and .. components; resolves symlinks when possible)
   let resolvedPath: string;
   try {
     resolvedPath = path.resolve(sessionPath);
   } catch {
     return "sessionPath could not be resolved";
   }
+  const canonicalPath = resolveCanonicalPath(resolvedPath);
 
   // Default allowed directories
   const home = process.env.HOME ?? "";
   const defaultAllowedDirs = [path.join(home, ".pi", "agent", "sessions")];
 
-  // Check if path ends with .jsonl (session file extension)
-  if (!resolvedPath.endsWith(".jsonl") && !resolvedPath.endsWith(".json")) {
+  // Check if path ends with .jsonl/.json (session file extension)
+  // Validate both resolved and canonical forms to avoid extension-smuggling through symlinks.
+  const hasAllowedExtension = (value: string) =>
+    value.endsWith(".jsonl") || value.endsWith(".json");
+  if (!hasAllowedExtension(resolvedPath) || !hasAllowedExtension(canonicalPath)) {
     return "sessionPath must point to a .jsonl or .json session file";
   }
 
   // Use provided allowed dirs or defaults
   const dirsToCheck = allowedDirs ?? defaultAllowedDirs;
 
-  // Check if resolved path is under an allowed directory
+  // Check if canonical path is under an allowed directory
   for (const allowedDir of dirsToCheck) {
-    const resolvedAllowed = path.resolve(allowedDir);
-    if (resolvedPath.startsWith(resolvedAllowed + path.sep) || resolvedPath === resolvedAllowed) {
+    const canonicalAllowed = resolveCanonicalPath(allowedDir);
+    if (
+      canonicalPath.startsWith(canonicalAllowed + path.sep) ||
+      canonicalPath === canonicalAllowed
+    ) {
       return null; // Valid path
     }
   }
 
   // Also allow any .pi/sessions directory (project-local)
-  const pathParts = resolvedPath.split(path.sep);
+  const pathParts = canonicalPath.split(path.sep);
   const piSessionsIndex = pathParts.findIndex(
     (part, i) => part === ".pi" && pathParts[i + 1] === "sessions"
   );
@@ -167,6 +198,7 @@ const SESSION_COMMANDS = new Set([
   "switch_session_file",
   "fork",
   "get_fork_messages",
+  "navigate_tree",
   "get_last_assistant_text",
   "get_context_usage",
 ]);
@@ -414,6 +446,40 @@ function validateCommandByType(type: string, cmd: Record<string, unknown>): Vali
     case "fork":
       if (!cmd.entryId || typeof cmd.entryId !== "string") {
         errors.push({ field: "entryId", message: "Required string" });
+      }
+      break;
+
+    case "navigate_tree":
+      if (!cmd.targetId || typeof cmd.targetId !== "string") {
+        errors.push({ field: "targetId", message: "Required string" });
+      }
+      if ("options" in cmd) {
+        if (!cmd.options || typeof cmd.options !== "object") {
+          errors.push({ field: "options", message: "Must be an object if provided" });
+        } else {
+          const options = cmd.options as Record<string, unknown>;
+          if ("summarize" in options && typeof options.summarize !== "boolean") {
+            errors.push({ field: "options.summarize", message: "Must be a boolean if provided" });
+          }
+          if ("customInstructions" in options && typeof options.customInstructions !== "string") {
+            errors.push({
+              field: "options.customInstructions",
+              message: "Must be a string if provided",
+            });
+          }
+          if (
+            "replaceInstructions" in options &&
+            typeof options.replaceInstructions !== "boolean"
+          ) {
+            errors.push({
+              field: "options.replaceInstructions",
+              message: "Must be a boolean if provided",
+            });
+          }
+          if ("label" in options && typeof options.label !== "string") {
+            errors.push({ field: "options.label", message: "Must be a string if provided" });
+          }
+        }
       }
       break;
 
