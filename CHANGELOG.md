@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0/).
 
+## [2.1.0](https://github.com/tryingET/pi-server/compare/v2.0.1...v2.1.0) (2026-03-03)
+
+
+### Features
+
+* add durable command journal foundation (level 4) ([e23ae1e](https://github.com/tryingET/pi-server/commit/e23ae1e50451ce580b4ff64d190a54a340d98f13))
+* **durable-journal:** harden append strictness, invariants, and chaos coverage ([01e9533](https://github.com/tryingET/pi-server/commit/01e9533a54d9b6dca21dd375279ddccb59ce87fa))
+* **protocol:** add navigate_tree RPC command for session tree navigation ([0e281eb](https://github.com/tryingET/pi-server/commit/0e281eb08471bf8856702dc4130d675a5d1354c6))
+* **session-manager:** emit debug diagnostics for npm env sanitization ([672de5e](https://github.com/tryingET/pi-server/commit/672de5e1c8bb0dc41b3418434b0af8fef0560737))
+
+
+### Bug Fixes
+
+* **validation:** harden session path and navigate_tree checks ([161021d](https://github.com/tryingET/pi-server/commit/161021dd5db5ddaae6855383b85b6ea1fe641dde))
+
 ## [2.0.1](https://github.com/tryingET/pi-server/compare/v2.0.0...v2.0.1) (2026-03-01)
 
 
