@@ -105,6 +105,14 @@ describe("command-classification", () => {
       assert.strictEqual(isShortTimeoutCommand("set_session_name"), true);
     });
 
+    it("returns true for get_startup_recovery", () => {
+      assert.strictEqual(isShortTimeoutCommand("get_startup_recovery"), true);
+    });
+
+    it("returns true for get_command_history", () => {
+      assert.strictEqual(isShortTimeoutCommand("get_command_history"), true);
+    });
+
     it("returns false for prompt", () => {
       assert.strictEqual(isShortTimeoutCommand("prompt"), false);
     });

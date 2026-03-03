@@ -36,6 +36,16 @@ export type ServerCommand =
   | { id?: string; type: "switch_session"; sessionId: string }
   | { id?: string; type: "get_metrics" }
   | { id?: string; type: "health_check" }
+  | { id?: string; type: "get_startup_recovery" }
+  | {
+      id?: string;
+      type: "get_command_history";
+      sessionIdFilter?: string;
+      commandId?: string;
+      fromTimestamp?: number;
+      toTimestamp?: number;
+      limit?: number;
+    }
   // ADR-0007: Session persistence
   | { id?: string; type: "list_stored_sessions" }
   | { id?: string; type: "load_session"; sessionId?: string; sessionPath: string };
@@ -146,6 +156,31 @@ export interface RpcResponseBase {
 }
 
 // Server command responses
+export interface StartupRecoveryData {
+  enabled: boolean;
+  initialized: boolean;
+  initState: "disabled" | "pending" | "ready" | "failed" | "timed_out";
+  initializationError?: string;
+  journalPath: string;
+  schemaVersion: number;
+  entriesScanned: number;
+  malformedEntries: number;
+  unsupportedVersionEntries: number;
+  recoveredOutcomes: number;
+  recoveredOutcomeIds: string[];
+  recoveredOutcomeIdsTruncated: boolean;
+  recoveredInFlightFailures: number;
+  recoveredInFlight: Array<{
+    commandId: string;
+    commandType: string;
+    laneKey: string;
+    lastPhase: "command_accepted" | "command_started";
+    reason: string;
+  }>;
+  recoveredInFlightTruncated: boolean;
+  maxItemsReturned: number;
+}
+
 export type ServerResponse =
   | (RpcResponseBase & {
       command: "list_sessions";
@@ -215,12 +250,17 @@ export type ServerResponse =
             /** Count of metadata file resets due to corruption/oversize */
             metadataResetCount: number;
           };
-          /** Durable command journal stats (Level 4 foundation). */
+          /** Durable command journal stats (Level 4 foundation + L4.4 scaffold). */
           journal: {
             enabled: boolean;
             initialized: boolean;
             journalPath: string;
             schemaVersion: number;
+            appendFailurePolicy: "best_effort" | "fail_closed";
+            redaction: {
+              beforePersistHookEnabled: boolean;
+              beforeExportHookEnabled: boolean;
+            };
             entriesWritten: number;
             writeErrors: number;
             entriesScanned: number;
@@ -228,6 +268,21 @@ export type ServerResponse =
             unsupportedVersionEntries: number;
             recoveredOutcomes: number;
             recoveredInFlightFailures: number;
+            retention: {
+              enabled: boolean;
+              maxEntries?: number;
+              maxAgeMs?: number;
+              maxBytes?: number;
+            };
+            compaction: {
+              runs: number;
+              droppedEntries: number;
+              lastCompactionAt?: number;
+              lastEntriesBefore: number;
+              lastEntriesAfter: number;
+              lastBytesBefore: number;
+              lastBytesAfter: number;
+            };
           };
         };
         /** Circuit breaker metrics per provider (ADR-0010) */
@@ -256,6 +311,54 @@ export type ServerResponse =
         hasOpenCircuit: boolean;
         /** Whether bash command circuit is open */
         hasOpenBashCircuit: boolean;
+      };
+    })
+  | (RpcResponseBase & {
+      command: "get_startup_recovery";
+      success: true;
+      data: StartupRecoveryData;
+    })
+  | (RpcResponseBase & {
+      command: "get_command_history";
+      success: true;
+      data: {
+        enabled: boolean;
+        initialized: boolean;
+        initState: "disabled" | "pending" | "ready" | "failed" | "timed_out";
+        initializationError?: string;
+        journalPath: string;
+        schemaVersion: number;
+        filters: {
+          sessionIdFilter?: string;
+          commandId?: string;
+          fromTimestamp?: number;
+          toTimestamp?: number;
+        };
+        entries: Array<{
+          recordedAt: number;
+          phase: "command_accepted" | "command_started" | "command_finished";
+          commandId: string;
+          commandType: string;
+          laneKey: string;
+          laneSequence: number;
+          fingerprint: string;
+          explicitId: boolean;
+          sessionId?: string;
+          dependsOn?: string[];
+          ifSessionVersion?: number;
+          idempotencyKey?: string;
+          success?: boolean;
+          error?: string;
+          sessionVersion?: number;
+          replayed?: boolean;
+          timedOut?: boolean;
+          recovered?: boolean;
+          recoveryReason?: string;
+        }>;
+        returned: number;
+        truncated: boolean;
+        maxItemsReturned: number;
+        maxItemsAllowed: number;
       };
     })
   // ADR-0007: Session persistence
@@ -420,6 +523,15 @@ export interface ServerShutdownEvent {
   data: { reason: string; timeoutMs?: number };
 }
 
+/**
+ * Optional convenience event with startup durable journal recovery summary.
+ * Endpoint-first contract remains canonical via get_startup_recovery command.
+ */
+export interface StartupRecoverySummaryEvent {
+  type: "startup_recovery_summary";
+  data: StartupRecoveryData;
+}
+
 export interface SessionLifecycleEvent {
   type: "session_created" | "session_deleted";
   data: { sessionId: string; sessionInfo?: SessionInfo };
@@ -445,6 +557,7 @@ export type RpcBroadcast =
   | RpcEvent
   | ServerEvent
   | ServerShutdownEvent
+  | StartupRecoverySummaryEvent
   | SessionLifecycleEvent
   | CommandLifecycleEvent;
 

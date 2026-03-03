@@ -159,6 +159,27 @@ interface WSMessage {
     serverVersion?: string;
     protocolVersion?: string;
     transports?: string[];
+    enabled?: boolean;
+    initialized?: boolean;
+    initState?: "disabled" | "pending" | "ready" | "failed" | "timed_out";
+    initializationError?: string;
+    journalPath?: string;
+    recoveredOutcomeIds?: string[];
+    recoveredOutcomeIdsTruncated?: boolean;
+    recoveredInFlight?: unknown[];
+    recoveredInFlightTruncated?: boolean;
+    maxItemsReturned?: number;
+    returned?: number;
+    truncated?: boolean;
+    maxItemsAllowed?: number;
+    entries?: unknown[];
+    filters?: {
+      sessionIdFilter?: string;
+      commandId?: string;
+      fromTimestamp?: number;
+      toTimestamp?: number;
+    };
+    [key: string]: unknown;
   };
   [key: string]: unknown;
 }
@@ -349,6 +370,44 @@ async function testServerReady() {
 
       client.close();
     });
+
+    await test("integration: receives startup_recovery_summary convenience event", async () => {
+      const client = new TestClient();
+      await client.connect(ctx.port);
+
+      const recoveryMsg = await client.waitForMessage(
+        (msg) => msg.type === "startup_recovery_summary",
+        2000
+      );
+
+      assert.strictEqual(recoveryMsg.type, "startup_recovery_summary");
+      assert.ok(typeof recoveryMsg.data?.enabled === "boolean");
+      assert.ok(typeof recoveryMsg.data?.initialized === "boolean");
+      assert.ok(
+        ["disabled", "pending", "ready", "failed", "timed_out"].includes(
+          (recoveryMsg.data?.initState as string) ?? ""
+        )
+      );
+      assert.strictEqual(
+        recoveryMsg.data?.journalPath,
+        "[redacted]",
+        "Convenience event should redact journalPath by default"
+      );
+      assert.ok(Array.isArray(recoveryMsg.data?.recoveredOutcomeIds));
+      assert.strictEqual(
+        recoveryMsg.data?.recoveredOutcomeIds?.length,
+        0,
+        "Convenience event should redact recovered outcome IDs by default"
+      );
+      assert.ok(Array.isArray(recoveryMsg.data?.recoveredInFlight));
+      assert.strictEqual(
+        recoveryMsg.data?.recoveredInFlight?.length,
+        0,
+        "Convenience event should redact recovered in-flight entries by default"
+      );
+
+      client.close();
+    });
   });
 }
 
@@ -359,7 +418,7 @@ async function testCommandResponse() {
     await test("integration: list_sessions returns empty array", async () => {
       const client = new TestClient();
       await client.connect(ctx.port);
-      client.clearMessages(); // Clear server_ready
+      client.clearMessages(); // Clear startup broadcasts
 
       const listCommandId = "list-empty";
       const response = await client.sendAndExpectSuccess({
@@ -611,6 +670,27 @@ async function testCommandResponse() {
       client.close();
     });
 
+    await test("integration: get_startup_recovery participates in duplicate-id conflict detection", async () => {
+      const client = new TestClient();
+      await client.connect(ctx.port);
+      client.clearMessages();
+
+      await client.sendAndExpectSuccess(
+        { id: "startup-dup-int", type: "get_startup_recovery" },
+        { timeoutMs: 8000 }
+      );
+
+      await client.send({ id: "startup-dup-int", type: "health_check" });
+      const conflict = await client.waitForMessage(
+        (msg) => msg.id === "startup-dup-int" && msg.success === false,
+        8000
+      );
+
+      assert.strictEqual(conflict.success, false);
+      assert.ok(conflict.error?.includes("Conflicting id 'startup-dup-int'"));
+      client.close();
+    });
+
     await test("integration: rejects conflicting idempotency keys", async () => {
       const client = new TestClient();
       await client.connect(ctx.port);
@@ -784,6 +864,59 @@ async function testMetrics() {
       assert.ok(typeof response.data?.commandsRejected === "object");
       assert.ok(typeof response.data?.doubleUnregisterErrors === "number");
       assert.ok(typeof response.data?.rateLimitUsage === "object");
+
+      client.close();
+    });
+
+    await test("integration: get_startup_recovery returns startup summary", async () => {
+      const client = new TestClient();
+      await client.connect(ctx.port);
+      client.clearMessages();
+
+      const response = await client.sendAndExpectSuccess({
+        id: "startup-recovery-1",
+        type: "get_startup_recovery",
+      });
+
+      assert.ok(typeof response.data?.enabled === "boolean");
+      assert.ok(typeof response.data?.initialized === "boolean");
+      assert.ok(typeof response.data?.journalPath === "string");
+      assert.notStrictEqual(
+        response.data?.journalPath,
+        "[redacted]",
+        "Explicit get_startup_recovery should return full diagnostics"
+      );
+      assert.ok(
+        ["disabled", "pending", "ready", "failed", "timed_out"].includes(
+          (response.data?.initState as string) ?? ""
+        )
+      );
+      assert.ok(Array.isArray(response.data?.recoveredOutcomeIds));
+      assert.ok(Array.isArray(response.data?.recoveredInFlight));
+      assert.ok(typeof response.data?.maxItemsReturned === "number");
+
+      client.close();
+    });
+
+    await test("integration: get_command_history returns bounded history payload", async () => {
+      const client = new TestClient();
+      await client.connect(ctx.port);
+      client.clearMessages();
+
+      const response = await client.sendAndExpectSuccess({
+        id: "command-history-1",
+        type: "get_command_history",
+        limit: 5,
+      });
+
+      assert.ok(typeof response.data?.enabled === "boolean");
+      assert.ok(typeof response.data?.initialized === "boolean");
+      assert.ok(typeof response.data?.journalPath === "string");
+      assert.ok(Array.isArray(response.data?.entries));
+      assert.ok(typeof response.data?.returned === "number");
+      assert.ok(typeof response.data?.truncated === "boolean");
+      assert.ok(typeof response.data?.maxItemsReturned === "number");
+      assert.ok(typeof response.data?.maxItemsAllowed === "number");
 
       client.close();
     });

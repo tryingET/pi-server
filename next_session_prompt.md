@@ -1,129 +1,151 @@
 # pi-server: Next Session Prompt
 
 **Operating mode:** Production-ready, reliability-first  
-**Current phase:** Level 4 (Durable command journal + replay) — active execution  
+**Current phase:** Level 4 (Durable command journal + replay) — ADR-0019 hardening continuation complete  
 **Version:** 2.0.1 (current)  
 **Formalization Level:** 2 (Bounded Run)
 
 ---
 
-## SESSION STATUS (2026-03-02)
+## SESSION STATUS (2026-03-03)
 
-### LATEST ADDITIONS
+## ✅ ADR-0019 NEXT-STEPS PASS COMPLETE
+
+This pass completed the previously deferred Level 4 hardening items:
+1. append write-failure strictness policy
+2. redaction hooks for persistence/export surfaces
+3. corruption/partial-write chaos coverage around recovery + compaction
+
+---
+
+## WHAT CHANGED THIS PASS
+
+### 1) Append write-failure strictness policy is now explicit
+
+New durable journal option:
+- `durableJournal.appendFailurePolicy`
+  - `"best_effort"` (default): log append failures and continue command flow
+  - `"fail_closed"`: mark durable state failed and fail command flow closed
+
+Fail-closed semantics:
+- Append failure during `command_accepted` / `command_started` causes command failure for non-observability commands.
+- Durable init state transitions to `failed` with explicit error details.
+- `get_startup_recovery` and `get_command_history` remain available for diagnostics.
+
+### 2) Redaction hooks added for persistence/export surfaces
+
+New durable journal hooks:
+- `durableJournal.redaction.beforePersist(entry)`
+- `durableJournal.redaction.beforeExport(result, { query })`
+
+Behavior:
+- `beforePersist` runs before journal append.
+- Immutable identity fields are protected (`commandId`, lane/phase/sequence, fingerprint, etc.).
+- `beforeExport` can redact history query payloads (entries and/or metadata like `journalPath`).
+
+### 3) Chaos coverage for malformed/partial writes
+
+Added deterministic tests for:
+- truncated/malformed tail lines during startup recovery
+- compaction behavior with malformed partial lines mixed with valid entries
+
+Guarantees validated:
+- malformed lines are skipped safely
+- recovery remains deterministic for valid explicit outcomes/in-flight entries
+- compaction rewrites to parseable retained entries while preserving replay semantics
+
+### 4) NEXUS hardening closure (deep-review addendum)
+
+Additional reliability fixes completed in the same pass:
+- `fail_closed` now enforces terminal failure when `command_finished` append fails.
+- Replay/idempotency persistence now stores the **finalized** terminal response to preserve determinism.
+- Redaction invariants now block replay-critical terminal corruption (`response` removal / `response.id` drift).
+- Stdio backpressure drop accounting increments `droppedCount` on each dropped non-critical write.
+- `PiServerOptions.durableInitTimeoutMs` now forwards to `PiSessionManager`.
+
+---
+
+## IMPLEMENTED IN THIS SESSION
 
 | Feature | Description | Files |
 |---|---|---|
-| Durable command journal foundation | Added append-only JSONL journal with per-lane sequence numbers and lifecycle persistence (`accepted`/`started`/`finished`) behind `durableJournal.enabled` | `src/command-journal.ts`, `src/session-manager.ts`, `src/server.ts` |
-| Deterministic startup rehydration | On startup, completed explicit outcomes are rehydrated; pre-crash in-flight explicit commands are deterministically marked failed and journaled | `src/command-journal.ts`, `src/session-manager.ts` |
-| Journal observability surface | `get_metrics.stores.journal` now exposes journal stats and recovery counters | `src/session-manager.ts`, `src/types.ts` |
-| Level 4 architecture decision | Documented backend choice (JSONL), schema v1, migration guardrails, and recovery policy | `docs/adr/0019-durable-command-journal-foundation.md` |
-| Test coverage for restart semantics | Added tests for durable replay across restart and in-flight recovery classification | `src/test.ts` |
-| Packaging/build updates | Added `command-journal` to build entries and published artifact list | `package.json` |
-| Docs updates | Added ADR index + README references; protocol limitation updated to feature-flagged durable status | `docs/README.md`, `README.md`, `PROTOCOL.md` |
+| Append strictness policy | Codified `best_effort` vs `fail_closed`; fail-closed latches durable state failure and fails non-observability command flow | `src/command-journal.ts`, `src/session-manager.ts`, `src/test.ts` |
+| Redaction hooks | Added `beforePersist` and `beforeExport` hooks with invariant checks for persistence safety | `src/command-journal.ts`, `src/test.ts` |
+| Journal observability extensions | `get_metrics.stores.journal` now exposes append policy + redaction hook enablement | `src/session-manager.ts`, `src/types.ts`, `src/test.ts` |
+| NEXUS hardening fixes | Terminal fail-closed enforcement + finalized outcome storage + replay-critical redaction guards + stdio drop counter + server timeout plumbing | `src/session-manager.ts`, `src/command-journal.ts`, `src/server.ts`, `src/test.ts` |
+| Chaos tests | Added partial-write recovery and malformed-compaction tests | `src/test.ts` |
 
 ---
 
-## RESOLVED IN THIS SESSION (Horizon B kickoff)
-
-| Finding | Fix Applied | Files |
-|---|---|---|
-| L4 backend decision unresolved | Chosen append-only JSONL for foundation, documented as ADR-0019 | `docs/adr/0019-durable-command-journal-foundation.md` |
-| No durable command lifecycle substrate | Added journal store with schema-versioned lifecycle records and per-lane monotonic sequencing | `src/command-journal.ts` |
-| No startup recovery rehydration | Added one-time startup initialization path in session manager/server startup | `src/session-manager.ts`, `src/server.ts` |
-| Crash leaves in-flight commands indeterminate after restart | Recovery pass now classifies pre-crash in-flight explicit commands as deterministic failed outcomes | `src/command-journal.ts` |
-| No runtime visibility into journal health | Added journal metrics fields to `get_metrics` response contract | `src/session-manager.ts`, `src/types.ts` |
-
----
-
-## TEST / VERIFICATION SNAPSHOT (CURRENT)
-
-Executed after Horizon B foundation changes:
+## TEST / VERIFICATION SNAPSHOT (THIS PASS)
 
 | Check | Status |
 |---|---|
 | `npm run typecheck` | ✅ |
 | `npm run lint` | ✅ |
-| `npm run format:check` | ✅ |
 | `npm run build` | ✅ |
-| `npm test` | ✅ 119 passed, 0 failed |
-| `npm run check:consistency` | ✅ |
+| `npm test` | ✅ 152 passed, 0 failed |
+| `npm run test:integration` | ✅ 31 passed, 0 failed |
+| `npm run test:fuzz` | ✅ 17 passed, 0 failed |
+| `node --experimental-vm-modules dist/test-command-classification.js` | ✅ 36 passed, 0 failed |
+| `npm run ci` | ✅ |
 
-Notable functional verification:
-- Explicit command outcomes now replay across manager restart when durable journal is enabled.
-- Pre-crash in-flight explicit command IDs are replayed as deterministic recovery failures.
+Notable verification:
+- Fail-closed append policy rejects command flow deterministically and keeps diagnostics surfaces available.
+- Best-effort policy preserves availability under append faults.
+- Redaction hooks affect both persisted and exported history payloads as configured.
+- Truncated/malformed journal lines do not corrupt deterministic recovery or retained replay behavior.
+- Fail-closed terminal append failures now downgrade final response and persist deterministically.
+- CI script now includes integration + fuzz gates (not just unit/main suite).
 
----
+## PRODUCTION READINESS GUARDRAILS (CURRENT)
 
-## ACTIVE DEFERRED CONTRACTS (CARRIED FORWARD)
-
-| Finding | Rationale | Owner | Trigger | Deadline | Blast Radius |
-|---|---|---|---|---|---|
-| **Level 4 completion: history API + replay extraction** | Durable substrate exists; external query/export APIs still missing | Maintainer | L4.3 execution | Current phase | Auditability / incident tooling |
-| **Retention + compaction policy** | JSONL growth is unbounded without retention/compaction controls | Maintainer | L4.4 execution | Current phase | Disk pressure / long-term ops |
-| **AbortController integration upstream** | Requires `@mariozechner/pi-coding-agent` API support for caller-provided `AbortSignal` | Maintainer | Upstream accepts proposal (`upstream-proposal-abortcontroller.md`) | Next major version | Timeout semantic mismatch + wasted LLM tokens |
-| **AgentSession backpressure API** | Deferred as YAGNI at current throughput; revisit with telemetry evidence | Maintainer | Sustained high `ws.bufferedAmount` / memory pressure metrics | When needed | Potential OOM under pathological slow consumers |
-
----
-
-## NEXT STEPS (PRIORITIZED)
-
-1. **L4.2 recovery surface completion**
-   - Expose startup recovery summary via protocol event or dedicated command
-   - Add deterministic fixture tests for repeated boot equivalence
-
-2. **L4.3 replay/history API**
-   - Define `get_command_history` contract (filters: session, commandId, time window)
-   - Implement server handler backed by durable journal scan/index
-
-3. **L4.4 retention + compaction**
-   - Add time/size retention policy
-   - Add compaction pass with replay-equivalence tests
-
-4. **Durability mode hardening**
-   - Decide strict write-failure behavior (fail-open vs fail-closed) for journal append errors
-   - Add chaos tests for partial writes/corrupt lines and schema-version mismatch behavior
-
-5. **Validation + CI expansion**
-   - Re-run full extended gates (`npm run test:integration`, `npm run test:fuzz`) after next L4 increments
-   - Consider adding journal schema checks to `check:consistency`
+- **Replay determinism:** explicit command IDs always replay the same stored terminal outcome.
+- **Timeout semantics:** timeout remains a terminal response and is replay-stable.
+- **Fail-closed durability mode:** append failures can intentionally fail command flow when configured (`appendFailurePolicy: "fail_closed"`).
+- **Durability observability continuity:** `get_startup_recovery` and `get_command_history` remain available for diagnostics under durable-init/append failure conditions.
+- **Rate-limit + lifecycle ordering:** replay remains free; new executions are still bounded by governor and lifecycle events remain emitted.
 
 ---
 
-## ROLLBACK (THIS SESSION)
+## DEFERRED CONTRACTS
+
+No new deferred contracts were introduced in this pass.
+
+Remaining broader roadmap items:
+- optional SQLite backend decision gate
+- deterministic replay engine placement (in-process vs offline tooling)
+- schema migration tooling and fixtures
+
+---
+
+## NEXT STEPS
+
+1. Evaluate and codify compliance envelope for redaction policy presets (safe defaults + examples).
+2. Add deterministic replay/export tooling contract (CLI/offline path) on top of redacted history surface.
+3. Add fault-injection matrix for journal I/O errors beyond malformed-line chaos (ENOSPC/EIO simulation harness).
+
+---
+
+## ROLLBACK (SESSION CHANGES)
 
 ```bash
-# Revert latest durable-journal foundation commit(s)
-# Replace <new-commit-sha> with actual SHA(s)
+git checkout -- src/command-journal.ts src/session-manager.ts src/server.ts src/types.ts \
+  src/test.ts package.json next_session_prompt.md
 
-git revert <new-commit-sha>
-
-# Re-validate
 npm run build
 npm test
-npm run check:consistency
+npm run test:integration
+npm run test:fuzz
 ```
-
----
-
-## PRODUCTION READINESS (POST-HORIZON-B FOUNDATION)
-
-| Check | Status |
-|---|---|
-| Runtime/package version alignment | ✅ enforced by check script |
-| Auth docs/source-of-truth alignment | ✅ ADR-0014 canonicalized |
-| Durable journal foundation | ✅ implemented behind feature flag |
-| Startup deterministic rehydration | ✅ implemented for explicit command IDs |
-| Full local quality gates run this session | ✅ green |
-
-**Verdict:** ✅ Level 4 foundation is in place; proceed with history/replay API and retention/compaction completion.
 
 ---
 
 ## UPSTREAM PROPOSALS
 
-See `~/programming/pi-extensions/issue-tracker/pi-mono-upstream/` for pending upstream change requests:
-- `extension-ui-wouldexceedlimit.md` — ExtensionUIContext.wouldExceedLimit() method
-- `shared-protocol-package.md` — Shared @mariozechner/pi-protocol package extraction
+See `~/programming/pi-extensions/issue-tracker/pi-mono-upstream/` for pending upstream requests:
+- `extension-ui-wouldexceedlimit.md`
+- `shared-protocol-package.md`
 
-Historical proposals archived in this repo:
-- `upstream-proposal-abortcontroller.md` — AbortSignal integration
+Historical proposal in this repo:
+- `upstream-proposal-abortcontroller.md`

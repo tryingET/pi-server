@@ -113,7 +113,7 @@
     "format:check": "biome format src",
     "check": "npm run typecheck && npm run lint",
     "check:consistency": "node scripts/check-version-docs.mjs",
-    "ci": "npm run typecheck && npm run lint && npm run format:check && npm run build && npm run check:consistency && npm test",
+    "ci": "npm run typecheck && npm run lint && npm run format:check && npm run build && npm run check:consistency && npm test && npm run test:integration && npm run test:fuzz",
     "start": "node dist/server.js",
     "dev": "esbuild src/server.ts --outdir=dist --format=esm --platform=node --target=node20 --sourcemap=inline --watch",
     "test": "node --experimental-vm-modules dist/test.js",

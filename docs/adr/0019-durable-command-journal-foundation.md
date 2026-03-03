@@ -89,10 +89,18 @@ This preserves rollback safety while validating operational behavior.
 
 ## Follow-up work
 
-- retention + compaction with replay-equivalence guarantees
+- ✅ recovery summary endpoint (`get_startup_recovery`) in protocol surface
+- ✅ recovery summary startup event (`startup_recovery_summary`) in protocol surface (convenience; endpoint remains canonical)
+- ✅ bounded history query endpoint (`get_command_history`) with session/command/time filters
+- ✅ retention + compaction foundation (`durableJournal.retention` with maxEntries/maxAgeMs/maxBytes), preserving retained replay + in-flight recovery semantics
+- ✅ single-writer lock file enforcement to prevent multi-process compaction/append races on one journal path
+- ✅ bounded history-query scan guardrails (line/time budget) to avoid unbounded server-lane scans
+- ✅ append write-failure strictness policy (`durableJournal.appendFailurePolicy`: `best_effort` / `fail_closed`)
+- ✅ redaction hooks for persistence/export surfaces (`durableJournal.redaction.beforePersist` / `beforeExport`)
+- ✅ chaos coverage for malformed/partial journal lines around recovery + compaction
 - optional SQLite backend evaluation (decision gate revisit)
-- recovery summary endpoint/event in protocol surface
 - schema migration tooling and fixtures
+- deterministic replay/export tooling for incident workflows
 
 ## References
 

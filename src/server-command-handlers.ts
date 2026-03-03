@@ -44,6 +44,17 @@ export interface ServerCommandContext {
   getMemoryMetrics?: () => Record<string, unknown> | undefined;
   /** Health check */
   getHealth: () => RpcResponse;
+  /** Startup durable recovery summary */
+  getStartupRecovery: () => RpcResponse;
+  /** Durable command history query surface (ADR-0019 follow-up). */
+  getCommandHistory: (command: {
+    id?: string;
+    sessionIdFilter?: string;
+    commandId?: string;
+    fromTimestamp?: number;
+    toTimestamp?: number;
+    limit?: number;
+  }) => Promise<RpcResponse>;
   /** Handle extension UI response */
   handleUIResponse: (command: {
     id?: string;
@@ -201,6 +212,21 @@ const handleGetMetrics: ServerCommandHandler = (_command, context) => {
 
 const handleHealthCheck: ServerCommandHandler = (_command, context) => {
   return context.getHealth();
+};
+
+const handleGetStartupRecovery: ServerCommandHandler = (_command, context) => {
+  return context.getStartupRecovery();
+};
+
+const handleGetCommandHistory: ServerCommandHandler = async (command, context) => {
+  return context.getCommandHistory({
+    id: command.id,
+    sessionIdFilter: command.sessionIdFilter,
+    commandId: command.commandId,
+    fromTimestamp: command.fromTimestamp,
+    toTimestamp: command.toTimestamp,
+    limit: command.limit,
+  });
 };
 
 // =============================================================================
@@ -397,6 +423,8 @@ export const serverCommandHandlers: Record<string, ServerCommandHandler> = {
   // Metrics & health
   get_metrics: handleGetMetrics,
   health_check: handleHealthCheck,
+  get_startup_recovery: handleGetStartupRecovery,
+  get_command_history: handleGetCommandHistory,
   // Extension UI
   extension_ui_response: handleExtensionUIResponse,
 };

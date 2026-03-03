@@ -737,6 +737,37 @@ function sendWithStdioBackpressure(
 
 ---
 
+## ADR-0019: Durable Command Journal Foundation
+
+**Status:** Accepted (2026-03-02)
+
+Full ADR: `docs/adr/0019-durable-command-journal-foundation.md`
+
+### The Invariant
+
+> Explicit client-provided command IDs must remain deterministic across process restarts.
+
+### Foundation Rules
+
+1. **Append lifecycle durably** - `command_accepted`, `command_started`, `command_finished` are persisted in append-only JSONL when `durableJournal.enabled=true`
+2. **Per-lane monotonic sequence** - each record carries `laneSequence`, resumed from max seen value during startup rehydration
+3. **Recover in-flight explicitly** - explicit IDs left in accepted/started state at crash are deterministically marked failed and written as synthetic recovery `command_finished` records
+4. **Conservative schema policy** - malformed or unsupported schema versions are skipped and counted; no implicit migration in foundation
+5. **Bound observability payloads** - startup recovery and history query responses are bounded with truncation metadata
+6. **Explicit append strictness policy** - `durableJournal.appendFailurePolicy` controls behavior (`best_effort` vs `fail_closed`)
+7. **Redaction hooks at durability seams** - `durableJournal.redaction.beforePersist` and `.beforeExport` support policy-driven data minimization
+
+### Key Properties
+
+1. **Feature-flagged rollout** - defaults off (`durableJournal.enabled=false`) for rollback safety
+2. **Replay continuity** - recovered explicit outcomes are rehydrated into replay store before serving commands
+3. **Failure-path observability** - `get_startup_recovery` and `get_command_history` remain usable for diagnostics when append strict mode latches durable state failed
+4. **Bounded introspection** - `get_command_history` provides filtered journal access (session filter, command ID, time window) with capped response size
+5. **Retention + compaction scaffold** - `durableJournal.retention.{maxEntries,maxAgeMs,maxBytes}` prunes stale terminal outcomes while preserving in-flight recovery semantics
+6. **Chaos-hardened malformed handling** - partial/truncated lines are safely skipped during recovery and compaction without corrupting retained replay semantics
+
+---
+
 ## Pattern: Settled Flag for Promise Races
 
 **Status:** Accepted (2026-02-28)
@@ -1138,10 +1169,10 @@ Fuzz test coverage:
 ### Running All Tests
 
 ```bash
-npm test                    # 83 unit tests
-npm run test:integration   # 26 integration tests
-npm run test:fuzz          # 17 fuzz tests
-# Module tests (141 total)
+npm test                    # Main test suite
+npm run test:integration   # Integration tests
+npm run test:fuzz          # Fuzz tests
+# Module tests
 node --experimental-vm-modules dist/test-command-classification.js
 node --experimental-vm-modules dist/test-session-version-store.js
 node --experimental-vm-modules dist/test-command-replay-store.js

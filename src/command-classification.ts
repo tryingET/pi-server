@@ -31,6 +31,8 @@ const SHORT_TIMEOUT_COMMANDS = new Set([
   "get_last_assistant_text",
   "get_context_usage",
   "set_session_name",
+  "get_startup_recovery",
+  "get_command_history",
 ]);
 
 /**

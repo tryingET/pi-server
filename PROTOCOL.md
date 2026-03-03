@@ -156,13 +156,14 @@ Optional fields:
 Server emits these event families:
 
 1. `server_ready`
-2. `server_shutdown`
-3. `session_created`
-4. `session_deleted`
-5. `event` (session-scoped AgentSession event)
-6. `command_accepted`
-7. `command_started`
-8. `command_finished`
+2. `startup_recovery_summary` (convenience; endpoint-first flow remains canonical)
+3. `server_shutdown`
+4. `session_created`
+5. `session_deleted`
+6. `event` (session-scoped AgentSession event)
+7. `command_accepted`
+8. `command_started`
+9. `command_finished`
 
 ### 6.1 Session-scoped AgentSession events
 
@@ -337,7 +338,7 @@ Conformant clients:
 
 1. No global total ordering (lane determinism only).
 2. Timeout does not prove cancellation completed.
-3. Durable replay beyond process lifetime is partially implemented behind a feature flag (`durableJournal.enabled`); full history/replay APIs remain Level 4 work.
+3. Durable replay beyond process lifetime is feature-flagged (`durableJournal.enabled`). `get_command_history` is available for bounded journal introspection; deterministic replay/export tooling remains Level 4 work.
 
 ---
 
@@ -360,7 +361,39 @@ Emitted on connection before any other messages. Announces server capabilities.
 
 Clients SHOULD check `protocolVersion` for compatibility.
 
-### 16.2 `server_shutdown`
+### 16.2 `startup_recovery_summary`
+
+Optional convenience event carrying the same payload schema as `get_startup_recovery`.
+
+By default, servers MAY redact sensitive fields in this event (for example: `journalPath`, `initializationError`, `recoveredOutcomeIds`, `recoveredInFlight`). Full diagnostics remain available via explicit `get_startup_recovery` requests.
+
+```json
+{
+  "type": "startup_recovery_summary",
+  "data": {
+    "enabled": true,
+    "initialized": true,
+    "initState": "ready",
+    "initializationError": "Initialization failed (details redacted; call get_startup_recovery for full diagnostics)",
+    "journalPath": "[redacted]",
+    "schemaVersion": 1,
+    "entriesScanned": 0,
+    "malformedEntries": 0,
+    "unsupportedVersionEntries": 0,
+    "recoveredOutcomes": 0,
+    "recoveredOutcomeIds": [],
+    "recoveredOutcomeIdsTruncated": false,
+    "recoveredInFlightFailures": 0,
+    "recoveredInFlight": [],
+    "recoveredInFlightTruncated": false,
+    "maxItemsReturned": 100
+  }
+}
+```
+
+This event is advisory. Clients SHOULD continue using `get_startup_recovery` as the canonical endpoint. Deployments that need full event detail can opt in via server configuration (`PiServerOptions.startupRecoverySummaryEvent.includeSensitiveData = true`).
+
+### 16.3 `server_shutdown`
 
 Emitted before server closes. Clients should expect connection termination.
 
@@ -388,10 +421,34 @@ Emitted before server closes. Clients should expect connection termination.
 | `switch_session` | Subscribe to session | `{ sessionInfo }` |
 | `get_metrics` | Server metrics | See `get_metrics` response |
 | `health_check` | Health status | `{ healthy, issues, hasOpenCircuit, hasOpenBashCircuit }` |
+| `get_startup_recovery` | Startup durable-journal recovery summary | `{ enabled, initialized, initState, initializationError?, journalPath, schemaVersion, entriesScanned, malformedEntries, unsupportedVersionEntries, recoveredOutcomes, recoveredOutcomeIds, recoveredOutcomeIdsTruncated, recoveredInFlightFailures, recoveredInFlight, recoveredInFlightTruncated, maxItemsReturned }` |
+| `get_command_history` | Bounded durable journal history query (ADR-0019) | `{ enabled, initialized, initState, initializationError?, journalPath, schemaVersion, filters, entries, returned, truncated, maxItemsReturned, maxItemsAllowed }` |
 | `list_stored_sessions` | List persisted sessions (ADR-0007) | `{ sessions: StoredSessionInfo[] }` |
 | `load_session` | Load session from disk (ADR-0007) | `{ sessionId, sessionInfo }` |
 
 > **Note:** `delete_session` unloads the session from server memory but does NOT delete the session file from disk. The session can be reloaded later via `load_session` or discovered via `list_stored_sessions`.
+
+#### `get_command_history` request fields
+
+```json
+{
+  "type": "get_command_history",
+  "sessionIdFilter": "session-123",
+  "commandId": "cmd-42",
+  "fromTimestamp": 1772412000000,
+  "toTimestamp": 1772415600000,
+  "limit": 100
+}
+```
+
+- `sessionIdFilter` (optional): exact match on journal entry `sessionId`
+- `commandId` (optional): exact match on journal entry command ID
+- `fromTimestamp` / `toTimestamp` (optional): inclusive time bounds on `recordedAt`
+- `limit` (optional): max entries returned (default `100`, hard max `500`)
+
+Entries are returned in append order and may be truncated when `limit` is reached.
+Servers MAY also apply internal scan guardrails (line/time budget) and set `truncated: true`
+when the query exceeds those bounds.
 
 ### 17.2 Session commands (require `sessionId`)
 

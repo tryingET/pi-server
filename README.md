@@ -142,11 +142,11 @@ npm install
 npm run build
 
 # Run tests
-npm test                    # Unit tests (83)
-npm run test:integration    # Integration tests (26)
-npm run test:fuzz           # Fuzz tests (17)
+npm test                    # Main test suite
+npm run test:integration    # Integration tests
+npm run test:fuzz           # Fuzz tests
 
-# Module tests (141)
+# Module tests
 node --experimental-vm-modules dist/test-command-classification.js
 node --experimental-vm-modules dist/test-session-version-store.js
 node --experimental-vm-modules dist/test-command-replay-store.js

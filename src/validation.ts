@@ -23,6 +23,7 @@ const MAX_COMMAND_ID_LENGTH = 256;
 const MAX_IDEMPOTENCY_KEY_LENGTH = 256;
 const MAX_REQUEST_ID_LENGTH = 256;
 const MAX_DEPENDENCIES = 32;
+const MAX_HISTORY_QUERY_LIMIT = 500;
 
 /** Valid characters for requestId (alphanumeric, colon, dash, underscore). */
 const REQUEST_ID_PATTERN = /^[a-zA-Z0-9:_-]+$/;
@@ -211,6 +212,8 @@ const SERVER_COMMANDS = new Set([
   "switch_session",
   "get_metrics",
   "health_check",
+  "get_startup_recovery",
+  "get_command_history",
   // ADR-0007: Session persistence
   "list_stored_sessions",
   "load_session",
@@ -354,6 +357,82 @@ function validateCommandByType(type: string, cmd: Record<string, unknown>): Vali
         errors.push({ field: "sessionId", message: "Required non-empty string" });
       }
       break;
+
+    case "get_command_history": {
+      if (
+        "sessionIdFilter" in cmd &&
+        (typeof cmd.sessionIdFilter !== "string" || cmd.sessionIdFilter.trim().length === 0)
+      ) {
+        errors.push({
+          field: "sessionIdFilter",
+          message: "Must be a non-empty string if provided",
+        });
+      }
+
+      if (
+        "commandId" in cmd &&
+        (typeof cmd.commandId !== "string" || cmd.commandId.trim().length === 0)
+      ) {
+        errors.push({ field: "commandId", message: "Must be a non-empty string if provided" });
+      } else if (
+        typeof cmd.commandId === "string" &&
+        cmd.commandId.length > MAX_COMMAND_ID_LENGTH
+      ) {
+        errors.push({
+          field: "commandId",
+          message: `Too long (max ${MAX_COMMAND_ID_LENGTH} chars)`,
+        });
+      }
+
+      if ("fromTimestamp" in cmd) {
+        if (
+          typeof cmd.fromTimestamp !== "number" ||
+          !Number.isInteger(cmd.fromTimestamp) ||
+          cmd.fromTimestamp < 0
+        ) {
+          errors.push({
+            field: "fromTimestamp",
+            message: "Must be a non-negative integer timestamp",
+          });
+        }
+      }
+
+      if ("toTimestamp" in cmd) {
+        if (
+          typeof cmd.toTimestamp !== "number" ||
+          !Number.isInteger(cmd.toTimestamp) ||
+          cmd.toTimestamp < 0
+        ) {
+          errors.push({
+            field: "toTimestamp",
+            message: "Must be a non-negative integer timestamp",
+          });
+        }
+      }
+
+      if (
+        typeof cmd.fromTimestamp === "number" &&
+        typeof cmd.toTimestamp === "number" &&
+        cmd.fromTimestamp > cmd.toTimestamp
+      ) {
+        errors.push({
+          field: "fromTimestamp",
+          message: "Must be less than or equal to toTimestamp",
+        });
+      }
+
+      if ("limit" in cmd) {
+        if (typeof cmd.limit !== "number" || !Number.isInteger(cmd.limit)) {
+          errors.push({ field: "limit", message: "Must be an integer if provided" });
+        } else if (cmd.limit <= 0 || cmd.limit > MAX_HISTORY_QUERY_LIMIT) {
+          errors.push({
+            field: "limit",
+            message: `Must be between 1 and ${MAX_HISTORY_QUERY_LIMIT}`,
+          });
+        }
+      }
+      break;
+    }
 
     case "prompt":
       if (!cmd.message || typeof cmd.message !== "string") {

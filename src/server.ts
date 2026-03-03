@@ -164,12 +164,18 @@ interface StdioState {
  * - Returns false if dropped due to backpressure
  * - Critical messages are always attempted
  */
-function sendWithStdioBackpressure(
+export function sendWithStdioBackpressure(
   data: string,
   state: StdioState,
   options: { isCritical?: boolean } = {}
 ): boolean {
   const { isCritical = false } = options;
+
+  // Under active backpressure, drop non-critical messages.
+  if (state.hasBackpressure && !isCritical) {
+    state.droppedCount += 1;
+    return false;
+  }
 
   try {
     const canWrite = process.stdout.write(data + "\n");
@@ -182,6 +188,7 @@ function sendWithStdioBackpressure(
         state.drainHandlerRegistered = true;
         process.stdout.once("drain", () => {
           state.hasBackpressure = false;
+          state.drainHandlerRegistered = false;
         });
       }
     }
@@ -295,6 +302,15 @@ export interface PiServerOptions {
   onAlertClear?: (alert: Alert) => void | Promise<void>;
   /** Durable command journal options (Level 4 foundation, feature-flagged). */
   durableJournal?: DurableCommandJournalOptions;
+  /** Timeout for durable journal startup initialization attempts. */
+  durableInitTimeoutMs?: number;
+  /** Startup recovery summary event policy (default: enabled with redacted sensitive fields). */
+  startupRecoverySummaryEvent?: {
+    /** Whether to emit startup_recovery_summary convenience events. */
+    enabled?: boolean;
+    /** Whether convenience events include sensitive details (journalPath, IDs, raw init error). */
+    includeSensitiveData?: boolean;
+  };
 }
 
 export class PiServer {
@@ -313,13 +329,23 @@ export class PiServer {
     droppedCount: 0,
     drainHandlerRegistered: false,
   };
+  /** Whether startup_recovery_summary convenience events are emitted. */
+  private startupRecoverySummaryEventEnabled = true;
+  /** Whether startup_recovery_summary includes sensitive details. */
+  private startupRecoverySummaryIncludeSensitiveData = false;
 
   constructor(options: PiServerOptions = {}) {
     this.authProvider = options.authProvider ?? new AllowAllAuthProvider();
     this.sessionManager = new PiSessionManager(undefined, {
       serverVersion: SERVER_VERSION,
       durableJournal: options.durableJournal,
+      durableInitTimeoutMs: options.durableInitTimeoutMs,
     });
+
+    const startupRecoveryEventPolicy = options.startupRecoverySummaryEvent;
+    this.startupRecoverySummaryEventEnabled = startupRecoveryEventPolicy?.enabled ?? true;
+    this.startupRecoverySummaryIncludeSensitiveData =
+      startupRecoveryEventPolicy?.includeSensitiveData ?? false;
 
     // Setup logger
     this.logger =
@@ -392,8 +418,16 @@ export class PiServer {
   }
 
   async start(port: number = DEFAULT_PORT): Promise<void> {
-    // Run one-time startup initialization (durable journal rehydration, etc.)
-    await this.sessionManager.initialize();
+    // Run one-time startup initialization (durable journal rehydration, etc.).
+    // If durable init fails, continue startup in degraded mode so clients can
+    // still call get_startup_recovery and inspect initialization failure details.
+    try {
+      await this.sessionManager.initialize();
+    } catch (error) {
+      this.logger.warn("Startup initialization failed; continuing in degraded mode", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
 
     // Start WebSocket server
     this.wss = new WebSocketServer({ port });
@@ -436,6 +470,17 @@ export class PiServer {
       },
     };
     this.sessionManager.broadcast(JSON.stringify(readyEvent));
+
+    // Optional convenience event: startup recovery summary.
+    // Endpoint-first flow remains canonical via get_startup_recovery.
+    if (this.startupRecoverySummaryEventEnabled) {
+      const startupRecoveryEvent: RpcBroadcast = this.sessionManager.getStartupRecoverySummaryEvent(
+        {
+          includeSensitiveData: this.startupRecoverySummaryIncludeSensitiveData,
+        }
+      );
+      this.sessionManager.broadcast(JSON.stringify(startupRecoveryEvent));
+    }
 
     // Record server start metric
     this.metrics.event(MetricNames.EVENT_SESSION_CREATED, { event: "server_ready" });
@@ -657,6 +702,16 @@ export class PiServer {
         },
       };
       sendWithBackpressure(ws, JSON.stringify(readyEvent), { isCritical: true });
+
+      // Send startup recovery summary convenience event.
+      // Clients should still use get_startup_recovery as canonical source of truth.
+      if (this.startupRecoverySummaryEventEnabled) {
+        const startupRecoveryEvent: RpcBroadcast =
+          this.sessionManager.getStartupRecoverySummaryEvent({
+            includeSensitiveData: this.startupRecoverySummaryIncludeSensitiveData,
+          });
+        sendWithBackpressure(ws, JSON.stringify(startupRecoveryEvent), { isCritical: true });
+      }
 
       this.sessionManager.addSubscriber(subscriber);
 

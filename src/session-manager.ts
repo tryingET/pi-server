@@ -25,6 +25,7 @@ import type {
   RpcResponse,
   SessionInfo,
   SessionResolver,
+  StartupRecoveryData,
   Subscriber,
 } from "./types.js";
 import {
@@ -59,6 +60,8 @@ import { CircuitBreakerManager, type CircuitBreakerConfig } from "./circuit-brea
 import { BashCircuitBreaker, type BashCircuitBreakerConfig } from "./bash-circuit-breaker.js";
 import {
   DurableCommandJournal,
+  MAX_COMMAND_HISTORY_LIMIT,
+  type CommandHistoryQuery,
   type CommandJournalRecoverySummary,
   type DurableCommandJournalOptions,
 } from "./command-journal.js";
@@ -74,6 +77,36 @@ const SHORT_COMMAND_TIMEOUT_MS = 30 * 1000;
 
 /** Max time to wait for a dependency command to complete. */
 const DEPENDENCY_WAIT_TIMEOUT_MS = 30 * 1000;
+
+/** Max time to wait for durable journal startup initialization. */
+const DEFAULT_DURABLE_INIT_TIMEOUT_MS = 5 * 1000;
+
+/** Max entries returned per list field in get_startup_recovery. */
+const STARTUP_RECOVERY_MAX_ITEMS = 100;
+
+type DurableInitState = "disabled" | "pending" | "ready" | "failed" | "timed_out";
+
+interface StartupRecoverySnapshot {
+  enabled: boolean;
+  initialized: boolean;
+  journalPath: string;
+  schemaVersion: number;
+  entriesScanned: number;
+  malformedEntries: number;
+  unsupportedVersionEntries: number;
+  recoveredOutcomes: number;
+  recoveredOutcomeIds: string[];
+  recoveredOutcomeIdsTruncated: boolean;
+  recoveredInFlightFailures: number;
+  recoveredInFlight: Array<{
+    commandId: string;
+    commandType: string;
+    laneKey: string;
+    lastPhase: "command_accepted" | "command_started";
+    reason: string;
+  }>;
+  recoveredInFlightTruncated: boolean;
+}
 
 /**
  * npm env keys inherited from npm scripts that can hijack global installs.
@@ -95,6 +128,8 @@ export interface SessionManagerRuntimeOptions {
   bashCircuitBreakerConfig?: Partial<BashCircuitBreakerConfig>;
   /** Durable command journal options (Level 4 foundation, feature-flagged) */
   durableJournal?: DurableCommandJournalOptions;
+  /** Timeout for durable journal startup initialization attempts. */
+  durableInitTimeoutMs?: number;
 }
 
 export class PiSessionManager implements SessionResolver {
@@ -120,10 +155,14 @@ export class PiSessionManager implements SessionResolver {
   private bashCircuitBreaker: BashCircuitBreaker;
   /** Durable command journal (Level 4 foundation, feature-flagged). */
   private commandJournal: DurableCommandJournal;
-  /** Recovery summary from durable journal startup rehydration. */
-  private commandJournalRecovery: CommandJournalRecoverySummary | null = null;
+  /** Bounded startup recovery snapshot derived from durable journal rehydration. */
+  private startupRecoverySnapshot: StartupRecoverySnapshot | null = null;
   /** One-time initialization promise for durable journal startup rehydration. */
   private durableInitPromise: Promise<void> | null = null;
+  /** Durable init lifecycle state (for get_startup_recovery observability). */
+  private durableInitState: DurableInitState = "pending";
+  /** Last durable initialization error, if any. */
+  private durableInitError: string | null = null;
 
   // Shutdown state (single source of truth - server.ts delegates to this)
   private isShuttingDown = false;
@@ -135,6 +174,7 @@ export class PiSessionManager implements SessionResolver {
   private readonly defaultCommandTimeoutMs: number;
   private readonly shortCommandTimeoutMs: number;
   private readonly dependencyWaitTimeoutMs: number;
+  private readonly durableInitTimeoutMs: number;
 
   // Extension UI request tracking
   private extensionUI = new ExtensionUIManager((sessionId: string, event: AgentSessionEvent) =>
@@ -162,6 +202,10 @@ export class PiSessionManager implements SessionResolver {
       typeof options.dependencyWaitTimeoutMs === "number" && options.dependencyWaitTimeoutMs > 0
         ? options.dependencyWaitTimeoutMs
         : DEPENDENCY_WAIT_TIMEOUT_MS;
+    this.durableInitTimeoutMs =
+      typeof options.durableInitTimeoutMs === "number" && options.durableInitTimeoutMs > 0
+        ? options.durableInitTimeoutMs
+        : DEFAULT_DURABLE_INIT_TIMEOUT_MS;
 
     this.replayStore = new CommandReplayStore({
       idempotencyTtlMs: options.idempotencyTtlMs,
@@ -187,6 +231,7 @@ export class PiSessionManager implements SessionResolver {
       serverVersion: options.serverVersion,
       ...options.durableJournal,
     });
+    this.durableInitState = this.commandJournal.isEnabled() ? "pending" : "disabled";
   }
 
   /**
@@ -218,49 +263,153 @@ export class PiSessionManager implements SessionResolver {
     await this.ensureDurableJournalInitialized();
   }
 
-  /**
-   * Ensure durable journal recovery has completed (idempotent).
-   */
-  private async ensureDurableJournalInitialized(): Promise<void> {
-    if (!this.commandJournal.isEnabled()) {
-      return;
-    }
+  private async waitForDurableInitWithTimeout(promise: Promise<void>): Promise<void> {
+    let timer: NodeJS.Timeout | null = null;
 
-    if (this.durableInitPromise) {
-      await this.durableInitPromise;
-      return;
-    }
-
-    this.durableInitPromise = (async () => {
-      const recovery = await this.commandJournal.initialize();
-
-      for (const outcome of recovery.recoveredOutcomes) {
-        this.replayStore.storeCommandOutcome(outcome);
+    try {
+      await Promise.race([
+        promise,
+        new Promise<void>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(
+              new Error(
+                `Durable journal initialization timed out after ${this.durableInitTimeoutMs}ms`
+              )
+            );
+          }, this.durableInitTimeoutMs);
+          if (timer.unref) {
+            timer.unref();
+          }
+        }),
+      ]);
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
       }
-
-      this.commandJournalRecovery = recovery;
-
-      if (
-        recovery.recoveredOutcomes.length > 0 ||
-        recovery.recoveredInFlightFailures > 0 ||
-        recovery.malformedEntries > 0
-      ) {
-        this.debugLogger?.("Durable command journal recovery completed", {
-          journalPath: recovery.journalPath,
-          entriesScanned: recovery.entriesScanned,
-          malformedEntries: recovery.malformedEntries,
-          unsupportedVersionEntries: recovery.unsupportedVersionEntries,
-          recoveredOutcomes: recovery.recoveredOutcomes.length,
-          recoveredInFlightFailures: recovery.recoveredInFlightFailures,
-        });
-      }
-    })();
-
-    await this.durableInitPromise;
+    }
   }
 
   /**
-   * Append command lifecycle transition to the durable journal (best-effort).
+   * Ensure durable journal recovery has completed (idempotent and bounded).
+   */
+  private async ensureDurableJournalInitialized(): Promise<void> {
+    if (!this.commandJournal.isEnabled()) {
+      this.durableInitState = "disabled";
+      this.durableInitError = null;
+      return;
+    }
+
+    // Runtime fail-closed policy can transition durable state to failed after startup.
+    // When that happens, non-observability commands must fail closed.
+    if (this.durableInitState === "failed" && this.durableInitError) {
+      throw new Error(this.durableInitError);
+    }
+
+    if (this.durableInitState === "ready") {
+      return;
+    }
+
+    if (!this.durableInitPromise) {
+      this.durableInitState = "pending";
+      this.durableInitError = null;
+
+      const initPromise = (async () => {
+        try {
+          const recovery = await this.commandJournal.initialize();
+
+          for (const outcome of recovery.recoveredOutcomes) {
+            this.replayStore.storeCommandOutcome(outcome);
+          }
+
+          this.startupRecoverySnapshot = this.createStartupRecoverySnapshot(recovery);
+          this.durableInitState = "ready";
+          this.durableInitError = null;
+
+          if (
+            recovery.recoveredOutcomes.length > 0 ||
+            recovery.recoveredInFlightFailures > 0 ||
+            recovery.malformedEntries > 0
+          ) {
+            this.debugLogger?.("Durable command journal recovery completed", {
+              journalPath: recovery.journalPath,
+              entriesScanned: recovery.entriesScanned,
+              malformedEntries: recovery.malformedEntries,
+              unsupportedVersionEntries: recovery.unsupportedVersionEntries,
+              recoveredOutcomes: recovery.recoveredOutcomes.length,
+              recoveredInFlightFailures: recovery.recoveredInFlightFailures,
+            });
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          this.durableInitState = "failed";
+          this.durableInitError = message;
+          throw error;
+        }
+      })();
+
+      // Guard against unhandled rejections when callers timeout before init settles.
+      initPromise.catch(() => {});
+      this.durableInitPromise = initPromise;
+    }
+
+    try {
+      await this.waitForDurableInitWithTimeout(this.durableInitPromise);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("timed out")) {
+        this.durableInitState = "timed_out";
+      } else if (this.durableInitState !== "failed") {
+        this.durableInitState = "failed";
+      }
+      this.durableInitError = message;
+      throw error;
+    }
+  }
+
+  private createStartupRecoverySnapshot(
+    recovery: CommandJournalRecoverySummary
+  ): StartupRecoverySnapshot {
+    const recoveredOutcomeIds = recovery.recoveredOutcomes
+      .slice(0, STARTUP_RECOVERY_MAX_ITEMS)
+      .map((outcome) => outcome.commandId);
+
+    const recoveredInFlight = recovery.recoveredInFlight
+      .slice(0, STARTUP_RECOVERY_MAX_ITEMS)
+      .map((item) => ({
+        commandId: item.commandId,
+        commandType: item.commandType,
+        laneKey: item.laneKey,
+        lastPhase: item.lastPhase,
+        reason: item.reason,
+      }));
+
+    return {
+      enabled: recovery.enabled,
+      initialized: true,
+      journalPath: recovery.journalPath,
+      schemaVersion: recovery.schemaVersion,
+      entriesScanned: recovery.entriesScanned,
+      malformedEntries: recovery.malformedEntries,
+      unsupportedVersionEntries: recovery.unsupportedVersionEntries,
+      recoveredOutcomes: recovery.recoveredOutcomes.length,
+      recoveredOutcomeIds,
+      recoveredOutcomeIdsTruncated: recovery.recoveredOutcomes.length > STARTUP_RECOVERY_MAX_ITEMS,
+      recoveredInFlightFailures: recovery.recoveredInFlightFailures,
+      recoveredInFlight,
+      recoveredInFlightTruncated: recovery.recoveredInFlight.length > STARTUP_RECOVERY_MAX_ITEMS,
+    };
+  }
+
+  private markDurableJournalRuntimeFailure(message: string): void {
+    this.durableInitState = "failed";
+    this.durableInitError = message;
+  }
+
+  /**
+   * Append command lifecycle transition to the durable journal.
+   *
+   * - best_effort: append errors are logged and command flow continues
+   * - fail_closed: append errors transition durable state to failed and caller can fail command
    */
   private appendCommandLifecycleToJournal(input: {
     phase: "command_accepted" | "command_started" | "command_finished";
@@ -279,18 +428,38 @@ export class PiSessionManager implements SessionResolver {
     replayed?: boolean;
     timedOut?: boolean;
     response?: RpcResponse;
-  }): void {
+  }): { ok: boolean; failClosed: boolean; error?: string } {
     if (!this.commandJournal.isEnabled()) {
-      return;
+      return { ok: true, failClosed: false };
     }
+
+    // Journal append is only valid after successful initialization.
+    // This keeps get_startup_recovery available even when durable init failed
+    // without noisy appendLifecycle("called before initialize") errors.
+    if (!this.commandJournal.getStats().initialized) {
+      return { ok: true, failClosed: false };
+    }
+
+    const failClosed = this.commandJournal.getAppendFailurePolicy() === "fail_closed";
 
     try {
       this.commandJournal.appendLifecycle(input);
+      return { ok: true, failClosed: false };
     } catch (error) {
-      console.error(
-        `[SessionManager] Failed to append command journal entry (${input.phase}) for ${input.commandId}:`,
-        error
-      );
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const message = `Durable journal append failed during ${input.phase} for command '${input.commandId}': ${errorMessage}`;
+
+      console.error(`[SessionManager] ${message}`, error);
+
+      if (failClosed) {
+        this.markDurableJournalRuntimeFailure(message);
+      }
+
+      return {
+        ok: false,
+        failClosed,
+        error: message,
+      };
     }
   }
 
@@ -436,6 +605,9 @@ export class PiSessionManager implements SessionResolver {
 
     // Clear governor state
     this.governor.cleanupStaleData(new Set());
+
+    // Release durable journal resources (e.g., single-writer lock file).
+    this.commandJournal.dispose();
 
     return { disposed, failed };
   }
@@ -850,6 +1022,24 @@ export class PiSessionManager implements SessionResolver {
         `[SessionManager] Cleaned up ${staleBashBreakersRemoved} stale bash circuit breakers`
       );
     }
+
+    // Level 4.4 scaffold: periodic durable journal retention/compaction.
+    if (this.commandJournal.isEnabled() && this.commandJournal.hasRetentionPolicy()) {
+      try {
+        const compaction = this.commandJournal.compactNow();
+        if (compaction.ran && compaction.droppedEntries > 0) {
+          this.debugLogger?.("Durable command journal compaction completed", {
+            droppedEntries: compaction.droppedEntries,
+            entriesBefore: compaction.entriesBefore,
+            entriesAfter: compaction.entriesAfter,
+            bytesBefore: compaction.bytesBefore,
+            bytesAfter: compaction.bytesAfter,
+          });
+        }
+      } catch (error) {
+        console.error("[SessionManager] Durable journal compaction failed:", error);
+      }
+    }
   }
 
   // ==========================================================================
@@ -949,6 +1139,8 @@ export class PiSessionManager implements SessionResolver {
       getMetrics: () => this.buildMetricsResponse(),
       getMemoryMetrics: () => this.memoryMetricsProvider?.(),
       getHealth: () => this.buildHealthResponse(),
+      getStartupRecovery: () => this.buildStartupRecoveryResponse(),
+      getCommandHistory: (query) => this.buildCommandHistoryResponse(query),
       handleUIResponse: (command) =>
         this.extensionUI.handleUIResponse({
           id: command.id,
@@ -1001,8 +1193,8 @@ export class PiSessionManager implements SessionResolver {
       metadataResetCount: this.sessionStore.getMetadataResetCount(),
     };
     const journalStats = this.commandJournal.getStats();
-    const recoveredOutcomeCount = this.commandJournalRecovery?.recoveredOutcomes.length ?? 0;
-    const recoveredInFlightFailures = this.commandJournalRecovery?.recoveredInFlightFailures ?? 0;
+    const recoveredOutcomeCount = this.startupRecoverySnapshot?.recoveredOutcomes ?? 0;
+    const recoveredInFlightFailures = this.startupRecoverySnapshot?.recoveredInFlightFailures ?? 0;
 
     return {
       type: "response",
@@ -1022,6 +1214,8 @@ export class PiSessionManager implements SessionResolver {
             initialized: journalStats.initialized,
             journalPath: journalStats.journalPath,
             schemaVersion: journalStats.schemaVersion,
+            appendFailurePolicy: journalStats.appendFailurePolicy,
+            redaction: journalStats.redaction,
             entriesWritten: journalStats.entriesWritten,
             writeErrors: journalStats.writeErrors,
             entriesScanned: journalStats.entriesScanned,
@@ -1029,6 +1223,8 @@ export class PiSessionManager implements SessionResolver {
             unsupportedVersionEntries: journalStats.unsupportedVersionEntries,
             recoveredOutcomes: recoveredOutcomeCount,
             recoveredInFlightFailures,
+            retention: journalStats.retention,
+            compaction: journalStats.compaction,
           },
         },
         circuitBreakers: circuitBreakerMetrics,
@@ -1066,6 +1262,131 @@ export class PiSessionManager implements SessionResolver {
     };
   }
 
+  /**
+   * Build startup durable recovery summary payload.
+   * Exposes deterministic boot-time recovery classification to clients.
+   */
+  private buildStartupRecoveryData(): StartupRecoveryData {
+    const stats = this.commandJournal.getStats();
+    const snapshot = this.startupRecoverySnapshot;
+
+    return {
+      enabled: stats.enabled,
+      initialized: stats.initialized,
+      initState: this.durableInitState,
+      initializationError: this.durableInitError ?? undefined,
+      journalPath: snapshot?.journalPath ?? stats.journalPath,
+      schemaVersion: snapshot?.schemaVersion ?? stats.schemaVersion,
+      entriesScanned: snapshot?.entriesScanned ?? stats.entriesScanned,
+      malformedEntries: snapshot?.malformedEntries ?? stats.malformedEntries,
+      unsupportedVersionEntries:
+        snapshot?.unsupportedVersionEntries ?? stats.unsupportedVersionEntries,
+      recoveredOutcomes: snapshot?.recoveredOutcomes ?? 0,
+      recoveredOutcomeIds: snapshot?.recoveredOutcomeIds ?? [],
+      recoveredOutcomeIdsTruncated: snapshot?.recoveredOutcomeIdsTruncated ?? false,
+      recoveredInFlightFailures: snapshot?.recoveredInFlightFailures ?? 0,
+      recoveredInFlight: snapshot?.recoveredInFlight ?? [],
+      recoveredInFlightTruncated: snapshot?.recoveredInFlightTruncated ?? false,
+      maxItemsReturned: STARTUP_RECOVERY_MAX_ITEMS,
+    };
+  }
+
+  /**
+   * Redact sensitive startup recovery details for broadcast convenience events.
+   * Full diagnostics remain available via explicit get_startup_recovery command.
+   */
+  private redactStartupRecoveryData(data: StartupRecoveryData): StartupRecoveryData {
+    return {
+      ...data,
+      journalPath: "[redacted]",
+      initializationError: data.initializationError
+        ? "Initialization failed (details redacted; call get_startup_recovery for full diagnostics)"
+        : undefined,
+      recoveredOutcomeIds: [],
+      recoveredOutcomeIdsTruncated: data.recoveredOutcomeIdsTruncated || data.recoveredOutcomes > 0,
+      recoveredInFlight: [],
+      recoveredInFlightTruncated:
+        data.recoveredInFlightTruncated || data.recoveredInFlightFailures > 0,
+    };
+  }
+
+  /**
+   * Build startup durable recovery response for get_startup_recovery command.
+   */
+  private buildStartupRecoveryResponse(id?: string): RpcResponse {
+    return {
+      id,
+      type: "response",
+      command: "get_startup_recovery",
+      success: true,
+      data: this.buildStartupRecoveryData(),
+    };
+  }
+
+  /**
+   * Build optional startup recovery summary broadcast event.
+   * Endpoint-first flow remains canonical; this is a convenience signal.
+   */
+  getStartupRecoverySummaryEvent(options: { includeSensitiveData?: boolean } = {}): {
+    type: "startup_recovery_summary";
+    data: StartupRecoveryData;
+  } {
+    const { includeSensitiveData = true } = options;
+    const raw = this.buildStartupRecoveryData();
+
+    return {
+      type: "startup_recovery_summary",
+      data: includeSensitiveData ? raw : this.redactStartupRecoveryData(raw),
+    };
+  }
+
+  /**
+   * Build bounded command history response from durable journal entries.
+   */
+  private async buildCommandHistoryResponse(query: {
+    id?: string;
+    sessionIdFilter?: string;
+    commandId?: string;
+    fromTimestamp?: number;
+    toTimestamp?: number;
+    limit?: number;
+  }): Promise<RpcResponse> {
+    const historyQuery: CommandHistoryQuery = {
+      sessionId: query.sessionIdFilter,
+      commandId: query.commandId,
+      fromTimestamp: query.fromTimestamp,
+      toTimestamp: query.toTimestamp,
+      limit: query.limit,
+    };
+    const history = await this.commandJournal.queryHistory(historyQuery);
+
+    return {
+      id: query.id,
+      type: "response",
+      command: "get_command_history",
+      success: true,
+      data: {
+        enabled: history.enabled,
+        initialized: this.commandJournal.getStats().initialized,
+        initState: this.durableInitState,
+        initializationError: this.durableInitError ?? undefined,
+        journalPath: history.journalPath,
+        schemaVersion: history.schemaVersion,
+        filters: {
+          sessionIdFilter: query.sessionIdFilter,
+          commandId: query.commandId,
+          fromTimestamp: query.fromTimestamp,
+          toTimestamp: query.toTimestamp,
+        },
+        entries: history.entries,
+        returned: history.entries.length,
+        truncated: history.truncated,
+        maxItemsReturned: history.maxItemsReturned,
+        maxItemsAllowed: MAX_COMMAND_HISTORY_LIMIT,
+      },
+    };
+  }
+
   // ==========================================================================
   // COMMAND EXECUTION
   // ==========================================================================
@@ -1073,17 +1394,29 @@ export class PiSessionManager implements SessionResolver {
   async executeCommand(command: RpcCommand): Promise<RpcResponse> {
     const id = getCommandId(command);
     const commandType = getCommandType(command);
+    const isDurableObservabilityCommand =
+      commandType === "get_startup_recovery" || commandType === "get_command_history";
 
-    try {
-      await this.ensureDurableJournalInitialized();
-    } catch (error) {
-      return {
-        id,
-        type: "response",
-        command: commandType ?? "unknown",
-        success: false,
-        error: `Durable journal initialization failed: ${error instanceof Error ? error.message : String(error)}`,
-      };
+    // Durable observability commands must remain available even when durable init fails,
+    // but they should still flow through normal admission/replay/lifecycle handling.
+    if (isDurableObservabilityCommand) {
+      try {
+        await this.ensureDurableJournalInitialized();
+      } catch {
+        // Intentionally ignored: response should still include failure state/details.
+      }
+    } else {
+      try {
+        await this.ensureDurableJournalInitialized();
+      } catch (error) {
+        return {
+          id,
+          type: "response",
+          command: commandType ?? "unknown",
+          success: false,
+          error: `Durable journal initialization failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
     }
     const sessionId = getSessionId(command);
     const commandId = this.replayStore.getOrCreateCommandId(command);
@@ -1119,41 +1452,8 @@ export class PiSessionManager implements SessionResolver {
 
     this.replayStore.cleanupIdempotencyCache();
 
-    this.broadcastCommandLifecycle("command_accepted", {
-      commandId,
-      commandType,
-      sessionId,
-      dependsOn,
-      ifSessionVersion,
-      idempotencyKey,
-    });
-    this.appendCommandLifecycleToJournal({
-      phase: "command_accepted",
-      commandId,
-      commandType,
-      laneKey,
-      fingerprint,
-      explicitId: isExplicitId,
-      sessionId,
-      dependsOn,
-      ifSessionVersion,
-      idempotencyKey,
-    });
-
     const finalizeResponse = (response: RpcResponse): RpcResponse => {
-      this.broadcastCommandLifecycle("command_finished", {
-        commandId,
-        commandType,
-        sessionId,
-        dependsOn,
-        ifSessionVersion,
-        idempotencyKey,
-        success: response.success,
-        error: response.success ? undefined : response.error,
-        sessionVersion: response.sessionVersion,
-        replayed: response.replayed,
-      });
-      this.appendCommandLifecycleToJournal({
+      const finishedAppend = this.appendCommandLifecycleToJournal({
         phase: "command_finished",
         commandId,
         commandType,
@@ -1171,8 +1471,65 @@ export class PiSessionManager implements SessionResolver {
         timedOut: response.timedOut,
         response,
       });
-      return response;
+
+      let finalizedResponse = response;
+      if (!finishedAppend.ok && finishedAppend.failClosed && !isDurableObservabilityCommand) {
+        finalizedResponse = {
+          id: response.id ?? id,
+          type: "response",
+          command: response.command,
+          success: false,
+          error: finishedAppend.error ?? "Durable journal append failed during command_finished",
+        };
+      }
+
+      this.broadcastCommandLifecycle("command_finished", {
+        commandId,
+        commandType,
+        sessionId,
+        dependsOn,
+        ifSessionVersion,
+        idempotencyKey,
+        success: finalizedResponse.success,
+        error: finalizedResponse.success ? undefined : finalizedResponse.error,
+        sessionVersion: finalizedResponse.sessionVersion,
+        replayed: finalizedResponse.replayed,
+      });
+
+      return finalizedResponse;
     };
+
+    this.broadcastCommandLifecycle("command_accepted", {
+      commandId,
+      commandType,
+      sessionId,
+      dependsOn,
+      ifSessionVersion,
+      idempotencyKey,
+    });
+
+    const acceptedAppend = this.appendCommandLifecycleToJournal({
+      phase: "command_accepted",
+      commandId,
+      commandType,
+      laneKey,
+      fingerprint,
+      explicitId: isExplicitId,
+      sessionId,
+      dependsOn,
+      ifSessionVersion,
+      idempotencyKey,
+    });
+
+    if (!acceptedAppend.ok && acceptedAppend.failClosed && !isDurableObservabilityCommand) {
+      return finalizeResponse({
+        id,
+        type: "response",
+        command: commandType,
+        success: false,
+        error: acceptedAppend.error ?? "Durable journal append failed during command_accepted",
+      });
+    }
 
     // Check for replay opportunities or conflicts (ADR-0001: Free replay)
     // Replay is O(1) lookup - no execution cost, should not consume rate limit
@@ -1242,7 +1599,7 @@ export class PiSessionManager implements SessionResolver {
           ifSessionVersion,
           idempotencyKey,
         });
-        this.appendCommandLifecycleToJournal({
+        const startedAppend = this.appendCommandLifecycleToJournal({
           phase: "command_started",
           commandId,
           commandType,
@@ -1254,6 +1611,16 @@ export class PiSessionManager implements SessionResolver {
           ifSessionVersion,
           idempotencyKey,
         });
+
+        if (!startedAppend.ok && startedAppend.failClosed && !isDurableObservabilityCommand) {
+          return {
+            id,
+            type: "response",
+            command: commandType,
+            success: false,
+            error: startedAppend.error ?? "Durable journal append failed during command_started",
+          };
+        }
 
         if (dependsOn.includes(commandId)) {
           return {
@@ -1345,6 +1712,8 @@ export class PiSessionManager implements SessionResolver {
       };
     }
 
+    const finalizedResponse = finalizeResponse(response);
+
     // ADR-0001: ATOMIC OUTCOME STORAGE
     // Store outcome BEFORE returning (not in async callback)
     // This ensures same command ID always returns same response
@@ -1360,10 +1729,10 @@ export class PiSessionManager implements SessionResolver {
           commandType,
           laneKey,
           fingerprint,
-          success: response.success,
-          error: response.success ? undefined : response.error,
-          response,
-          sessionVersion: response.sessionVersion,
+          success: finalizedResponse.success,
+          error: finalizedResponse.success ? undefined : finalizedResponse.error,
+          response: finalizedResponse,
+          sessionVersion: finalizedResponse.sessionVersion,
           finishedAt: Date.now(),
         });
       } catch (outcomeError) {
@@ -1386,11 +1755,11 @@ export class PiSessionManager implements SessionResolver {
         idempotencyKey,
         commandType,
         fingerprint,
-        response,
+        response: finalizedResponse,
       });
     }
 
-    return finalizeResponse(response);
+    return finalizedResponse;
   }
 
   /**

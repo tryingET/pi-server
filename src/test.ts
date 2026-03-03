@@ -11,7 +11,7 @@
 
 import assert from "assert";
 import { spawn } from "child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
@@ -79,6 +79,46 @@ async function testValidation() {
   await test("validation: accepts list_sessions without sessionId", () => {
     const errors = validateCommand({ type: "list_sessions" });
     assert.strictEqual(errors.length, 0, "Should have no errors");
+  });
+
+  await test("validation: accepts get_startup_recovery without sessionId", () => {
+    const errors = validateCommand({ type: "get_startup_recovery" });
+    assert.strictEqual(errors.length, 0, "Should have no errors");
+  });
+
+  await test("validation: accepts get_command_history filters", () => {
+    const errors = validateCommand({
+      type: "get_command_history",
+      sessionIdFilter: "s1",
+      commandId: "cmd-1",
+      fromTimestamp: 100,
+      toTimestamp: 200,
+      limit: 25,
+    });
+    assert.strictEqual(errors.length, 0, "Should have no errors");
+  });
+
+  await test("validation: rejects get_command_history with invalid limit", () => {
+    const errors = validateCommand({
+      type: "get_command_history",
+      limit: 0,
+    });
+    assert(
+      errors.some((e) => e.field === "limit"),
+      "Should have limit error"
+    );
+  });
+
+  await test("validation: rejects get_command_history with invalid time window", () => {
+    const errors = validateCommand({
+      type: "get_command_history",
+      fromTimestamp: 200,
+      toTimestamp: 100,
+    });
+    assert(
+      errors.some((e) => e.field === "fromTimestamp"),
+      "Should have fromTimestamp error"
+    );
   });
 
   // Test: Valid create_session with sessionId
@@ -1113,7 +1153,7 @@ async function testExtensionUI() {
 // =============================================================================
 
 import { PiSessionManager } from "./session-manager.js";
-import { PiServer } from "./server.js";
+import { PiServer, sendWithStdioBackpressure } from "./server.js";
 import { DurableCommandJournal } from "./command-journal.js";
 import { MetricNames, type MetricEvent, type MetricsSink } from "./metrics-types.js";
 
@@ -1547,6 +1587,7 @@ async function testSessionManager() {
         fingerprint: JSON.stringify({ type: "list_sessions" }),
         explicitId: true,
       });
+      seededJournal.dispose();
 
       const recoveredManager = new PiSessionManager(undefined, {
         durableJournal: { enabled: true, dataDir: journalDir },
@@ -1565,6 +1606,386 @@ async function testSessionManager() {
         "Recovered failure should replay deterministically"
       );
       assert.ok(replay.error?.includes("did not finish before previous shutdown"));
+
+      recoveredManager.disposeAllSessions();
+    } finally {
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-manager: retention compaction drops synthetic in-flight artifacts", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-synth-inflight-drop-"));
+
+    try {
+      const seededJournal = new DurableCommandJournal({
+        enabled: true,
+        dataDir: journalDir,
+      });
+      await seededJournal.initialize();
+
+      seededJournal.appendLifecycle({
+        phase: "command_accepted",
+        commandId: "anon:synthetic-inflight-1",
+        commandType: "list_sessions",
+        laneKey: "server",
+        fingerprint: JSON.stringify({ type: "list_sessions" }),
+        explicitId: false,
+      });
+
+      seededJournal.appendLifecycle({
+        phase: "command_finished",
+        commandId: "synthetic-drop-explicit-1",
+        commandType: "list_sessions",
+        laneKey: "server",
+        fingerprint: JSON.stringify({ type: "list_sessions" }),
+        explicitId: true,
+        success: true,
+        response: {
+          id: "synthetic-drop-explicit-1",
+          type: "response",
+          command: "list_sessions",
+          success: true,
+          data: { sessions: [] },
+        },
+      });
+      seededJournal.dispose();
+
+      const recoveredManager = new PiSessionManager(undefined, {
+        durableJournal: {
+          enabled: true,
+          dataDir: journalDir,
+          retention: { maxEntries: 10 },
+        },
+      });
+      await recoveredManager.initialize();
+
+      const historyResponse = await recoveredManager.executeCommand({
+        type: "get_command_history",
+        limit: 200,
+      } as any);
+      assert.strictEqual(historyResponse.success, true);
+
+      const historyEntries = (historyResponse as any).data.entries as Array<{ commandId: string }>;
+      assert.ok(
+        historyEntries.some((entry) => entry.commandId === "synthetic-drop-explicit-1"),
+        "Expected explicit terminal outcome to be retained"
+      );
+      assert.ok(
+        !historyEntries.some((entry) => entry.commandId === "anon:synthetic-inflight-1"),
+        "Synthetic in-flight marker must be dropped during compaction"
+      );
+
+      const replay = await recoveredManager.executeCommand({
+        id: "synthetic-drop-explicit-1",
+        type: "list_sessions",
+      });
+      assert.strictEqual(replay.success, true);
+      assert.strictEqual(replay.replayed, true, "Explicit command should still replay");
+
+      recoveredManager.disposeAllSessions();
+    } finally {
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-manager: durable recovery summary is deterministic across repeated boots", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-recovery-summary-"));
+
+    try {
+      const seededJournal = new DurableCommandJournal({
+        enabled: true,
+        dataDir: journalDir,
+      });
+      await seededJournal.initialize();
+
+      seededJournal.appendLifecycle({
+        phase: "command_accepted",
+        commandId: "crash-inflight-repeat-1",
+        commandType: "list_sessions",
+        laneKey: "server",
+        fingerprint: JSON.stringify({ type: "list_sessions" }),
+        explicitId: true,
+      });
+      seededJournal.dispose();
+
+      const firstBoot = new PiSessionManager(undefined, {
+        durableJournal: { enabled: true, dataDir: journalDir },
+      });
+      await firstBoot.initialize();
+
+      const firstSummary = await firstBoot.executeCommand({ type: "get_startup_recovery" });
+      assert.strictEqual(firstSummary.success, true);
+      const firstData = (firstSummary as any).data;
+      assert.strictEqual(firstData.enabled, true);
+      assert.strictEqual(firstData.initState, "ready");
+      assert.strictEqual(firstData.recoveredInFlightFailures, 1);
+      assert.strictEqual(firstData.recoveredOutcomes, 1);
+      assert.ok(firstData.recoveredOutcomeIds.includes("crash-inflight-repeat-1"));
+
+      firstBoot.disposeAllSessions();
+
+      const secondBoot = new PiSessionManager(undefined, {
+        durableJournal: { enabled: true, dataDir: journalDir },
+      });
+      await secondBoot.initialize();
+
+      const secondSummary = await secondBoot.executeCommand({ type: "get_startup_recovery" });
+      assert.strictEqual(secondSummary.success, true);
+      const secondData = (secondSummary as any).data;
+      assert.strictEqual(secondData.enabled, true);
+      assert.strictEqual(secondData.initState, "ready");
+      assert.strictEqual(secondData.recoveredInFlightFailures, 0);
+      assert.strictEqual(secondData.recoveredOutcomes, 1);
+      assert.ok(secondData.recoveredOutcomeIds.includes("crash-inflight-repeat-1"));
+
+      const replay = await secondBoot.executeCommand({
+        id: "crash-inflight-repeat-1",
+        type: "list_sessions",
+      });
+      assert.strictEqual(replay.success, false);
+      assert.strictEqual(replay.replayed, true);
+      assert.ok(replay.error?.includes("did not finish before previous shutdown"));
+
+      secondBoot.disposeAllSessions();
+    } finally {
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-manager: durable journal retention maxEntries keeps newest outcomes replayable", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-retention-max-entries-"));
+
+    try {
+      const firstManager = new PiSessionManager(undefined, {
+        durableJournal: {
+          enabled: true,
+          dataDir: journalDir,
+          retention: { maxEntries: 1 },
+        },
+      });
+      await firstManager.initialize();
+
+      const firstOld = await firstManager.executeCommand({
+        id: "retention-max-entries-old",
+        type: "list_sessions",
+      });
+      assert.strictEqual(firstOld.success, true);
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const firstNew = await firstManager.executeCommand({
+        id: "retention-max-entries-new",
+        type: "list_sessions",
+      });
+      assert.strictEqual(firstNew.success, true);
+
+      firstManager.disposeAllSessions();
+
+      const secondManager = new PiSessionManager(undefined, {
+        durableJournal: {
+          enabled: true,
+          dataDir: journalDir,
+          retention: { maxEntries: 1 },
+        },
+      });
+      await secondManager.initialize();
+
+      const oldReplay = await secondManager.executeCommand({
+        id: "retention-max-entries-old",
+        type: "list_sessions",
+      });
+      assert.strictEqual(oldReplay.success, true);
+      assert.notStrictEqual(oldReplay.replayed, true, "Older command should have been compacted");
+
+      const newReplay = await secondManager.executeCommand({
+        id: "retention-max-entries-new",
+        type: "list_sessions",
+      });
+      assert.strictEqual(newReplay.success, true);
+      assert.strictEqual(newReplay.replayed, true, "Newest command should remain replayable");
+
+      secondManager.disposeAllSessions();
+    } finally {
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-manager: durable journal retention maxAgeMs drops stale outcomes", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-retention-max-age-"));
+
+    try {
+      const firstManager = new PiSessionManager(undefined, {
+        durableJournal: {
+          enabled: true,
+          dataDir: journalDir,
+          retention: { maxAgeMs: 80 },
+        },
+      });
+      await firstManager.initialize();
+
+      const oldResponse = await firstManager.executeCommand({
+        id: "retention-max-age-old",
+        type: "list_sessions",
+      });
+      assert.strictEqual(oldResponse.success, true);
+
+      await new Promise((resolve) => setTimeout(resolve, 120));
+
+      const freshResponse = await firstManager.executeCommand({
+        id: "retention-max-age-fresh",
+        type: "list_sessions",
+      });
+      assert.strictEqual(freshResponse.success, true);
+
+      firstManager.disposeAllSessions();
+
+      const secondManager = new PiSessionManager(undefined, {
+        durableJournal: {
+          enabled: true,
+          dataDir: journalDir,
+          retention: { maxAgeMs: 80 },
+        },
+      });
+      await secondManager.initialize();
+
+      const oldReplay = await secondManager.executeCommand({
+        id: "retention-max-age-old",
+        type: "list_sessions",
+      });
+      assert.strictEqual(oldReplay.success, true);
+      assert.notStrictEqual(oldReplay.replayed, true, "Stale command should have been compacted");
+
+      const freshReplay = await secondManager.executeCommand({
+        id: "retention-max-age-fresh",
+        type: "list_sessions",
+      });
+      assert.strictEqual(freshReplay.success, true);
+      assert.strictEqual(freshReplay.replayed, true, "Fresh command should remain replayable");
+
+      secondManager.disposeAllSessions();
+    } finally {
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-manager: retention maxBytes keeps in-flight recovery semantics", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-retention-max-bytes-"));
+
+    try {
+      const seededJournal = new DurableCommandJournal({
+        enabled: true,
+        dataDir: journalDir,
+      });
+      await seededJournal.initialize();
+
+      const oversizedErrorA = "a".repeat(2000);
+      seededJournal.appendLifecycle({
+        phase: "command_finished",
+        commandId: "retention-max-bytes-a",
+        commandType: "list_sessions",
+        laneKey: "server",
+        fingerprint: JSON.stringify({ type: "list_sessions" }),
+        explicitId: true,
+        success: false,
+        error: oversizedErrorA,
+        response: {
+          id: "retention-max-bytes-a",
+          type: "response",
+          command: "list_sessions",
+          success: false,
+          error: oversizedErrorA,
+        },
+      });
+
+      const oversizedErrorB = "b".repeat(2000);
+      seededJournal.appendLifecycle({
+        phase: "command_finished",
+        commandId: "retention-max-bytes-b",
+        commandType: "list_sessions",
+        laneKey: "server",
+        fingerprint: JSON.stringify({ type: "list_sessions" }),
+        explicitId: true,
+        success: false,
+        error: oversizedErrorB,
+        response: {
+          id: "retention-max-bytes-b",
+          type: "response",
+          command: "list_sessions",
+          success: false,
+          error: oversizedErrorB,
+        },
+      });
+
+      seededJournal.appendLifecycle({
+        phase: "command_accepted",
+        commandId: "retention-max-bytes-inflight",
+        commandType: "list_sessions",
+        laneKey: "server",
+        fingerprint: JSON.stringify({ type: "list_sessions" }),
+        explicitId: true,
+      });
+
+      const journalRaw = readFileSync(seededJournal.getJournalPath(), "utf-8");
+      const journalLines = journalRaw.split(/\r?\n/).filter((line) => line.trim().length > 0);
+
+      let bytesA = 0;
+      let bytesB = 0;
+      let bytesInFlight = 0;
+      for (const line of journalLines) {
+        const parsed = JSON.parse(line) as { commandId?: string };
+        const lineBytes = Buffer.byteLength(`${line}\n`, "utf-8");
+        if (parsed.commandId === "retention-max-bytes-a") {
+          bytesA = lineBytes;
+        } else if (parsed.commandId === "retention-max-bytes-b") {
+          bytesB = lineBytes;
+        } else if (parsed.commandId === "retention-max-bytes-inflight") {
+          bytesInFlight = lineBytes;
+        }
+      }
+
+      assert.ok(
+        bytesA > 0 && bytesB > 0 && bytesInFlight > 0,
+        "Expected seeded journal line sizes"
+      );
+
+      // Keep newest terminal outcome + in-flight marker, force oldest terminal drop.
+      const maxBytes = bytesInFlight + bytesB + Math.max(1, Math.floor(bytesA / 2));
+      seededJournal.dispose();
+
+      const recoveredManager = new PiSessionManager(undefined, {
+        durableJournal: {
+          enabled: true,
+          dataDir: journalDir,
+          retention: { maxBytes },
+        },
+      });
+      await recoveredManager.initialize();
+
+      const oldReplay = await recoveredManager.executeCommand({
+        id: "retention-max-bytes-a",
+        type: "list_sessions",
+      });
+      assert.strictEqual(oldReplay.success, true);
+      assert.notStrictEqual(oldReplay.replayed, true, "Oldest oversized outcome should be dropped");
+
+      const newReplay = await recoveredManager.executeCommand({
+        id: "retention-max-bytes-b",
+        type: "list_sessions",
+      });
+      assert.strictEqual(newReplay.success, false);
+      assert.strictEqual(newReplay.replayed, true, "Newest oversized outcome should remain");
+
+      const inflightReplay = await recoveredManager.executeCommand({
+        id: "retention-max-bytes-inflight",
+        type: "list_sessions",
+      });
+      assert.strictEqual(inflightReplay.success, false);
+      assert.strictEqual(
+        inflightReplay.replayed,
+        true,
+        "In-flight recovery must remain deterministic"
+      );
+      assert.ok(inflightReplay.error?.includes("did not finish before previous shutdown"));
 
       recoveredManager.disposeAllSessions();
     } finally {
@@ -1926,8 +2347,826 @@ async function testSessionManager() {
     // Verify version store has session
     assert.strictEqual(data.stores.version.sessionCount, 1, "Should have 1 session");
 
+    // Verify journal retention/compaction stats shape
+    assert.ok(data.stores.journal, "Should have journal store stats");
+    assert.ok(
+      ["best_effort", "fail_closed"].includes(data.stores.journal.appendFailurePolicy),
+      "Expected appendFailurePolicy enum"
+    );
+    assert.strictEqual(typeof data.stores.journal.redaction.beforePersistHookEnabled, "boolean");
+    assert.strictEqual(typeof data.stores.journal.redaction.beforeExportHookEnabled, "boolean");
+    assert.strictEqual(typeof data.stores.journal.retention.enabled, "boolean");
+    assert.strictEqual(typeof data.stores.journal.compaction.runs, "number");
+    assert.strictEqual(typeof data.stores.journal.compaction.droppedEntries, "number");
+
     // Cleanup
     await manager.executeCommand({ type: "delete_session", sessionId: "metrics-test" });
+  });
+
+  await test("session-manager: get_startup_recovery returns defaults when journal disabled", async () => {
+    const response = await manager.executeCommand({ type: "get_startup_recovery" });
+    assert.strictEqual(response.success, true, "get_startup_recovery should succeed");
+
+    const data = (response as any).data;
+    assert.strictEqual(data.enabled, false, "Journal should be disabled by default");
+    assert.strictEqual(data.initState, "disabled", "Disabled journal should report disabled state");
+    assert.strictEqual(typeof data.initialized, "boolean", "Should include initialized flag");
+    assert.ok(typeof data.journalPath === "string", "Should include journalPath");
+    assert.ok(Array.isArray(data.recoveredOutcomeIds), "Should include recoveredOutcomeIds");
+    assert.ok(Array.isArray(data.recoveredInFlight), "Should include recoveredInFlight list");
+    assert.strictEqual(data.recoveredOutcomeIdsTruncated, false);
+    assert.strictEqual(data.recoveredInFlightTruncated, false);
+    assert.strictEqual(data.maxItemsReturned, 100);
+  });
+
+  await test("session-manager: startup_recovery_summary event payload matches command", async () => {
+    const response = await manager.executeCommand({ type: "get_startup_recovery" });
+    assert.strictEqual(response.success, true);
+
+    const event = manager.getStartupRecoverySummaryEvent();
+    assert.strictEqual(event.type, "startup_recovery_summary");
+    assert.deepStrictEqual(event.data, (response as any).data);
+  });
+
+  await test("session-manager: startup_recovery_summary supports redacted and sensitive variants", async () => {
+    const response = await manager.executeCommand({ type: "get_startup_recovery" });
+    assert.strictEqual(response.success, true);
+
+    const redacted = manager.getStartupRecoverySummaryEvent({ includeSensitiveData: false });
+    assert.strictEqual(redacted.type, "startup_recovery_summary");
+    assert.strictEqual(redacted.data.journalPath, "[redacted]");
+    assert.deepStrictEqual(redacted.data.recoveredOutcomeIds, []);
+    assert.deepStrictEqual(redacted.data.recoveredInFlight, []);
+
+    const sensitive = manager.getStartupRecoverySummaryEvent({ includeSensitiveData: true });
+    assert.deepStrictEqual(sensitive.data, (response as any).data);
+  });
+
+  await test("session-manager: get_startup_recovery participates in duplicate-id conflict detection", async () => {
+    const first = await manager.executeCommand({
+      id: "startup-dup-id",
+      type: "get_startup_recovery",
+    } as any);
+    assert.strictEqual(first.success, true);
+
+    const second = await manager.executeCommand({
+      id: "startup-dup-id",
+      type: "health_check",
+    } as any);
+    assert.strictEqual(second.success, false);
+    assert.ok(second.error?.includes("Conflicting id 'startup-dup-id'"));
+  });
+
+  await test("session-manager: get_startup_recovery emits lifecycle events", async () => {
+    const localManager = new PiSessionManager();
+    const events: any[] = [];
+
+    const subscriber = {
+      send: (data: string) => {
+        events.push(JSON.parse(data));
+      },
+      subscribedSessions: new Set<string>(),
+    };
+
+    localManager.addSubscriber(subscriber);
+    try {
+      const response = await localManager.executeCommand({
+        id: "startup-life-1",
+        type: "get_startup_recovery",
+      } as any);
+
+      assert.strictEqual(response.success, true);
+      const accepted = events.find(
+        (e) => e.type === "command_accepted" && e.data?.commandId === "startup-life-1"
+      );
+      const started = events.find(
+        (e) => e.type === "command_started" && e.data?.commandId === "startup-life-1"
+      );
+      const finished = events.find(
+        (e) => e.type === "command_finished" && e.data?.commandId === "startup-life-1"
+      );
+
+      assert.ok(accepted, "Expected command_accepted event");
+      assert.ok(started, "Expected command_started event");
+      assert.ok(finished, "Expected command_finished event");
+      assert.strictEqual(finished.data.success, true);
+    } finally {
+      localManager.removeSubscriber(subscriber);
+    }
+  });
+
+  await test("session-manager: get_command_history returns empty result when journal disabled", async () => {
+    const response = await manager.executeCommand({ type: "get_command_history" } as any);
+    assert.strictEqual(response.success, true, "get_command_history should succeed");
+
+    const data = (response as any).data;
+    assert.strictEqual(data.enabled, false);
+    assert.strictEqual(data.initState, "disabled");
+    assert.ok(Array.isArray(data.entries));
+    assert.strictEqual(data.entries.length, 0);
+    assert.strictEqual(data.truncated, false);
+  });
+
+  await test("session-manager: get_command_history applies filters and bounded limit", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-history-query-"));
+
+    try {
+      const seededJournal = new DurableCommandJournal({
+        enabled: true,
+        dataDir: journalDir,
+      });
+      await seededJournal.initialize();
+
+      seededJournal.appendLifecycle({
+        phase: "command_accepted",
+        commandId: "history-cmd-a",
+        commandType: "prompt",
+        laneKey: "session:history-s1",
+        fingerprint: JSON.stringify({ type: "prompt", sessionId: "history-s1", message: "hi" }),
+        explicitId: true,
+        sessionId: "history-s1",
+      });
+      seededJournal.appendLifecycle({
+        phase: "command_started",
+        commandId: "history-cmd-a",
+        commandType: "prompt",
+        laneKey: "session:history-s1",
+        fingerprint: JSON.stringify({ type: "prompt", sessionId: "history-s1", message: "hi" }),
+        explicitId: true,
+        sessionId: "history-s1",
+      });
+      seededJournal.appendLifecycle({
+        phase: "command_finished",
+        commandId: "history-cmd-a",
+        commandType: "prompt",
+        laneKey: "session:history-s1",
+        fingerprint: JSON.stringify({ type: "prompt", sessionId: "history-s1", message: "hi" }),
+        explicitId: true,
+        sessionId: "history-s1",
+        success: true,
+        response: {
+          id: "history-cmd-a",
+          type: "response",
+          command: "prompt",
+          success: true,
+        },
+      });
+
+      seededJournal.appendLifecycle({
+        phase: "command_finished",
+        commandId: "history-cmd-b",
+        commandType: "list_sessions",
+        laneKey: "server",
+        fingerprint: JSON.stringify({ type: "list_sessions" }),
+        explicitId: true,
+        sessionId: "history-s2",
+        success: true,
+        response: {
+          id: "history-cmd-b",
+          type: "response",
+          command: "list_sessions",
+          success: true,
+          data: { sessions: [] },
+        },
+      });
+      seededJournal.dispose();
+
+      const localManager = new PiSessionManager(undefined, {
+        durableJournal: { enabled: true, dataDir: journalDir },
+      });
+      await localManager.initialize();
+
+      const filtered = await localManager.executeCommand({
+        type: "get_command_history",
+        sessionIdFilter: "history-s1",
+        limit: 2,
+      } as any);
+      assert.strictEqual(filtered.success, true);
+
+      const filteredData = (filtered as any).data;
+      assert.strictEqual(filteredData.enabled, true);
+      assert.strictEqual(filteredData.returned, 2);
+      assert.strictEqual(filteredData.truncated, true);
+      assert.strictEqual(filteredData.maxItemsReturned, 2);
+      assert.strictEqual(filteredData.filters.sessionIdFilter, "history-s1");
+      assert.ok(
+        filteredData.entries.every((entry: any) => entry.sessionId === "history-s1"),
+        "All entries should match session filter"
+      );
+
+      const byCommandId = await localManager.executeCommand({
+        type: "get_command_history",
+        commandId: "history-cmd-b",
+      } as any);
+      assert.strictEqual(byCommandId.success, true);
+      const byCommandIdData = (byCommandId as any).data;
+      assert.strictEqual(byCommandIdData.returned, 1);
+      assert.strictEqual(byCommandIdData.entries[0]?.commandId, "history-cmd-b");
+      assert.strictEqual(byCommandIdData.truncated, false);
+
+      localManager.disposeAllSessions();
+    } finally {
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-manager: get_command_history enforces scan budget", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-history-budget-"));
+
+    try {
+      const localManager = new PiSessionManager(undefined, {
+        durableJournal: {
+          enabled: true,
+          dataDir: journalDir,
+          historyScanMaxEntries: 5,
+        },
+      });
+      await localManager.initialize();
+
+      for (let i = 0; i < 4; i++) {
+        const response = await localManager.executeCommand({
+          id: `history-budget-${i}`,
+          type: "list_sessions",
+        } as any);
+        assert.strictEqual(response.success, true);
+      }
+
+      const historyResponse = await localManager.executeCommand({
+        type: "get_command_history",
+        limit: 200,
+      } as any);
+      assert.strictEqual(historyResponse.success, true);
+
+      const data = (historyResponse as any).data;
+      assert.strictEqual(data.truncated, true, "Scan budget should force truncation");
+      assert.ok(data.returned <= 5, `Expected <=5 entries from scan budget, got ${data.returned}`);
+
+      localManager.disposeAllSessions();
+    } finally {
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-manager: best_effort append failures do not fail command flow", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-append-best-effort-"));
+    const originalConsoleError = console.error;
+
+    try {
+      console.error = () => {};
+
+      const localManager = new PiSessionManager(undefined, {
+        durableJournal: {
+          enabled: true,
+          dataDir: journalDir,
+          appendFailurePolicy: "best_effort",
+          redaction: {
+            beforePersist: () => {
+              throw new Error("injected-append-failure-best-effort");
+            },
+          },
+        },
+      });
+      await localManager.initialize();
+
+      const command = await localManager.executeCommand({
+        id: "append-best-effort-1",
+        type: "list_sessions",
+      } as any);
+      assert.strictEqual(command.success, true, "best_effort should keep command execution open");
+
+      const history = await localManager.executeCommand({
+        type: "get_command_history",
+        commandId: "append-best-effort-1",
+      } as any);
+      assert.strictEqual(history.success, true);
+      assert.strictEqual(
+        (history as any).data.returned,
+        0,
+        "Failed appends should not persist history"
+      );
+
+      const metrics = await localManager.executeCommand({ type: "get_metrics" } as any);
+      assert.strictEqual(metrics.success, true);
+      assert.strictEqual((metrics as any).data.stores.journal.appendFailurePolicy, "best_effort");
+      assert.strictEqual(
+        (metrics as any).data.stores.journal.redaction.beforePersistHookEnabled,
+        true
+      );
+
+      localManager.disposeAllSessions();
+    } finally {
+      console.error = originalConsoleError;
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-manager: fail_closed append failures fail command flow but keep observability", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-append-fail-closed-"));
+    const originalConsoleError = console.error;
+
+    try {
+      console.error = () => {};
+
+      const localManager = new PiSessionManager(undefined, {
+        durableJournal: {
+          enabled: true,
+          dataDir: journalDir,
+          appendFailurePolicy: "fail_closed",
+          redaction: {
+            beforePersist: () => {
+              throw new Error("injected-append-failure-fail-closed");
+            },
+          },
+        },
+      });
+      await localManager.initialize();
+
+      const command = await localManager.executeCommand({
+        id: "append-fail-closed-1",
+        type: "list_sessions",
+      } as any);
+      assert.strictEqual(command.success, false, "fail_closed should reject on append failures");
+      assert.ok(
+        command.error?.includes("command_accepted") || command.error?.includes("command_finished"),
+        `Expected phase marker in error, got: ${command.error}`
+      );
+      assert.ok(command.error?.includes("injected-append-failure-fail-closed"));
+
+      const followUp = await localManager.executeCommand({
+        id: "append-fail-closed-2",
+        type: "list_sessions",
+      } as any);
+      assert.strictEqual(followUp.success, false, "Subsequent commands should fail closed");
+      assert.ok(followUp.error?.includes("Durable journal append failed"));
+
+      const recovery = await localManager.executeCommand({ type: "get_startup_recovery" } as any);
+      assert.strictEqual(recovery.success, true, "Startup recovery must remain available");
+      assert.strictEqual((recovery as any).data.initState, "failed");
+
+      const history = await localManager.executeCommand({
+        type: "get_command_history",
+        limit: 10,
+      } as any);
+      assert.strictEqual(history.success, true, "History should remain available for diagnostics");
+
+      localManager.disposeAllSessions();
+    } finally {
+      console.error = originalConsoleError;
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-manager: fail_closed command_finished append failure downgrades terminal response", async () => {
+    const journalDir = mkdtempSync(
+      join(tmpdir(), "pi-server-journal-append-fail-closed-finished-")
+    );
+    const originalConsoleError = console.error;
+
+    try {
+      console.error = () => {};
+
+      const localManager = new PiSessionManager(undefined, {
+        durableJournal: {
+          enabled: true,
+          dataDir: journalDir,
+          appendFailurePolicy: "fail_closed",
+          redaction: {
+            beforePersist: (entry) => {
+              if (entry.phase === "command_finished") {
+                throw new Error("injected-append-failure-command-finished");
+              }
+              return entry;
+            },
+          },
+        },
+      });
+      await localManager.initialize();
+
+      const response = await localManager.executeCommand({
+        id: "append-fail-closed-finished-1",
+        type: "list_sessions",
+      } as any);
+
+      assert.strictEqual(response.success, false, "Fail-closed should downgrade terminal response");
+      assert.ok(response.error?.includes("command_finished"));
+      assert.ok(response.error?.includes("injected-append-failure-command-finished"));
+
+      const replayStore = (localManager as any).replayStore;
+      const stored = replayStore.getCommandOutcome("append-fail-closed-finished-1");
+      assert.ok(stored, "Expected stored terminal outcome");
+      assert.strictEqual(stored.success, false, "Stored outcome must match downgraded failure");
+      assert.strictEqual(
+        stored.response.success,
+        false,
+        "Stored response must match downgraded failure"
+      );
+      assert.ok(stored.error?.includes("command_finished"));
+
+      localManager.disposeAllSessions();
+    } finally {
+      console.error = originalConsoleError;
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("command-journal: beforePersist rejects replay-critical response removal", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-redaction-invariant-"));
+
+    try {
+      const journal = new DurableCommandJournal({
+        enabled: true,
+        dataDir: journalDir,
+        redaction: {
+          beforePersist: (entry) => {
+            if (entry.phase === "command_finished") {
+              return {
+                ...entry,
+                response: undefined,
+              };
+            }
+            return entry;
+          },
+        },
+      });
+      await journal.initialize();
+
+      assert.throws(
+        () =>
+          journal.appendLifecycle({
+            phase: "command_finished",
+            commandId: "redaction-invariant-cmd-1",
+            commandType: "list_sessions",
+            laneKey: "server",
+            fingerprint: JSON.stringify({ type: "list_sessions" }),
+            explicitId: true,
+            success: true,
+            response: {
+              id: "redaction-invariant-cmd-1",
+              type: "response",
+              command: "list_sessions",
+              success: true,
+              data: { sessions: [] },
+            },
+          }),
+        /replay-critical response/
+      );
+
+      journal.dispose();
+    } finally {
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-manager: durable journal redaction hooks apply to persistence and export", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-redaction-hooks-"));
+
+    try {
+      const localManager = new PiSessionManager(undefined, {
+        durableJournal: {
+          enabled: true,
+          dataDir: journalDir,
+          redaction: {
+            beforePersist: (entry) => ({
+              ...entry,
+              idempotencyKey: entry.idempotencyKey ? "[redacted-idempotency]" : undefined,
+            }),
+            beforeExport: (result) => ({
+              ...result,
+              journalPath: "[redacted-journal-path]",
+              entries: result.entries.map((entry) => ({
+                ...entry,
+                fingerprint: "[redacted-fingerprint]",
+              })),
+            }),
+          },
+        },
+      });
+      await localManager.initialize();
+
+      const executed = await localManager.executeCommand({
+        id: "redaction-hook-cmd-1",
+        type: "list_sessions",
+        idempotencyKey: "secret-idempotency-token",
+      } as any);
+      assert.strictEqual(executed.success, true);
+
+      const history = await localManager.executeCommand({
+        type: "get_command_history",
+        commandId: "redaction-hook-cmd-1",
+        limit: 20,
+      } as any);
+      assert.strictEqual(history.success, true);
+
+      const data = (history as any).data;
+      assert.strictEqual(data.journalPath, "[redacted-journal-path]");
+      assert.ok(data.returned > 0, "Expected history entries for command");
+
+      const finishedEntry = data.entries.find((entry: any) => entry.phase === "command_finished");
+      assert.ok(finishedEntry, "Expected command_finished history entry");
+      assert.strictEqual(finishedEntry.idempotencyKey, "[redacted-idempotency]");
+      assert.strictEqual(finishedEntry.fingerprint, "[redacted-fingerprint]");
+
+      localManager.disposeAllSessions();
+    } finally {
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-manager: startup recovery tolerates truncated journal tail", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-chaos-recovery-"));
+
+    try {
+      const journalPath = join(journalDir, "command-journal.jsonl");
+      const now = Date.now();
+      const lines = [
+        JSON.stringify({
+          schemaVersion: 1,
+          kind: "command_lifecycle",
+          phase: "command_finished",
+          recordedAt: now - 2000,
+          serverVersion: "test",
+          commandId: "chaos-finished-1",
+          commandType: "list_sessions",
+          laneKey: "server",
+          laneSequence: 1,
+          fingerprint: JSON.stringify({ type: "list_sessions" }),
+          explicitId: true,
+          success: true,
+          response: {
+            id: "chaos-finished-1",
+            type: "response",
+            command: "list_sessions",
+            success: true,
+            data: { sessions: [] },
+          },
+        }),
+        JSON.stringify({
+          schemaVersion: 1,
+          kind: "command_lifecycle",
+          phase: "command_accepted",
+          recordedAt: now - 1000,
+          serverVersion: "test",
+          commandId: "chaos-inflight-1",
+          commandType: "list_sessions",
+          laneKey: "server",
+          laneSequence: 2,
+          fingerprint: JSON.stringify({ type: "list_sessions" }),
+          explicitId: true,
+        }),
+        '{"schemaVersion":1,"kind":"command_lifecycle","phase":"command_started"',
+      ];
+      writeFileSync(journalPath, `${lines.join("\n")}\n`, "utf-8");
+
+      const localManager = new PiSessionManager(undefined, {
+        durableJournal: { enabled: true, dataDir: journalDir },
+      });
+      await localManager.initialize();
+
+      const recovery = await localManager.executeCommand({ type: "get_startup_recovery" } as any);
+      assert.strictEqual(recovery.success, true);
+
+      const recoveryData = (recovery as any).data;
+      assert.ok(recoveryData.malformedEntries >= 1, "Expected malformed entry count");
+      assert.strictEqual(recoveryData.recoveredOutcomes, 2);
+      assert.strictEqual(recoveryData.recoveredInFlightFailures, 1);
+
+      const replayFinished = await localManager.executeCommand({
+        id: "chaos-finished-1",
+        type: "list_sessions",
+      } as any);
+      assert.strictEqual(replayFinished.success, true);
+      assert.strictEqual(replayFinished.replayed, true);
+
+      const replayInflight = await localManager.executeCommand({
+        id: "chaos-inflight-1",
+        type: "list_sessions",
+      } as any);
+      assert.strictEqual(replayInflight.success, false);
+      assert.strictEqual(replayInflight.replayed, true);
+      assert.ok(replayInflight.error?.includes("did not finish before previous shutdown"));
+
+      localManager.disposeAllSessions();
+    } finally {
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-manager: compaction drops malformed partial lines and preserves replay", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-chaos-compaction-"));
+
+    try {
+      const journalPath = join(journalDir, "command-journal.jsonl");
+      const now = Date.now();
+      const lines = [
+        JSON.stringify({
+          schemaVersion: 1,
+          kind: "command_lifecycle",
+          phase: "command_finished",
+          recordedAt: now - 3000,
+          serverVersion: "test",
+          commandId: "chaos-compact-old",
+          commandType: "list_sessions",
+          laneKey: "server",
+          laneSequence: 1,
+          fingerprint: JSON.stringify({ type: "list_sessions" }),
+          explicitId: true,
+          success: true,
+          response: {
+            id: "chaos-compact-old",
+            type: "response",
+            command: "list_sessions",
+            success: true,
+            data: { sessions: [] },
+          },
+        }),
+        '{"schemaVersion":1,"kind":"command_lifecycle","phase":"command_started"',
+        JSON.stringify({
+          schemaVersion: 1,
+          kind: "command_lifecycle",
+          phase: "command_finished",
+          recordedAt: now - 1000,
+          serverVersion: "test",
+          commandId: "chaos-compact-new",
+          commandType: "list_sessions",
+          laneKey: "server",
+          laneSequence: 2,
+          fingerprint: JSON.stringify({ type: "list_sessions" }),
+          explicitId: true,
+          success: true,
+          response: {
+            id: "chaos-compact-new",
+            type: "response",
+            command: "list_sessions",
+            success: true,
+            data: { sessions: [] },
+          },
+        }),
+      ];
+      writeFileSync(journalPath, `${lines.join("\n")}\n`, "utf-8");
+
+      const localManager = new PiSessionManager(undefined, {
+        durableJournal: {
+          enabled: true,
+          dataDir: journalDir,
+          retention: { maxEntries: 1 },
+        },
+      });
+      await localManager.initialize();
+
+      const compactedRaw = readFileSync(journalPath, "utf-8");
+      const compactedLines = compactedRaw.split(/\r?\n/).filter((line) => line.trim().length > 0);
+      assert.ok(compactedLines.length > 0, "Compacted journal should contain retained entries");
+      for (const line of compactedLines) {
+        assert.doesNotThrow(() => JSON.parse(line), `Expected parseable compacted line: ${line}`);
+      }
+
+      const oldReplay = await localManager.executeCommand({
+        id: "chaos-compact-old",
+        type: "list_sessions",
+      } as any);
+      assert.strictEqual(oldReplay.success, true);
+      assert.notStrictEqual(oldReplay.replayed, true, "Old entry should be compacted out");
+
+      const newReplay = await localManager.executeCommand({
+        id: "chaos-compact-new",
+        type: "list_sessions",
+      } as any);
+      assert.strictEqual(newReplay.success, true);
+      assert.strictEqual(newReplay.replayed, true, "Newest retained entry should replay");
+
+      localManager.disposeAllSessions();
+    } finally {
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-manager: get_startup_recovery remains available when durable init fails", async () => {
+    const localManager = new PiSessionManager(undefined, {
+      durableJournal: { enabled: true, dataDir: "/dev/null/pi-startup-recovery-failure" },
+    });
+
+    const summary = await localManager.executeCommand({ type: "get_startup_recovery" });
+    assert.strictEqual(summary.success, true, "Recovery summary command should remain available");
+
+    const data = (summary as any).data;
+    assert.strictEqual(data.enabled, true);
+    assert.ok(
+      data.initState === "failed" || data.initState === "timed_out",
+      `Expected failed or timed_out init state, got ${data.initState}`
+    );
+    assert.ok(
+      typeof data.initializationError === "string" && data.initializationError.length > 0,
+      "Should expose initializationError"
+    );
+
+    const normalCommand = await localManager.executeCommand({ type: "list_sessions" });
+    assert.strictEqual(normalCommand.success, false, "Normal commands should still fail closed");
+    assert.ok(normalCommand.error?.includes("Durable journal initialization failed"));
+  });
+
+  await test("session-manager: unsupported virtual fs journal path fails fast", async () => {
+    if (process.platform !== "linux") {
+      return;
+    }
+
+    const localManager = new PiSessionManager(undefined, {
+      durableJournal: { enabled: true, dataDir: "/proc/pi-startup-recovery-failure" },
+    });
+
+    const startedAt = Date.now();
+    const response = await localManager.executeCommand({ type: "list_sessions" });
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.strictEqual(response.success, false);
+    assert.ok(elapsedMs < 2000, `Expected fast failure (<2s), got ${elapsedMs}ms`);
+    assert.ok(response.error?.includes("unsupported virtual filesystem root"));
+  });
+
+  await test("session-manager: durable journal lock rejects active foreign owner", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-lock-foreign-"));
+    const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], {
+      stdio: "ignore",
+    });
+
+    try {
+      const holderPid = holder.pid;
+      assert.ok(typeof holderPid === "number" && holderPid > 0, "Expected holder PID");
+
+      const lockPath = join(journalDir, "command-journal.jsonl.lock");
+      writeFileSync(lockPath, `${JSON.stringify({ pid: holderPid, acquiredAt: Date.now() })}\n`);
+
+      const localManager = new PiSessionManager(undefined, {
+        durableJournal: { enabled: true, dataDir: journalDir },
+      });
+
+      const response = await localManager.executeCommand({ type: "list_sessions" });
+      assert.strictEqual(response.success, false);
+      assert.ok(response.error?.includes("already in use by PID"));
+      localManager.disposeAllSessions();
+    } finally {
+      try {
+        holder.kill("SIGKILL");
+      } catch {
+        // Ignore process cleanup failures.
+      }
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-manager: get_startup_recovery caps large recovery lists", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-recovery-cap-"));
+
+    try {
+      const seededJournal = new DurableCommandJournal({
+        enabled: true,
+        dataDir: journalDir,
+      });
+      await seededJournal.initialize();
+
+      for (let i = 0; i < 150; i++) {
+        const commandId = `cap-cmd-${i}`;
+        seededJournal.appendLifecycle({
+          phase: "command_finished",
+          commandId,
+          commandType: "list_sessions",
+          laneKey: "server",
+          fingerprint: JSON.stringify({ type: "list_sessions" }),
+          explicitId: true,
+          success: true,
+          response: {
+            id: commandId,
+            type: "response",
+            command: "list_sessions",
+            success: true,
+            data: { sessions: [] },
+          },
+        });
+      }
+      seededJournal.dispose();
+
+      const localManager = new PiSessionManager(undefined, {
+        durableJournal: { enabled: true, dataDir: journalDir },
+      });
+      await localManager.initialize();
+
+      const summary = await localManager.executeCommand({ type: "get_startup_recovery" });
+      assert.strictEqual(summary.success, true);
+
+      const data = (summary as any).data;
+      assert.strictEqual(data.recoveredOutcomes, 150);
+      assert.strictEqual(data.recoveredOutcomeIds.length, 100);
+      assert.strictEqual(data.recoveredOutcomeIdsTruncated, true);
+      assert.strictEqual(data.maxItemsReturned, 100);
+      assert.strictEqual(data.recoveredInFlightTruncated, false);
+
+      localManager.disposeAllSessions();
+    } finally {
+      rmSync(journalDir, { recursive: true, force: true });
+    }
   });
 
   // Test: list_stored_sessions (ADR-0007)
@@ -1997,6 +3236,12 @@ async function testSessionManager() {
     assert.strictEqual((listAfter as any).data.sessions.length, 0, "Should have 0 sessions");
   });
 
+  await test("server: forwards durableInitTimeoutMs to session manager", () => {
+    const server = new PiServer({ durableInitTimeoutMs: 1234 } as any);
+    const managerAny = server.getSessionManager() as any;
+    assert.strictEqual(managerAny.durableInitTimeoutMs, 1234);
+  });
+
   await test("server: shutdown flush includes final uptime metric", async () => {
     const sink = new BufferedTestSink();
     const server = new PiServer({
@@ -2012,6 +3257,141 @@ async function testSessionManager() {
       true,
       "Expected uptime metric to be included in flushed metrics"
     );
+  });
+
+  await test("server: starts in degraded mode when durable init fails", async () => {
+    if (process.platform !== "linux") {
+      return;
+    }
+
+    const server = new PiServer({
+      durableJournal: { enabled: true, dataDir: "/dev/null/pi-startup-fail-test" },
+    });
+
+    await server.start(0);
+    try {
+      const summary = await server.getSessionManager().executeCommand({
+        type: "get_startup_recovery",
+      } as any);
+      assert.strictEqual(summary.success, true);
+      const data = (summary as any).data;
+      assert.ok(data.initState === "failed" || data.initState === "timed_out");
+
+      const normal = await server.getSessionManager().executeCommand({
+        type: "list_sessions",
+      } as any);
+      assert.strictEqual(normal.success, false, "Non-recovery commands should fail closed");
+      assert.ok(normal.error?.includes("Durable journal initialization failed"));
+    } finally {
+      await server.stop(1000);
+    }
+  });
+
+  await test("server: startup_recovery_summary can include sensitive fields via opt-in", async () => {
+    const server = new PiServer({
+      startupRecoverySummaryEvent: {
+        enabled: true,
+        includeSensitiveData: true,
+      },
+    });
+
+    const captured: Array<Record<string, unknown>> = [];
+    const subscriber = {
+      send: (data: string) => {
+        captured.push(JSON.parse(data));
+      },
+      subscribedSessions: new Set<string>(),
+    };
+
+    server.getSessionManager().addSubscriber(subscriber);
+
+    await server.start(0);
+    try {
+      const startupRecovery = captured.find((event) => event.type === "startup_recovery_summary");
+      assert.ok(startupRecovery, "Expected startup_recovery_summary broadcast");
+      assert.notStrictEqual(
+        (startupRecovery as any).data?.journalPath,
+        "[redacted]",
+        "Opt-in sensitive mode should include journalPath"
+      );
+    } finally {
+      server.getSessionManager().removeSubscriber(subscriber);
+      await server.stop(1000);
+    }
+  });
+
+  await test("stdio backpressure: drops non-critical writes while backpressured", () => {
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    const writes: string[] = [];
+
+    (process.stdout as any).write = (chunk: string) => {
+      writes.push(String(chunk));
+      return false;
+    };
+
+    const state = {
+      hasBackpressure: false,
+      droppedCount: 0,
+      drainHandlerRegistered: false,
+    };
+
+    try {
+      const first = sendWithStdioBackpressure("first", state, { isCritical: false });
+      const second = sendWithStdioBackpressure("second", state, { isCritical: false });
+
+      assert.strictEqual(first, true, "First write should be attempted");
+      assert.strictEqual(second, false, "Second write should be dropped under backpressure");
+      assert.strictEqual(writes.length, 1, "Dropped write should not hit stdout.write");
+      assert.strictEqual(state.droppedCount, 1, "Dropped counter should increment");
+    } finally {
+      (process.stdout as any).write = originalWrite;
+    }
+  });
+
+  await test("stdio backpressure: drain resets pressure and critical writes still attempt", () => {
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    const writes: string[] = [];
+    let writeCalls = 0;
+
+    (process.stdout as any).write = (chunk: string) => {
+      writes.push(String(chunk));
+      writeCalls += 1;
+      // First write simulates buffer full, subsequent writes are accepted.
+      return writeCalls > 1;
+    };
+
+    const state = {
+      hasBackpressure: false,
+      droppedCount: 0,
+      drainHandlerRegistered: false,
+    };
+
+    try {
+      const firstCritical = sendWithStdioBackpressure("critical-1", state, { isCritical: true });
+      assert.strictEqual(firstCritical, true, "Critical write should always be attempted");
+      assert.strictEqual(state.hasBackpressure, true, "State should enter backpressure");
+      assert.strictEqual(state.drainHandlerRegistered, true, "Drain handler should be registered");
+
+      const nonCritical = sendWithStdioBackpressure("non-critical", state, { isCritical: false });
+      assert.strictEqual(nonCritical, false, "Non-critical write should drop while backpressured");
+      assert.strictEqual(writes.length, 1, "Dropped non-critical write should not reach stdout");
+      assert.strictEqual(state.droppedCount, 1, "Dropped counter should increment");
+
+      // Simulate drain from previous write cycle.
+      (process.stdout as any).emit("drain");
+      assert.strictEqual(state.hasBackpressure, false, "Drain should clear backpressure state");
+      assert.strictEqual(
+        state.drainHandlerRegistered,
+        false,
+        "Drain should clear handler registration flag"
+      );
+
+      const secondCritical = sendWithStdioBackpressure("critical-2", state, { isCritical: true });
+      assert.strictEqual(secondCritical, true, "Critical write should be attempted after drain");
+      assert.strictEqual(writes.length, 2, "Critical writes should reach stdout");
+    } finally {
+      (process.stdout as any).write = originalWrite;
+    }
   });
 }
 

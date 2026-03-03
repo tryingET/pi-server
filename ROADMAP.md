@@ -100,7 +100,7 @@ Each unchecked item requires an **owner**, an **acceptance test**, and a **decis
 ### L4.2 Crash recovery model
 - [ ] Rehydrate journal on startup
 - [ ] Classify pre-crash in-flight commands (`recoverable` / `failed`) with explicit reason
-- [ ] Expose recovery summary event/endpoint
+- [x] Expose recovery summary event/endpoint
 
 **Owner:** TBD
 
@@ -113,7 +113,7 @@ Each unchecked item requires an **owner**, an **acceptance test**, and a **decis
 
 ### L4.3 Replay and trace extraction
 - [ ] Deterministic replay mode for audit/debug
-- [ ] `get_command_history` API (session, commandId, time-window filters)
+- [x] `get_command_history` API (session, commandId, time-window filters; bounded response)
 - [ ] Redaction-aware export path for incident reports
 
 **Owner:** TBD
@@ -126,9 +126,9 @@ Each unchecked item requires an **owner**, an **acceptance test**, and a **decis
 - Replay placement: in-process feature vs offline tool
 
 ### L4.4 Retention, compaction, privacy controls
-- [ ] Retention policy (time + size)
-- [ ] Compaction that preserves replay correctness
-- [ ] PII redaction hooks before persistence/export
+- [x] Retention policy (time + size)
+- [x] Compaction that preserves replay correctness for retained outcomes + in-flight recovery
+- [x] PII redaction hooks before persistence/export
 
 **Owner:** TBD
 
