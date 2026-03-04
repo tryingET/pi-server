@@ -755,14 +755,24 @@ async function testCommandRouter() {
     const tree: any[] = [
       {
         // Well-formed node
-        entry: { type: "message", id: "good-1", parentId: null, message: { role: "user", content: "hi" } },
+        entry: {
+          type: "message",
+          id: "good-1",
+          parentId: null,
+          message: { role: "user", content: "hi" },
+        },
         children: [
           null, // Malformed: null child
           undefined, // Malformed: undefined child
           "not-an-object", // Malformed: string child
           {
             // Another well-formed node
-            entry: { type: "message", id: "good-2", parentId: "good-1", message: { role: "assistant", content: "hello" } },
+            entry: {
+              type: "message",
+              id: "good-2",
+              parentId: "good-1",
+              message: { role: "assistant", content: "hello" },
+            },
             children: [],
           },
         ],
@@ -786,8 +796,14 @@ async function testCommandRouter() {
     const data = (response as any).data;
     // Should only include the 2 well-formed nodes
     assert.strictEqual(data.nodes.length, 2, "Should skip malformed nodes");
-    assert(data.nodes.find((n: any) => n.entryId === "good-1"), "Should include first good node");
-    assert(data.nodes.find((n: any) => n.entryId === "good-2"), "Should include second good node");
+    assert(
+      data.nodes.find((n: any) => n.entryId === "good-1"),
+      "Should include first good node"
+    );
+    assert(
+      data.nodes.find((n: any) => n.entryId === "good-2"),
+      "Should include second good node"
+    );
   });
 }
 

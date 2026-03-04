@@ -44,7 +44,9 @@ interface SessionTreeNodeLike {
   label?: string;
 }
 
-function serializeSessionTreeNodes(tree: SessionTreeNodeLike[] | undefined): SessionTreeNodePayload[] {
+function serializeSessionTreeNodes(
+  tree: SessionTreeNodeLike[] | undefined
+): SessionTreeNodePayload[] {
   if (!Array.isArray(tree) || tree.length === 0) {
     return [];
   }
@@ -101,7 +103,8 @@ function serializeSessionTreeNodes(tree: SessionTreeNodeLike[] | undefined): Ses
 
 function serializeSingleTreeNode(node: SessionTreeNodeLike): SessionTreeNodePayload {
   const entry = node.entry ?? {};
-  const role = entry.type === "message" && typeof entry.message?.role === "string" ? entry.message.role : null;
+  const role =
+    entry.type === "message" && typeof entry.message?.role === "string" ? entry.message.role : null;
   const preview = normalizePreview(extractEntryPreview(entry));
   const fallbackLabel = role ? `[${role}]` : `[${entry.type ?? "entry"}]`;
 

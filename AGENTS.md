@@ -862,6 +862,86 @@ if (counter.checkAndRecord('session-1', 100)) {
 
 ---
 
+## Pattern: Bounded Tree Traversal
+
+**Status:** Accepted (2026-03-04)
+
+### The Problem
+
+External tree structures (from session files, APIs) can be:
+- Arbitrarily deep (causing stack overflow in recursive traversal)
+- Arbitrarily large (causing memory exhaustion)
+- Malformed (containing null/undefined/non-object nodes)
+- Circular (causing infinite loops)
+
+### The Solution
+
+Traverse external trees with defensive bounds:
+
+```typescript
+const MAX_TREE_DEPTH = 1000;
+const MAX_TREE_NODES = 10000;
+
+interface StackItem<T> {
+  node: T;
+  depth: number;
+}
+
+function traverseSafely<T>(tree: T[], visit: (node: T) => void): void {
+  if (!Array.isArray(tree)) return;
+
+  const stack: StackItem<T>[] = [];
+  const result: unknown[] = [];
+
+  // Initialize with depth tracking
+  for (let i = tree.length - 1; i >= 0; i--) {
+    const node = tree[i];
+    if (node && typeof node === "object") {
+      stack.push({ node, depth: 0 });
+    }
+  }
+
+  while (stack.length > 0) {
+    if (result.length >= MAX_TREE_NODES) break;
+
+    const item = stack.pop();
+    if (!item) break;
+
+    const { node, depth } = item;
+    if (depth > MAX_TREE_DEPTH) continue;
+
+    try {
+      visit(node);
+    } catch {
+      // Skip malformed nodes
+    }
+
+    // Push children with incremented depth
+    const children = (node as any).children;
+    if (Array.isArray(children)) {
+      for (let i = children.length - 1; i >= 0; i--) {
+        const child = children[i];
+        if (child && typeof child === "object") {
+          stack.push({ node: child, depth: depth + 1 });
+        }
+      }
+    }
+  }
+}
+```
+
+### Key Properties
+
+1. **Depth limit** — Prevents stack overflow on deeply nested trees
+2. **Node count limit** — Prevents memory exhaustion on large trees
+3. **try/catch per node** — Isolates malformed entries without failing entire traversal
+4. **Object guard at seams** — Validates external data before processing
+5. **Iterative (not recursive)** — Uses explicit stack to avoid call stack limits
+
+**Applied to:** `serializeSessionTreeNodes` (command-router.ts)
+
+---
+
 ## Protocol Patterns
 
 ### Command → Response Correlation
