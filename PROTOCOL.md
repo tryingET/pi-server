@@ -508,11 +508,71 @@ when the query exceeds those bounds.
 | `switch_session_file` | Switch to different file |
 | `fork` | Fork from message |
 | `get_fork_messages` | Get fork preview |
+| `get_tree` | Retrieve normalized session tree (all roles) |
 | `navigate_tree` | Navigate session tree to target entry |
 | `get_last_assistant_text` | Get last response |
 | `get_context_usage` | Get token usage info |
 
-### 17.3 `navigate_tree` details
+### 17.3 `get_tree` details
+
+`get_tree` exposes the full session tree (all entry types) so remote UIs can render `/tree` just like the pi TUI. Unlike `get_fork_messages`, no filtering is applied—assistant replies, tool results, compaction summaries, labels, and custom entries are all included so clients can faithfully reconstruct branch structure.
+
+**Request:**
+```json
+{
+  "type": "get_tree",
+  "sessionId": "session-123"
+}
+```
+
+**Response:**
+```json
+{
+  "command": "get_tree",
+  "success": true,
+  "data": {
+    "currentLeafId": "entry-789",
+    "nodes": [
+      {
+        "entryId": "entry-root",
+        "parentId": null,
+        "entryType": "message",
+        "role": "user",
+        "text": "Initial question",
+        "timestamp": "2026-03-04T00:12:00.000Z",
+        "label": "start"
+      },
+      {
+        "entryId": "entry-assistant",
+        "parentId": "entry-root",
+        "entryType": "message",
+        "role": "assistant",
+        "text": "Sure, let's break that down"
+      },
+      {
+        "entryId": "entry-tool",
+        "parentId": "entry-assistant",
+        "entryType": "message",
+        "role": "toolResult",
+        "text": "ls -la output..."
+      }
+    ]
+  }
+}
+```
+
+`nodes` is a flattened pre-order traversal. Each node includes enough metadata to rebuild parent/child relationships:
+
+- `entryId` / `parentId` – stable identifiers matching the session file
+- `entryType` – one of `message`, `custom_message`, `branch_summary`, `compaction`, `model_change`, `thinking_level_change`, `label`, or `custom`
+- `role` – `user`, `assistant`, `toolResult`, `bashExecution`, etc. (only for `message` entries)
+- `text` – normalized preview (newlines collapsed, trimmed, max 400 characters)
+- `timestamp` – ISO string when available
+- `label` – resolved label attached to the entry, if any
+
+`currentLeafId` mirrors the active branch pointer and helps clients highlight the live node. The payload is read-only and small enough for short timeout classification.
+
+### 17.4 `navigate_tree` details
 
 Navigate the session tree to a target entry, optionally summarizing the branch.
 
@@ -556,7 +616,7 @@ Navigate the session tree to a target entry, optionally summarizing the branch.
 - `cancelled` — `true` if navigation was cancelled (e.g., by extension)
 - `aborted` — `true` if summarization was aborted
 
-### 17.4 Extension UI commands
+### 17.5 Extension UI commands
 
 See [Section 18](#18-extension-ui-protocol).
 

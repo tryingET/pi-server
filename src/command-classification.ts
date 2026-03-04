@@ -28,6 +28,7 @@ const SHORT_TIMEOUT_COMMANDS = new Set([
   "list_session_files",
   "get_session_stats",
   "get_fork_messages",
+  "get_tree",
   "get_last_assistant_text",
   "get_context_usage",
   "set_session_name",
@@ -96,6 +97,7 @@ const READ_ONLY_COMMANDS = new Set([
   "list_session_files",
   "get_session_stats",
   "get_fork_messages",
+  "get_tree",
   "get_last_assistant_text",
   "get_context_usage",
   "switch_session", // Switches client focus, doesn't change session

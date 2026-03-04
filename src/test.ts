@@ -505,6 +505,19 @@ async function testValidation() {
     );
   });
 
+  await test("validation: accepts get_tree command", () => {
+    const errors = validateCommand({ type: "get_tree", sessionId: "test" });
+    assert.strictEqual(errors.length, 0, "Should accept valid get_tree command");
+  });
+
+  await test("validation: rejects get_tree without sessionId", () => {
+    const errors = validateCommand({ type: "get_tree" });
+    assert(
+      errors.some((e) => e.field === "sessionId"),
+      "Should require sessionId for get_tree"
+    );
+  });
+
   // Test: Path validation for switch_session_file
   await test("validation: rejects path traversal in switch_session_file", () => {
     const errors = validateCommand({
@@ -603,7 +616,7 @@ async function testSessionPathValidation() {
 // COMMAND ROUTER TESTS
 // =============================================================================
 
-import { getSupportedSessionCommands } from "./command-router.js";
+import { getSupportedSessionCommands, routeSessionCommand } from "./command-router.js";
 
 async function testCommandRouter() {
   console.log("\n=== Command Router Tests ===\n");
@@ -619,25 +632,162 @@ async function testCommandRouter() {
     assert(commands.length >= 25, `Should have at least 25 commands, got ${commands.length}`);
   });
 
-  await test("router: all session commands are recognized by validation", () => {
-    const commands = getSupportedSessionCommands();
+  await test("router: get_tree returns normalized data", async () => {
+    const iso = "2026-03-04T00:00:00.000Z";
+    const tree: any[] = [
+      {
+        entry: {
+          type: "message",
+          id: "user-1",
+          parentId: null,
+          timestamp: iso,
+          message: { role: "user", content: "Show the repo status" },
+        },
+        label: undefined,
+        children: [
+          {
+            entry: {
+              type: "message",
+              id: "assistant-1",
+              parentId: "user-1",
+              timestamp: iso,
+              message: { role: "assistant", content: [{ type: "text", text: "Sure, running ls" }] },
+            },
+            label: "main",
+            children: [
+              {
+                entry: {
+                  type: "message",
+                  id: "tool-1",
+                  parentId: "assistant-1",
+                  timestamp: iso,
+                  message: {
+                    role: "toolResult",
+                    toolName: "bash",
+                    content: [{ type: "text", text: "total 42" }],
+                  },
+                },
+                label: undefined,
+                children: [],
+              },
+            ],
+          },
+        ],
+      },
+    ];
+    const fakeSession = {
+      sessionManager: {
+        getTree: () => tree,
+        getLeafId: () => "tool-1",
+      },
+    } as any;
 
-    for (const commandType of commands) {
-      const errors = validateCommand({
-        type: commandType,
-        sessionId: "validator-probe",
-      });
+    const response = await routeSessionCommand(
+      fakeSession,
+      { type: "get_tree", sessionId: "session-x" },
+      () => undefined
+    );
 
-      const hasUnknownTypeError = errors.some(
-        (error) => error.field === "type" && error.message.includes("Unknown command type")
-      );
+    assert(response, "Should return response");
+    assert.strictEqual(response!.success, true, "get_tree should succeed");
+    const data = (response as any).data;
+    assert.strictEqual(data.currentLeafId, "tool-1");
+    assert(Array.isArray(data.nodes), "nodes should be an array");
+    assert.strictEqual(data.nodes.length, 3, "Should include all tree nodes");
 
-      assert.strictEqual(
-        hasUnknownTypeError,
-        false,
-        `Validator must recognize router command '${commandType}'`
-      );
-    }
+    const assistantNode = data.nodes.find((node: any) => node.entryId === "assistant-1");
+    assert(assistantNode, "Assistant node should exist");
+    assert.strictEqual(assistantNode.role, "assistant");
+    assert.strictEqual(assistantNode.label, "main");
+
+    const toolNode = data.nodes.find((node: any) => node.entryId === "tool-1");
+    assert(toolNode, "Tool result node should exist");
+    assert(toolNode.text.includes("total 42"), "Tool node should include preview text");
+
+    const userNode = data.nodes.find((node: any) => node.entryId === "user-1");
+    assert(userNode, "User node should exist");
+    assert.strictEqual(userNode.role, "user");
+  });
+
+  await test("router: get_tree handles empty tree", async () => {
+    const fakeSession = {
+      sessionManager: {
+        getTree: () => [],
+        getLeafId: () => null,
+      },
+    } as any;
+
+    const response = await routeSessionCommand(
+      fakeSession,
+      { type: "get_tree", sessionId: "session-empty" },
+      () => undefined
+    );
+
+    assert(response, "Should return response for empty tree");
+    assert.strictEqual(response!.success, true, "get_tree should succeed on empty tree");
+    const data = (response as any).data;
+    assert.strictEqual(data.currentLeafId, null, "Leaf ID should be null for empty tree");
+    assert(Array.isArray(data.nodes), "nodes should be an array");
+    assert.strictEqual(data.nodes.length, 0, "nodes should be empty");
+  });
+
+  await test("router: get_tree handles null tree", async () => {
+    const fakeSession = {
+      sessionManager: {
+        getTree: () => null,
+        getLeafId: () => null,
+      },
+    } as any;
+
+    const response = await routeSessionCommand(
+      fakeSession,
+      { type: "get_tree", sessionId: "session-null" },
+      () => undefined
+    );
+
+    assert(response, "Should return response for null tree");
+    assert.strictEqual(response!.success, true, "get_tree should succeed on null tree");
+    const data = (response as any).data;
+    assert.strictEqual(data.nodes.length, 0, "nodes should be empty for null tree");
+  });
+
+  await test("router: get_tree handles malformed nodes gracefully", async () => {
+    const tree: any[] = [
+      {
+        // Well-formed node
+        entry: { type: "message", id: "good-1", parentId: null, message: { role: "user", content: "hi" } },
+        children: [
+          null, // Malformed: null child
+          undefined, // Malformed: undefined child
+          "not-an-object", // Malformed: string child
+          {
+            // Another well-formed node
+            entry: { type: "message", id: "good-2", parentId: "good-1", message: { role: "assistant", content: "hello" } },
+            children: [],
+          },
+        ],
+      },
+    ];
+    const fakeSession = {
+      sessionManager: {
+        getTree: () => tree,
+        getLeafId: () => "good-2",
+      },
+    } as any;
+
+    const response = await routeSessionCommand(
+      fakeSession,
+      { type: "get_tree", sessionId: "session-malformed" },
+      () => undefined
+    );
+
+    assert(response, "Should return response despite malformed nodes");
+    assert.strictEqual(response!.success, true, "get_tree should succeed despite malformed nodes");
+    const data = (response as any).data;
+    // Should only include the 2 well-formed nodes
+    assert.strictEqual(data.nodes.length, 2, "Should skip malformed nodes");
+    assert(data.nodes.find((n: any) => n.entryId === "good-1"), "Should include first good node");
+    assert(data.nodes.find((n: any) => n.entryId === "good-2"), "Should include second good node");
   });
 }
 

@@ -107,6 +107,7 @@ export type SessionCommand =
   | { id?: string; sessionId: string; type: "switch_session_file"; sessionPath: string }
   | { id?: string; sessionId: string; type: "fork"; entryId: string }
   | { id?: string; sessionId: string; type: "get_fork_messages" }
+  | { id?: string; sessionId: string; type: "get_tree" }
   | {
       id?: string;
       sessionId: string;
@@ -384,6 +385,17 @@ export interface StoredSessionInfo extends SessionInfo {
 }
 
 // Session command responses (mirrors RpcCommand types)
+
+export interface SessionTreeNodePayload {
+  entryId: string;
+  parentId: string | null;
+  entryType: string;
+  role: string | null;
+  text: string;
+  timestamp?: string | number | null;
+  label?: string;
+}
+
 export type SessionResponse =
   | (RpcResponseBase & { command: "extension_ui_response"; success: true })
   // Discovery command responses
@@ -474,6 +486,11 @@ export type SessionResponse =
       command: "get_fork_messages";
       success: true;
       data: { messages: Array<{ entryId: string; text: string }> };
+    })
+  | (RpcResponseBase & {
+      command: "get_tree";
+      success: true;
+      data: { currentLeafId: string | null; nodes: SessionTreeNodePayload[] };
     })
   | (RpcResponseBase & {
       command: "navigate_tree";

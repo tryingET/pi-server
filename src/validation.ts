@@ -199,6 +199,7 @@ const SESSION_COMMANDS = new Set([
   "switch_session_file",
   "fork",
   "get_fork_messages",
+  "get_tree",
   "navigate_tree",
   "get_last_assistant_text",
   "get_context_usage",

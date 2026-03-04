@@ -12,7 +12,7 @@
 
 import path from "path";
 import { type AgentSession, SessionManager } from "@mariozechner/pi-coding-agent";
-import type { RpcResponse, SessionInfo } from "./types.js";
+import type { RpcResponse, SessionInfo, SessionTreeNodePayload } from "./types.js";
 
 // =============================================================================
 // HANDLER TYPE
@@ -23,6 +23,221 @@ export type CommandHandler = (
   command: any,
   getSessionInfo: (sessionId: string) => SessionInfo | undefined
 ) => Promise<RpcResponse> | RpcResponse;
+
+// =============================================================================
+// TREE SERIALIZATION HELPERS
+// =============================================================================
+
+const MAX_TREE_PREVIEW_LENGTH = 400;
+const MAX_TREE_DEPTH = 1000;
+const MAX_TREE_NODES = 10000;
+
+interface SessionTreeNodeLike {
+  entry: {
+    id: string;
+    parentId: string | null;
+    type: string;
+    timestamp?: string | number;
+    [key: string]: any;
+  };
+  children: SessionTreeNodeLike[];
+  label?: string;
+}
+
+function serializeSessionTreeNodes(tree: SessionTreeNodeLike[] | undefined): SessionTreeNodePayload[] {
+  if (!Array.isArray(tree) || tree.length === 0) {
+    return [];
+  }
+
+  const result: SessionTreeNodePayload[] = [];
+  const stack: Array<{ node: SessionTreeNodeLike; depth: number }> = [];
+
+  // Initialize stack with depth tracking (reverse for pre-order)
+  for (let i = tree.length - 1; i >= 0; i--) {
+    const node = tree[i];
+    // Defensive: skip null/undefined/non-object nodes
+    if (node && typeof node === "object") {
+      stack.push({ node, depth: 0 });
+    }
+  }
+
+  while (stack.length > 0) {
+    // Hard bound on total nodes to prevent memory exhaustion
+    if (result.length >= MAX_TREE_NODES) {
+      break;
+    }
+
+    const item = stack.pop();
+    if (!item) break;
+
+    const { node, depth } = item;
+
+    // Skip nodes beyond max depth (prevents stack overflow on deep trees)
+    if (depth > MAX_TREE_DEPTH) {
+      continue;
+    }
+
+    // Defensive: wrap node serialization in try/catch to isolate malformed entries
+    try {
+      result.push(serializeSingleTreeNode(node));
+    } catch {
+      // Skip malformed nodes, continue processing siblings
+    }
+
+    // Push children with incremented depth
+    if (Array.isArray(node.children) && node.children.length > 0) {
+      for (let i = node.children.length - 1; i >= 0; i--) {
+        const child = node.children[i];
+        // Defensive: skip null/undefined/non-object children
+        if (child && typeof child === "object") {
+          stack.push({ node: child, depth: depth + 1 });
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+function serializeSingleTreeNode(node: SessionTreeNodeLike): SessionTreeNodePayload {
+  const entry = node.entry ?? {};
+  const role = entry.type === "message" && typeof entry.message?.role === "string" ? entry.message.role : null;
+  const preview = normalizePreview(extractEntryPreview(entry));
+  const fallbackLabel = role ? `[${role}]` : `[${entry.type ?? "entry"}]`;
+
+  return {
+    entryId: entry.id,
+    parentId: entry.parentId ?? null,
+    entryType: entry.type ?? "unknown",
+    role,
+    text: preview || fallbackLabel,
+    timestamp: entry.timestamp ?? null,
+    label: node.label,
+  };
+}
+
+function extractEntryPreview(entry: Record<string, any>): string {
+  switch (entry.type) {
+    case "message":
+      return extractMessageBody(entry.message);
+    case "custom_message":
+      return extractContentBlocks(entry.content);
+    case "branch_summary":
+      return entry.summary ?? "";
+    case "compaction":
+      return entry.summary ?? formatCompactionTokens(entry.tokensBefore);
+    case "model_change":
+      if (entry.provider && entry.modelId) {
+        return `${entry.provider}/${entry.modelId}`;
+      }
+      return entry.modelId ?? "";
+    case "thinking_level_change":
+      return entry.thinkingLevel ?? "";
+    case "label":
+      return `${entry.label ?? "(cleared)"}${entry.targetId ? ` → ${entry.targetId}` : ""}`;
+    case "custom":
+      if (typeof entry.customType === "string" && entry.customType.length > 0) {
+        return entry.customType;
+      }
+      if (entry.data !== undefined) {
+        try {
+          if (typeof entry.data === "string") {
+            return entry.data;
+          }
+          // Safe JSON stringify with circular reference detection
+          const seen = new WeakSet();
+          const serialized = JSON.stringify(entry.data, (_key, value) => {
+            if (typeof value === "object" && value !== null) {
+              if (seen.has(value)) {
+                return "[Circular]";
+              }
+              seen.add(value);
+            }
+            return value;
+          });
+          return serialized;
+        } catch {
+          return "[unserializable]";
+        }
+      }
+      return "";
+    case "session_info":
+      return entry.name ?? "";
+    default:
+      return "";
+  }
+}
+
+function extractMessageBody(message: Record<string, any> | undefined): string {
+  if (!message) return "";
+
+  const fromContent = extractContentBlocks(message.content);
+  if (fromContent) return fromContent;
+
+  if (typeof message.text === "string") {
+    return message.text;
+  }
+
+  if (typeof message.output === "string") {
+    return message.output;
+  }
+
+  if (typeof message.command === "string") {
+    return message.command;
+  }
+
+  if (typeof message.summary === "string") {
+    return message.summary;
+  }
+
+  return "";
+}
+
+function extractContentBlocks(content: unknown): string {
+  if (!content) return "";
+  if (typeof content === "string") return content;
+
+  if (Array.isArray(content)) {
+    let result = "";
+    for (const block of content) {
+      if (typeof block === "string") {
+        result += block;
+        continue;
+      }
+      if (!block || typeof block !== "object") continue;
+      if (typeof (block as any).text === "string") {
+        result += (block as any).text;
+      } else if (typeof (block as any).thinking === "string") {
+        result += (block as any).thinking;
+      } else if (typeof (block as any).content === "string") {
+        result += (block as any).content;
+      }
+    }
+    return result;
+  }
+
+  return "";
+}
+
+function formatCompactionTokens(tokensBefore?: number): string {
+  if (typeof tokensBefore !== "number" || !Number.isFinite(tokensBefore)) {
+    return "";
+  }
+  if (tokensBefore >= 1000) {
+    return `${Math.round(tokensBefore / 1000)}k tokens`;
+  }
+  return `${tokensBefore} tokens`;
+}
+
+function normalizePreview(text: string): string {
+  if (!text) return "";
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  if (!collapsed) return "";
+  if (collapsed.length <= MAX_TREE_PREVIEW_LENGTH) {
+    return collapsed;
+  }
+  return `${collapsed.slice(0, MAX_TREE_PREVIEW_LENGTH)}…`;
+}
 
 // =============================================================================
 // HANDLER IMPLEMENTATIONS
@@ -240,6 +455,33 @@ const handleGetForkMessages: CommandHandler = (session, command) => {
   };
 };
 
+const handleGetTree: CommandHandler = (session, command) => {
+  try {
+    const tree = session.sessionManager.getTree() as unknown as SessionTreeNodeLike[];
+    const nodes = serializeSessionTreeNodes(tree);
+    const currentLeafId = session.sessionManager.getLeafId();
+    return {
+      id: command.id,
+      type: "response",
+      command: "get_tree",
+      success: true,
+      data: {
+        currentLeafId: currentLeafId ?? null,
+        nodes,
+      },
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    return {
+      id: command.id,
+      type: "response",
+      command: "get_tree",
+      success: false,
+      error: `Failed to serialize session tree: ${message}`,
+    };
+  }
+};
+
 const handleNavigateTree: CommandHandler = async (session, command) => {
   const result = await session.navigateTree(command.targetId, command.options);
   return {
@@ -436,6 +678,7 @@ export const sessionCommandHandlers: Record<string, CommandHandler> = {
   switch_session_file: handleSwitchSessionFile,
   fork: handleFork,
   get_fork_messages: handleGetForkMessages,
+  get_tree: handleGetTree,
   navigate_tree: handleNavigateTree,
   get_last_assistant_text: handleGetLastAssistantText,
   get_context_usage: handleGetContextUsage,

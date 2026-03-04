@@ -93,6 +93,10 @@ describe("command-classification", () => {
       assert.strictEqual(isShortTimeoutCommand("get_fork_messages"), true);
     });
 
+    it("returns true for get_tree", () => {
+      assert.strictEqual(isShortTimeoutCommand("get_tree"), true);
+    });
+
     it("returns true for get_last_assistant_text", () => {
       assert.strictEqual(isShortTimeoutCommand("get_last_assistant_text"), true);
     });
@@ -156,6 +160,7 @@ describe("command-classification", () => {
       assert.strictEqual(isMutationCommand("get_session_stats"), false);
       assert.strictEqual(isMutationCommand("get_fork_messages"), false);
       assert.strictEqual(isMutationCommand("get_last_assistant_text"), false);
+      assert.strictEqual(isMutationCommand("get_tree"), false);
       assert.strictEqual(isMutationCommand("get_context_usage"), false);
       assert.strictEqual(isMutationCommand("switch_session"), false);
     });
@@ -185,6 +190,7 @@ describe("command-classification", () => {
       assert.strictEqual(isReadOnlyCommand("get_state"), true);
       assert.strictEqual(isReadOnlyCommand("get_messages"), true);
       assert.strictEqual(isReadOnlyCommand("switch_session"), true);
+      assert.strictEqual(isReadOnlyCommand("get_tree"), true);
     });
 
     it("returns false for mutating commands", () => {
@@ -207,6 +213,14 @@ describe("command-classification", () => {
       assert.strictEqual(classification.timeoutMs, 30000);
       assert.strictEqual(classification.isShortTimeout, true);
       assert.strictEqual(classification.isCancellable, true);
+      assert.strictEqual(classification.isMutation, false);
+      assert.strictEqual(classification.isReadOnly, true);
+    });
+
+    it("classifies get_tree as read-only", () => {
+      const classification = classifyCommand("get_tree");
+      assert.strictEqual(classification.timeoutMs, 30000);
+      assert.strictEqual(classification.isShortTimeout, true);
       assert.strictEqual(classification.isMutation, false);
       assert.strictEqual(classification.isReadOnly, true);
     });
