@@ -51,16 +51,14 @@ function stableJsonStringify(value: unknown, seen = new WeakSet<object>()): stri
       const entries = Object.entries(value)
         .filter(([, entryValue]) => {
           const entryType = typeof entryValue;
-          return (
-            entryValue !== undefined &&
-            entryType !== "function" &&
-            entryType !== "symbol"
-          );
+          return entryValue !== undefined && entryType !== "function" && entryType !== "symbol";
         })
         .sort(([left], [right]) => left.localeCompare(right));
 
       const serialized = `{${entries
-        .map(([key, entryValue]) => `${JSON.stringify(key)}:${stableJsonStringify(entryValue, seen)}`)
+        .map(
+          ([key, entryValue]) => `${JSON.stringify(key)}:${stableJsonStringify(entryValue, seen)}`
+        )
         .join(",")}}`;
 
       seen.delete(value);
