@@ -133,14 +133,18 @@ await session.bindExtensions({
 
 `createAgentSession()` loads extensions, skills, and prompts. Can take several seconds. Don't assume it's fast.
 
-### modelRegistry.getModel() is Internal API
+### modelRegistry.find() is the public lookup seam
 
 ```typescript
-// WRONG: Internal API, will break
+// AVOID: internal getModel()/type-casts
 session.setModel((session.modelRegistry as any).getModel(provider, modelId));
 
-// RIGHT: Use public API (if available) or document the risk
-// Currently no clean public API for this — needs investigation
+// PREFER: public lookup API
+const model = session.modelRegistry.find(provider, modelId);
+if (!model) {
+  throw new Error(`Model ${provider}/${modelId} not found`);
+}
+session.setModel(model);
 ```
 
 ### bindExtensions Required for Extension UI
@@ -1123,8 +1127,8 @@ cat /tmp/test.jsonl | timeout 5 node dist/server.js | jq .
 
 | Issue | Location | Status |
 |-------|----------|--------|
-| `set_model` uses internal API | command-router.ts:67 | Document risk, investigate public API |
-| Windows path handling | command-router.ts:175 | Use `path.basename()` |
+| ~~`set_model` uses internal API~~ | command-router.ts | **FIXED** - uses `session.modelRegistry.find()` public lookup |
+| ~~Windows path handling~~ | command-router.ts | **FIXED** - uses `path.basename()` |
 | ~~No input validation~~ | validation.ts | **FIXED** |
 | ~~No command timeout~~ | command-execution-engine.ts | **FIXED** |
 | ~~Extension UI not wired~~ | session-manager.ts | **FIXED** |
@@ -1194,6 +1198,8 @@ All stores have bounded memory:
 Validation happens in this order to prevent abuse:
 
 1. **Structural validation** — Field types, required fields, bounds (validation.ts)
+   - Keep this pure and cheap.
+   - Path-bearing commands that touch the filesystem (`load_session`, `switch_session_file`) MUST do runtime capability validation with `validateSessionFileAccess()` before calling upstream session APIs.
 2. **Replay check** — Free O(1) lookup, no rate limit charged
 3. **Rate limiting** — Only for NEW executions
 4. **Semantic validation** — Dependency existence, version checks (inside lane)
