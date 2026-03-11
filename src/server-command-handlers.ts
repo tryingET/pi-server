@@ -24,6 +24,8 @@ import type { RpcResponse, SessionInfo, StoredSessionInfo } from "./types.js";
  * Contains everything handlers need without direct SessionManager coupling.
  */
 export interface ServerCommandContext {
+  /** Authenticated principal associated with the current command, if any. */
+  principal?: string;
   /** Resolve sessions by ID */
   getSession: (sessionId: string) => AgentSession | undefined;
   /** Get session info (includes metadata) */

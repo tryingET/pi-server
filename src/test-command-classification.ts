@@ -10,6 +10,8 @@ import {
   isNoTimeoutCommand,
   isMutationCommand,
   isReadOnlyCommand,
+  getCommandExecutionPlane,
+  getRateLimitTarget,
   classifyCommand,
 } from "./command-classification.js";
 
@@ -204,6 +206,55 @@ describe("command-classification", () => {
   });
 
   // ==========================================================================
+  // EXECUTION PLANE / RATE LIMITING
+  // ==========================================================================
+
+  describe("getCommandExecutionPlane", () => {
+    it("classifies server lifecycle commands as control-plane", () => {
+      assert.strictEqual(getCommandExecutionPlane("create_session"), "control");
+      assert.strictEqual(getCommandExecutionPlane("delete_session"), "control");
+      assert.strictEqual(getCommandExecutionPlane("get_command_history"), "control");
+    });
+
+    it("classifies session work commands as data-plane", () => {
+      assert.strictEqual(getCommandExecutionPlane("prompt"), "data");
+      assert.strictEqual(getCommandExecutionPlane("get_state"), "data");
+      assert.strictEqual(getCommandExecutionPlane("extension_ui_response"), "data");
+    });
+  });
+
+  describe("getRateLimitTarget", () => {
+    it("uses dedicated control buckets for targeted control-plane commands", () => {
+      assert.deepStrictEqual(
+        getRateLimitTarget({ type: "delete_session", sessionId: "s1" } as any),
+        { plane: "control", key: "control:s1" }
+      );
+      assert.deepStrictEqual(
+        getRateLimitTarget({ type: "switch_session", sessionId: "s1" } as any),
+        { plane: "control", key: "control:s1" }
+      );
+    });
+
+    it("uses shared server control bucket for untargeted control-plane commands", () => {
+      assert.deepStrictEqual(getRateLimitTarget({ type: "list_sessions" } as any), {
+        plane: "control",
+        key: "_server_control_",
+      });
+      assert.deepStrictEqual(
+        getRateLimitTarget({ type: "load_session", sessionId: "future-id" } as any),
+        { plane: "control", key: "_server_control_" }
+      );
+    });
+
+    it("keeps session data-plane commands on per-session buckets", () => {
+      assert.deepStrictEqual(getRateLimitTarget({ type: "get_state", sessionId: "s1" } as any), {
+        plane: "data",
+        key: "s1",
+      });
+    });
+  });
+
+  // ==========================================================================
   // COMBINED CLASSIFICATION
   // ==========================================================================
 
@@ -215,6 +266,7 @@ describe("command-classification", () => {
       assert.strictEqual(classification.isCancellable, true);
       assert.strictEqual(classification.isMutation, false);
       assert.strictEqual(classification.isReadOnly, true);
+      assert.strictEqual(classification.executionPlane, "data");
     });
 
     it("classifies get_tree as read-only", () => {
@@ -241,6 +293,7 @@ describe("command-classification", () => {
       assert.strictEqual(classification.isCancellable, false);
       assert.strictEqual(classification.isMutation, true); // creates state
       assert.strictEqual(classification.isReadOnly, false);
+      assert.strictEqual(classification.executionPlane, "control");
     });
 
     it("respects custom options", () => {

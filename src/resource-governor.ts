@@ -11,6 +11,8 @@
  * Makes testing trivial (mock the governor).
  */
 
+import fs from "fs";
+import path from "path";
 import type { MetricsEmitter } from "./metrics-emitter.js";
 import { MetricNames } from "./metrics-types.js";
 
@@ -58,6 +60,7 @@ export const DEFAULT_CONFIG: ResourceGovernorConfig = {
 export interface GovernorMetrics {
   sessionCount: number;
   connectionCount: number;
+  pendingConnectionCount: number;
   totalCommandsExecuted: number;
   commandsRejected: {
     sessionLimit: number;
@@ -115,7 +118,7 @@ const CWD_MAX_LENGTH = 4096;
 const SESSION_ID_PATTERN = /^[a-zA-Z0-9_.-]+$/;
 
 /** Dangerous path patterns */
-const DANGEROUS_PATH_PATTERNS = [/\.\./, /^~/];
+const DANGEROUS_PATH_PATTERNS = [/\0/, /^~/];
 
 /**
  * Rate limit timestamp with generation marker.
@@ -143,6 +146,7 @@ interface RateLimitEntry {
 export class ResourceGovernor {
   private sessionCount = 0;
   private connectionCount = 0;
+  private pendingConnectionCount = 0;
   private commandTimestamps = new Map<string, RateLimitEntry[]>();
   private globalCommandTimestamps: RateLimitEntry[] = [];
   private extensionUIResponseTimestamps = new Map<string, RateLimitEntry[]>();
@@ -244,6 +248,31 @@ export class ResourceGovernor {
         return "CWD contains potentially dangerous path components";
       }
     }
+    if (!path.isAbsolute(cwd)) {
+      return "CWD must be an absolute path";
+    }
+
+    const resolved = path.resolve(cwd);
+    let canonicalPath = resolved;
+    try {
+      canonicalPath = fs.realpathSync.native(resolved);
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (err.code === "ENOENT") {
+        return "CWD must point to an existing directory";
+      }
+      return "CWD could not be resolved";
+    }
+
+    try {
+      const stats = fs.statSync(canonicalPath);
+      if (!stats.isDirectory()) {
+        return "CWD must point to an existing directory";
+      }
+    } catch {
+      return "CWD must point to an existing directory";
+    }
+
     return null;
   }
 
@@ -334,9 +363,10 @@ export class ResourceGovernor {
 
   /**
    * Check if a new connection can be accepted.
+   * @deprecated Use tryReserveConnectionSlot() for race-safe admission accounting.
    */
   canAcceptConnection(): GovernorResult {
-    if (this.connectionCount >= this.config.maxConnections) {
+    if (this.connectionCount + this.pendingConnectionCount >= this.config.maxConnections) {
       this.commandsRejected.connectionLimit++;
       return {
         allowed: false,
@@ -347,7 +377,55 @@ export class ResourceGovernor {
   }
 
   /**
+   * Atomically reserve a connection slot before authentication completes.
+   * Prevents slow/throwing auth flows from bypassing maxConnections.
+   */
+  tryReserveConnectionSlot(): GovernorResult {
+    if (this.connectionCount + this.pendingConnectionCount >= this.config.maxConnections) {
+      this.commandsRejected.connectionLimit++;
+      return {
+        allowed: false,
+        reason: `Connection limit reached (${this.config.maxConnections} connections)`,
+      };
+    }
+    this.pendingConnectionCount++;
+    return { allowed: true };
+  }
+
+  /**
+   * Promote a reserved connection slot to an active connection after auth succeeds.
+   */
+  activateReservedConnection(): void {
+    if (this.pendingConnectionCount > 0) {
+      this.pendingConnectionCount--;
+      this.connectionCount++;
+      return;
+    }
+
+    this.doubleUnregisterErrors++;
+    console.error(
+      "[ResourceGovernor] ERROR: activateReservedConnection called without pending reservation"
+    );
+    this.connectionCount++;
+  }
+
+  /**
+   * Release a reserved connection slot when auth fails or the client disconnects.
+   */
+  releaseReservedConnection(): void {
+    this.pendingConnectionCount--;
+    if (this.pendingConnectionCount < 0) {
+      this.doubleUnregisterErrors++;
+      this.pendingConnectionCount = 0;
+      console.error(
+        "[ResourceGovernor] ERROR: releaseReservedConnection called with no pending reservations"
+      );
+    }
+  }
+
+  /**
    * Register a new connection.
+   * @deprecated Prefer activateReservedConnection() after tryReserveConnectionSlot().
    */
   registerConnection(): void {
     this.connectionCount++;
@@ -369,10 +447,17 @@ export class ResourceGovernor {
   }
 
   /**
-   * Get current connection count.
+   * Get current active connection count.
    */
   getConnectionCount(): number {
     return this.connectionCount;
+  }
+
+  /**
+   * Get current pending-auth connection count.
+   */
+  getPendingConnectionCount(): number {
+    return this.pendingConnectionCount;
   }
 
   // ==========================================================================
@@ -523,8 +608,10 @@ export class ResourceGovernor {
   /**
    * Check if an extension_ui_response command can be executed for the given session.
    * This is a separate, more restrictive rate limit to prevent abuse of UI responses.
+   *
+   * @returns The generation marker for refund, or rejection result
    */
-  canExecuteExtensionUIResponse(sessionId: string): GovernorResult {
+  canExecuteExtensionUIResponse(sessionId: string): GovernorResult & { generation?: number } {
     const now = Date.now();
     const windowStart = now - RATE_WINDOW_MS;
 
@@ -548,7 +635,28 @@ export class ResourceGovernor {
     // Record this response with generation marker
     const generation = this.nextGeneration();
     entries.push({ timestamp: now, generation });
-    return { allowed: true };
+    return { allowed: true, generation };
+  }
+
+  /**
+   * Refund a previously counted extension_ui_response admission.
+   * Used when a command is rejected before execution begins.
+   */
+  refundExtensionUIResponse(sessionId: string, generation: number): void {
+    const entries = this.extensionUIResponseTimestamps.get(sessionId);
+    if (!entries) {
+      return;
+    }
+
+    const idx = entries.findIndex((entry) => entry.generation === generation);
+    if (idx === -1) {
+      return;
+    }
+
+    entries.splice(idx, 1);
+    if (entries.length === 0) {
+      this.extensionUIResponseTimestamps.delete(sessionId);
+    }
   }
 
   // ==========================================================================
@@ -630,6 +738,7 @@ export class ResourceGovernor {
     return {
       sessionCount: this.sessionCount,
       connectionCount: this.connectionCount,
+      pendingConnectionCount: this.pendingConnectionCount,
       totalCommandsExecuted: this.totalCommandsExecuted,
       commandsRejected: { ...this.commandsRejected },
       zombieSessionsDetected: this.zombieSessionsDetected,

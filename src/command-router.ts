@@ -13,6 +13,7 @@
 import path from "path";
 import { type AgentSession, SessionManager } from "@mariozechner/pi-coding-agent";
 import type { RpcResponse, SessionInfo, SessionTreeNodePayload } from "./types.js";
+import { validateSessionFileAccess } from "./validation.js";
 
 // =============================================================================
 // HANDLER TYPE
@@ -426,6 +427,21 @@ const handleNewSession: CommandHandler = async (session, command) => {
 };
 
 const handleSwitchSessionFile: CommandHandler = async (session, command) => {
+  const sessionPathError = validateSessionFileAccess(command.sessionPath, {
+    cwd: process.cwd(),
+    requireExistingFile: true,
+    requireSessionHeader: true,
+  });
+  if (sessionPathError) {
+    return {
+      id: command.id,
+      type: "response",
+      command: "switch_session_file",
+      success: false,
+      error: sessionPathError,
+    };
+  }
+
   const cancelled = !(await session.switchSession(command.sessionPath));
   return {
     id: command.id,
@@ -443,7 +459,11 @@ const handleFork: CommandHandler = async (session, command) => {
     type: "response",
     command: "fork",
     success: true,
-    data: { text: result.selectedText, cancelled: result.cancelled },
+    data: {
+      sessionId: session.sessionId,
+      text: result.selectedText,
+      cancelled: result.cancelled,
+    },
   };
 };
 

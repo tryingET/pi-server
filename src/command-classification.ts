@@ -8,7 +8,10 @@
  * Classification dimensions:
  * - Timeout policy: short (30s), long (5min), or none (uncancellable)
  * - Mutation: does the command change session state?
+ * - Execution plane: control-plane vs data-plane admission/rate limiting
  */
+
+import type { RpcCommand } from "./types.js";
 
 // =============================================================================
 // TIMEOUT CLASSIFICATION
@@ -112,6 +115,28 @@ const SPECIAL_SESSION_COMMANDS = new Set([
 ]);
 
 /**
+ * Commands that operate on server/session registry control surfaces rather than
+ * consuming a session's data-plane work budget.
+ */
+const CONTROL_PLANE_COMMANDS = new Set([
+  "list_sessions",
+  "create_session",
+  "delete_session",
+  "switch_session",
+  "get_metrics",
+  "health_check",
+  "get_startup_recovery",
+  "get_command_history",
+  "list_stored_sessions",
+  "load_session",
+]);
+
+/** Commands that target a specific session but should use a dedicated control bucket. */
+const TARGETED_CONTROL_PLANE_COMMANDS = new Set(["delete_session", "switch_session"]);
+
+export type CommandExecutionPlane = "control" | "data";
+
+/**
  * Check if a command type mutates session state.
  * Mutating commands advance the session version.
  */
@@ -126,6 +151,53 @@ export function isMutationCommand(commandType: string): boolean {
  */
 export function isReadOnlyCommand(commandType: string): boolean {
   return READ_ONLY_COMMANDS.has(commandType);
+}
+
+/**
+ * Resolve whether a command belongs to the control plane or data plane.
+ *
+ * Why this matters:
+ * - control-plane operations (create/delete/switch/metrics/history) must remain
+ *   operable even when a session's data-plane traffic is saturated
+ * - data-plane operations should still be isolated per session
+ */
+export function getCommandExecutionPlane(commandType: string): CommandExecutionPlane {
+  return CONTROL_PLANE_COMMANDS.has(commandType) ? "control" : "data";
+}
+
+export interface RateLimitTarget {
+  plane: CommandExecutionPlane;
+  key: string;
+}
+
+/**
+ * Get the rate-limit bucket key for a command.
+ *
+ * Control-plane commands use dedicated buckets so runaway session traffic does
+ * not block cleanup/inspection commands like delete_session.
+ */
+export function getRateLimitTarget(
+  command: Pick<RpcCommand, "type"> & { sessionId?: string }
+): RateLimitTarget {
+  const plane = getCommandExecutionPlane(command.type);
+  if (plane === "data") {
+    return {
+      plane,
+      key: command.sessionId ?? "_server_data_",
+    };
+  }
+
+  if (command.sessionId && TARGETED_CONTROL_PLANE_COMMANDS.has(command.type)) {
+    return {
+      plane,
+      key: `control:${command.sessionId}`,
+    };
+  }
+
+  return {
+    plane,
+    key: "_server_control_",
+  };
 }
 
 // =============================================================================
@@ -146,6 +218,8 @@ export interface CommandClassification {
   isMutation: boolean;
   /** Whether this command is read-only */
   isReadOnly: boolean;
+  /** Whether this command is control-plane or data-plane */
+  executionPlane: CommandExecutionPlane;
 }
 
 /**
@@ -165,5 +239,6 @@ export function classifyCommand(
     isCancellable: timeoutMs !== null,
     isMutation: isMutationCommand(commandType),
     isReadOnly: isReadOnlyCommand(commandType),
+    executionPlane: getCommandExecutionPlane(commandType),
   };
 }

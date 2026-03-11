@@ -34,6 +34,20 @@ const DANGEROUS_PATH_PATTERNS = [/\.\./, /^~/, /\0/];
 /** Maximum path length to prevent abuse. */
 const MAX_PATH_LENGTH = 4096;
 
+/** Maximum bytes to inspect when probing an on-disk session file. */
+const SESSION_FILE_PROBE_BYTES = 64 * 1024;
+
+export interface SessionFileAccessOptions {
+  /** Explicitly allowed root directories for session files. */
+  allowedDirs?: string[];
+  /** Base working directory used to derive default project-local roots. */
+  cwd?: string;
+  /** Require the target path to already exist on disk. */
+  requireExistingFile?: boolean;
+  /** Require the target file to look like a session file header. */
+  requireSessionHeader?: boolean;
+}
+
 function hasControlCharacters(value: string): boolean {
   for (let i = 0; i < value.length; i++) {
     const code = value.charCodeAt(i);
@@ -61,6 +75,118 @@ function resolveCanonicalPath(candidatePath: string): string {
       return path.join(realDir, base);
     } catch {
       return resolved;
+    }
+  }
+}
+
+function isPathWithin(candidatePath: string, parentPath: string): boolean {
+  return candidatePath === parentPath || candidatePath.startsWith(parentPath + path.sep);
+}
+
+/**
+ * Derive default allowed session roots for the active server process.
+ *
+ * This keeps project-local access anchored to the current working tree rather
+ * than accepting any absolute path that merely contains `/.pi/sessions/`.
+ */
+export function getDefaultAllowedSessionDirectories(cwd = process.cwd()): string[] {
+  const dirs = new Set<string>();
+
+  const home = process.env.HOME ?? "";
+  if (home) {
+    dirs.add(resolveCanonicalPath(path.join(home, ".pi", "agent", "sessions")));
+  }
+
+  const resolvedCwd = resolveCanonicalPath(cwd);
+  const resolvedHome = home ? resolveCanonicalPath(home) : null;
+  const stopAtHome = resolvedHome ? isPathWithin(resolvedCwd, resolvedHome) : false;
+
+  let current = resolvedCwd;
+  while (true) {
+    dirs.add(resolveCanonicalPath(path.join(current, ".pi", "sessions")));
+
+    if (stopAtHome && resolvedHome && current === resolvedHome) {
+      break;
+    }
+
+    const parent = path.dirname(current);
+    if (parent === current) {
+      break;
+    }
+    current = parent;
+  }
+
+  return Array.from(dirs);
+}
+
+function looksLikeSessionHeader(header: Record<string, unknown> | null): boolean {
+  return (
+    header?.type === "session" &&
+    typeof header.version === "number" &&
+    Number.isFinite(header.version) &&
+    typeof header.cwd === "string"
+  );
+}
+
+function readSessionFileProbeSync(candidatePath: string): Record<string, unknown> | null {
+  let fd: number | undefined;
+
+  try {
+    const stats = fs.statSync(candidatePath);
+    if (!stats.isFile()) {
+      return null;
+    }
+
+    const bytesToRead = Math.min(stats.size, SESSION_FILE_PROBE_BYTES);
+    if (bytesToRead <= 0) {
+      return null;
+    }
+
+    fd = fs.openSync(candidatePath, "r");
+    const buffer = Buffer.alloc(bytesToRead);
+    const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, 0);
+    if (bytesRead <= 0) {
+      return null;
+    }
+
+    const chunk = buffer.toString("utf8", 0, bytesRead).trim();
+    if (!chunk) {
+      return null;
+    }
+
+    const firstLine = chunk.split(/\r?\n/, 1)[0]?.trim();
+    if (firstLine) {
+      try {
+        const parsed = JSON.parse(firstLine);
+        return typeof parsed === "object" && parsed !== null
+          ? (parsed as Record<string, unknown>)
+          : null;
+      } catch {
+        // Fall through to whole-chunk parsing for compact/small JSON session files.
+      }
+    }
+
+    if (stats.size <= SESSION_FILE_PROBE_BYTES) {
+      try {
+        const parsed = JSON.parse(chunk);
+        return typeof parsed === "object" && parsed !== null
+          ? (parsed as Record<string, unknown>)
+          : null;
+      } catch {
+        return null;
+      }
+    }
+
+    return null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Ignore close errors
+      }
     }
   }
 }
@@ -112,10 +238,6 @@ export function validateSessionPath(sessionPath: string, allowedDirs?: string[])
   }
   const canonicalPath = resolveCanonicalPath(resolvedPath);
 
-  // Default allowed directories
-  const home = process.env.HOME ?? "";
-  const defaultAllowedDirs = [path.join(home, ".pi", "agent", "sessions")];
-
   // Check if path ends with .jsonl/.json (session file extension)
   // Validate both resolved and canonical forms to avoid extension-smuggling through symlinks.
   const hasAllowedExtension = (value: string) =>
@@ -124,30 +246,60 @@ export function validateSessionPath(sessionPath: string, allowedDirs?: string[])
     return "sessionPath must point to a .jsonl or .json session file";
   }
 
-  // Use provided allowed dirs or defaults
-  const dirsToCheck = allowedDirs ?? defaultAllowedDirs;
+  // Use provided allowed dirs or derived defaults.
+  const dirsToCheck = allowedDirs ?? getDefaultAllowedSessionDirectories();
 
-  // Check if canonical path is under an allowed directory
+  // Check if canonical path is under an allowed directory.
   for (const allowedDir of dirsToCheck) {
     const canonicalAllowed = resolveCanonicalPath(allowedDir);
-    if (
-      canonicalPath.startsWith(canonicalAllowed + path.sep) ||
-      canonicalPath === canonicalAllowed
-    ) {
-      return null; // Valid path
+    if (isPathWithin(canonicalPath, canonicalAllowed)) {
+      return null;
     }
   }
 
-  // Also allow any .pi/sessions directory (project-local)
-  const pathParts = canonicalPath.split(path.sep);
-  const piSessionsIndex = pathParts.findIndex(
-    (part, i) => part === ".pi" && pathParts[i + 1] === "sessions"
+  return "sessionPath must be under an allowed session directory for this server (e.g. ~/.pi/agent/sessions/ or this project's .pi/sessions/)";
+}
+
+/**
+ * Validate a session file path for commands that switch/load an on-disk session.
+ * This is stricter than validateSessionPath(): it can require the file to exist
+ * already and to look like a real session file header.
+ */
+export function validateSessionFileAccess(
+  sessionPath: string,
+  options: SessionFileAccessOptions = {}
+): string | null {
+  const pathError = validateSessionPath(
+    sessionPath,
+    options.allowedDirs ?? getDefaultAllowedSessionDirectories(options.cwd)
   );
-  if (piSessionsIndex !== -1) {
-    return null; // Valid project-local path
+  if (pathError) {
+    return pathError;
   }
 
-  return `sessionPath must be under an allowed session directory (e.g., ~/.pi/agent/sessions/ or .pi/sessions/)`;
+  const canonicalPath = resolveCanonicalPath(path.resolve(sessionPath));
+  const requireExistingFile = options.requireExistingFile ?? true;
+  const requireSessionHeader = options.requireSessionHeader ?? true;
+
+  if (requireExistingFile) {
+    try {
+      const stats = fs.statSync(canonicalPath);
+      if (!stats.isFile()) {
+        return "sessionPath must point to an existing session file";
+      }
+    } catch {
+      return "sessionPath must point to an existing session file";
+    }
+  }
+
+  if (requireSessionHeader) {
+    const header = readSessionFileProbeSync(canonicalPath);
+    if (!looksLikeSessionHeader(header)) {
+      return "sessionPath must point to an existing session file";
+    }
+  }
+
+  return null;
 }
 
 /**

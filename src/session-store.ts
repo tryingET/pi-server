@@ -125,6 +125,7 @@ export class SessionStore {
   private metadataCache: Map<string, StoredSessionMetadata> | null = null;
   private lastLoadTime = 0;
   private cachedMetadataMtimeMs: number | null = null;
+  private cachedMetadataCtimeMs: number | null = null;
   private cachedMetadataSize: number | null = null;
   private cachedMetadataMissing = true;
   /** Cache TTL in ms (5 seconds) */
@@ -169,6 +170,7 @@ export class SessionStore {
         if (
           !this.cachedMetadataMissing &&
           this.cachedMetadataMtimeMs === stat.mtimeMs &&
+          this.cachedMetadataCtimeMs === stat.ctimeMs &&
           this.cachedMetadataSize === stat.size
         ) {
           return this.metadataCache;
@@ -203,6 +205,7 @@ export class SessionStore {
         this.metadataCache = new Map();
         this.lastLoadTime = now;
         this.cachedMetadataMtimeMs = null;
+        this.cachedMetadataCtimeMs = null;
         this.cachedMetadataSize = null;
         this.cachedMetadataMissing = true;
         return this.metadataCache;
@@ -240,6 +243,7 @@ export class SessionStore {
       this.metadataCache = map;
       this.lastLoadTime = now;
       this.cachedMetadataMtimeMs = stat.mtimeMs;
+      this.cachedMetadataCtimeMs = stat.ctimeMs;
       this.cachedMetadataSize = stat.size;
       this.cachedMetadataMissing = false;
       return map;
@@ -249,6 +253,7 @@ export class SessionStore {
         this.metadataCache = new Map();
         this.lastLoadTime = now;
         this.cachedMetadataMtimeMs = null;
+        this.cachedMetadataCtimeMs = null;
         this.cachedMetadataSize = null;
         this.cachedMetadataMissing = true;
         return this.metadataCache;
@@ -259,6 +264,7 @@ export class SessionStore {
       this.metadataCache = new Map();
       this.lastLoadTime = now;
       this.cachedMetadataMtimeMs = null;
+      this.cachedMetadataCtimeMs = null;
       this.cachedMetadataSize = null;
       this.cachedMetadataMissing = false;
       return this.metadataCache;
@@ -305,10 +311,12 @@ export class SessionStore {
     try {
       const stat = await fs.stat(this.metadataPath);
       this.cachedMetadataMtimeMs = stat.mtimeMs;
+      this.cachedMetadataCtimeMs = stat.ctimeMs;
       this.cachedMetadataSize = stat.size;
       this.cachedMetadataMissing = false;
     } catch {
       this.cachedMetadataMtimeMs = null;
+      this.cachedMetadataCtimeMs = null;
       this.cachedMetadataSize = null;
       this.cachedMetadataMissing = false;
     }
@@ -451,6 +459,7 @@ export class SessionStore {
     this.metadataCache = null;
     this.lastLoadTime = 0;
     this.cachedMetadataMtimeMs = null;
+    this.cachedMetadataCtimeMs = null;
     this.cachedMetadataSize = null;
     this.cachedMetadataMissing = true;
   }
@@ -581,10 +590,7 @@ export class SessionStore {
           continue;
         }
 
-        if (
-          entry.isFile() &&
-          (entry.name.endsWith(".jsonl") || entry.name.endsWith(".json"))
-        ) {
+        if (entry.isFile() && (entry.name.endsWith(".jsonl") || entry.name.endsWith(".json"))) {
           files.push(fullPath);
         }
       }
@@ -646,9 +652,7 @@ export class SessionStore {
    * Read the first line of a session file to get metadata.
    * Uses readline to properly handle UTF-8 and avoid truncation issues.
    */
-  async readSessionFileMetadata(
-    filePath: string
-  ): Promise<{ cwd: string; sessionName?: string }> {
+  async readSessionFileMetadata(filePath: string): Promise<{ cwd: string; sessionName?: string }> {
     const readline = await import("readline");
     const fileStream = fsRegular.createReadStream(filePath, { encoding: "utf-8" });
     let rl: ReturnType<typeof readline.createInterface> | undefined;
@@ -669,10 +673,19 @@ export class SessionStore {
         return { cwd: "/unknown" };
       }
 
-      const meta = JSON.parse(firstLine);
+      const meta = JSON.parse(firstLine) as {
+        cwd?: unknown;
+        sessionName?: unknown;
+        name?: unknown;
+      };
       return {
-        cwd: meta.cwd || "/unknown",
-        sessionName: meta.sessionName || meta.name || undefined,
+        cwd: typeof meta.cwd === "string" && meta.cwd.length > 0 ? meta.cwd : "/unknown",
+        sessionName:
+          typeof meta.sessionName === "string"
+            ? meta.sessionName
+            : typeof meta.name === "string"
+              ? meta.name
+              : undefined,
       };
     } catch {
       return { cwd: "/unknown" };

@@ -75,7 +75,9 @@ Important:
 
 - ordering is deterministic **within a lane**
 - no global total ordering across different lanes
-- replay responses emit `accepted -> finished` (no `started`)
+- newly admitted executions emit `accepted -> started? -> finished`
+- replay responses emit `finished` only (`replayed: true`)
+- requests rejected before admission emit no `accepted` / `started`
 
 ---
 

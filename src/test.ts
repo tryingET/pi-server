@@ -11,7 +11,15 @@
 
 import assert from "assert";
 import { spawn } from "child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "fs";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
@@ -1174,16 +1182,24 @@ async function testResourceGovernor() {
   // Test: CWD validation
   await test("governor: validates CWD paths", () => {
     const governor = new ResourceGovernor();
+    const validDir = mkdtempSync(join(tmpdir(), "pi-governor-cwd-"));
+    const filePath = join(validDir, "not-a-dir.txt");
+    writeFileSync(filePath, "x");
 
-    // Valid paths (absolute and relative)
-    assert.strictEqual(governor.validateCwd("/absolute/path"), null);
-    assert.strictEqual(governor.validateCwd("relative/path"), null);
+    try {
+      // Valid path (existing absolute directory)
+      assert.strictEqual(governor.validateCwd(validDir), null);
 
-    // Invalid paths
-    assert(governor.validateCwd("../../../etc")?.includes("dangerous"));
-    assert(governor.validateCwd("~/home")?.includes("dangerous"));
-    assert(governor.validateCwd("")?.includes("non-empty"));
-    assert(governor.validateCwd(null as any)?.includes("non-empty"));
+      // Invalid paths
+      assert(governor.validateCwd("relative/path")?.includes("absolute path"));
+      assert(governor.validateCwd("~/home")?.includes("dangerous"));
+      assert(governor.validateCwd(join(validDir, "missing"))?.includes("existing directory"));
+      assert(governor.validateCwd(filePath)?.includes("existing directory"));
+      assert(governor.validateCwd("")?.includes("non-empty"));
+      assert(governor.validateCwd(null as any)?.includes("non-empty"));
+    } finally {
+      rmSync(validDir, { recursive: true, force: true });
+    }
   });
 
   await test("governor: rejects overly long CWD", () => {
@@ -2382,7 +2398,7 @@ async function testSessionManager() {
     }
   });
 
-  await test("session-manager: emits command_finished for admitted rate-limited commands", async () => {
+  await test("session-manager: rate-limited commands do not emit command_accepted", async () => {
     const governor = new ResourceGovernor({
       ...DEFAULT_CONFIG,
       maxCommandsPerMinute: 1,
@@ -2415,15 +2431,70 @@ async function testSessionManager() {
     const accepted = events.find(
       (e) => e.type === "command_accepted" && e.data?.commandId === "rl-lifecycle-2"
     );
+    const started = events.find(
+      (e) => e.type === "command_started" && e.data?.commandId === "rl-lifecycle-2"
+    );
     const finished = events.find(
       (e) => e.type === "command_finished" && e.data?.commandId === "rl-lifecycle-2"
     );
 
-    assert.ok(accepted, "Expected command_accepted event for rate-limited command");
+    assert.strictEqual(accepted, undefined, "Rejected command must not emit command_accepted");
+    assert.strictEqual(started, undefined, "Rejected command must not emit command_started");
     assert.ok(finished, "Expected command_finished event for rate-limited command");
     assert.strictEqual(finished.data.success, false, "Finished event should report failure");
 
     localManager.removeSubscriber(subscriber);
+  });
+
+  await test("session-manager: delete_session uses control-plane rate limit bucket", async () => {
+    const governor = new ResourceGovernor({
+      ...DEFAULT_CONFIG,
+      maxCommandsPerMinute: 1,
+      maxGlobalCommandsPerMinute: 100,
+    });
+    const localManager = new PiSessionManager(governor);
+
+    const fakeSession = {
+      bindExtensions: async () => {},
+      subscribe: () => () => {},
+      dispose: () => {
+        (fakeSession as any).disposed = true;
+      },
+      sessionFile: join(tmpdir(), `control-delete-${Date.now()}.jsonl`),
+      model: { id: "fake-model" },
+      thinkingLevel: "medium",
+      isStreaming: false,
+      messages: [],
+      sessionName: "control-delete",
+    };
+    (localManager as any).createAgentSessionWithSanitizedNpmEnv = async () => ({
+      session: fakeSession,
+    });
+
+    await localManager.createSession("control-delete");
+
+    const first = await localManager.executeCommand({
+      id: "control-delete-state-1",
+      type: "get_state",
+      sessionId: "control-delete",
+    } as any);
+    assert.strictEqual(first.success, true);
+
+    const second = await localManager.executeCommand({
+      id: "control-delete-state-2",
+      type: "get_state",
+      sessionId: "control-delete",
+    } as any);
+    assert.strictEqual(second.success, false);
+    assert(second.error?.includes("Rate limit"));
+
+    const deleted = await localManager.executeCommand({
+      id: "control-delete-now",
+      type: "delete_session",
+      sessionId: "control-delete",
+    } as any);
+    assert.strictEqual(deleted.success, true, deleted.error);
+    assert.strictEqual(localManager.getSession("control-delete"), undefined);
   });
 
   await test("session-manager: create_session ignores npm_config_prefix leakage", async () => {
@@ -2572,6 +2643,58 @@ async function testSessionManager() {
     }
   });
 
+  await test("session-manager: load_session uses source session cwd for runtime creation", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "pi-load-runtime-cwd-"));
+    const localManager = new PiSessionManager();
+    (localManager as any).sessionStore = new SessionStore({
+      dataDir,
+      sessionsDir: dataDir,
+      serverVersion: "test",
+    });
+
+    const sourceCwd = join(tmpdir(), "pi-loaded-runtime-origin");
+    const sessionPath = join(
+      process.cwd(),
+      ".pi",
+      "sessions",
+      `load-runtime-cwd-${Date.now()}.jsonl`
+    );
+    mkdirSync(join(process.cwd(), ".pi", "sessions"), { recursive: true });
+    writeFileSync(
+      sessionPath,
+      JSON.stringify({ type: "session", version: 3, cwd: sourceCwd }) + "\n"
+    );
+
+    let capturedCwd: string | undefined;
+    const fakeSession = {
+      bindExtensions: async () => {},
+      subscribe: () => () => {},
+      dispose: () => {},
+      switchSession: async () => true,
+      sessionFile: sessionPath,
+      model: { id: "fake-model" },
+      thinkingLevel: "medium",
+      isStreaming: false,
+      messages: [],
+      sessionName: "runtime-cwd",
+    };
+    (localManager as any).createAgentSessionWithSanitizedNpmEnv = async (options: {
+      cwd?: string;
+    }) => {
+      capturedCwd = options.cwd;
+      return { session: fakeSession };
+    };
+
+    try {
+      const response = await localManager.loadSession("runtime-cwd", sessionPath);
+      assert.strictEqual(response.sessionId, "runtime-cwd");
+      assert.strictEqual(capturedCwd, sourceCwd);
+    } finally {
+      rmSync(sessionPath, { force: true });
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   await test("session-manager: create_session rolls back runtime state on metadata failure", async () => {
     const dataDir = mkdtempSync(join(tmpdir(), "pi-create-rollback-"));
     const localManager = new PiSessionManager();
@@ -2647,7 +2770,10 @@ async function testSessionManager() {
     };
 
     try {
-      await assert.rejects(() => localManager.loadSession("rollback-load", sessionPath), /disk full/);
+      await assert.rejects(
+        () => localManager.loadSession("rollback-load", sessionPath),
+        /disk full/
+      );
       assert.strictEqual(localManager.getSession("rollback-load"), undefined);
       assert.strictEqual(localManager.getGovernor().getSessionCount(), 0);
       assert.strictEqual((fakeSession as any).disposed, true);
@@ -2689,8 +2815,54 @@ async function testSessionManager() {
     };
 
     await assert.rejects(() => localManager.deleteSession("delete-rollback"), /disk full/);
-    assert.ok(localManager.getSession("delete-rollback"), "Session should remain live after failure");
+    assert.ok(
+      localManager.getSession("delete-rollback"),
+      "Session should remain live after failure"
+    );
     assert.strictEqual((fakeSession as any).disposed, undefined);
+
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  await test("session-manager: delete_session surfaces runtime cleanup failures", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "pi-delete-runtime-fail-"));
+    const localManager = new PiSessionManager();
+    (localManager as any).sessionStore = new SessionStore({
+      dataDir,
+      sessionsDir: dataDir,
+      serverVersion: "test",
+    });
+
+    const fakeSession = {
+      bindExtensions: async () => {},
+      subscribe: () => () => {
+        throw new Error("unsubscribe boom");
+      },
+      dispose: () => {
+        throw new Error("dispose boom");
+      },
+      sessionFile: join(dataDir, "persist.jsonl"),
+      model: { id: "fake-model" },
+      thinkingLevel: "medium",
+      isStreaming: false,
+      messages: [],
+      sessionName: "delete-runtime-fail",
+    };
+    (localManager as any).createAgentSessionWithSanitizedNpmEnv = async () => ({
+      session: fakeSession,
+    });
+
+    await localManager.createSession("delete-runtime-fail");
+
+    const response = await localManager.executeCommand({
+      id: "delete-runtime-fail-1",
+      type: "delete_session",
+      sessionId: "delete-runtime-fail",
+    } as any);
+
+    assert.strictEqual(response.success, false);
+    assert.ok(response.error?.includes("runtime cleanup failed"));
+    assert.strictEqual(localManager.getSession("delete-runtime-fail"), undefined);
 
     rmSync(dataDir, { recursive: true, force: true });
   });
@@ -3416,6 +3588,57 @@ async function testSessionManager() {
     }
   });
 
+  await test("session-manager: fail_closed append failures remain deterministic across restart", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-fail-closed-restart-"));
+    const originalConsoleError = console.error;
+
+    try {
+      console.error = () => {};
+
+      const firstBoot = new PiSessionManager(undefined, {
+        durableJournal: {
+          enabled: true,
+          dataDir: journalDir,
+          appendFailurePolicy: "fail_closed",
+          redaction: {
+            beforePersist: (entry) => {
+              if (entry.phase === "command_finished") {
+                throw new Error("restart-finished-failure");
+              }
+              return entry;
+            },
+          },
+        },
+      });
+      await firstBoot.initialize();
+
+      const firstResponse = await firstBoot.executeCommand({
+        id: "fail-closed-restart-1",
+        type: "list_sessions",
+      } as any);
+      assert.strictEqual(firstResponse.success, false);
+      firstBoot.disposeAllSessions();
+
+      const secondBoot = new PiSessionManager(undefined, {
+        durableJournal: { enabled: true, dataDir: journalDir },
+      });
+      await secondBoot.initialize();
+
+      const secondResponse = await secondBoot.executeCommand({
+        id: "fail-closed-restart-1",
+        type: "list_sessions",
+      } as any);
+      assert.strictEqual(secondResponse.success, false);
+      assert.strictEqual(secondResponse.replayed, true);
+      assert.strictEqual(secondResponse.error, firstResponse.error);
+
+      secondBoot.disposeAllSessions();
+    } finally {
+      console.error = originalConsoleError;
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
   await test("command-journal: beforePersist rejects replay-critical response removal", async () => {
     const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-redaction-invariant-"));
 
@@ -3764,6 +3987,24 @@ async function testSessionManager() {
     }
   });
 
+  await test("command-journal: initialization failure releases writer lock", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-lock-release-"));
+    const journalPath = join(journalDir, "command-journal.jsonl");
+    mkdirSync(journalPath, { recursive: true });
+
+    try {
+      const journal = new DurableCommandJournal({ enabled: true, filePath: journalPath });
+      await assert.rejects(() => journal.initialize(), /EISDIR|illegal operation on a directory/);
+      assert.strictEqual(
+        existsSync(`${journalPath}.lock`),
+        false,
+        "Init failure must release the journal lock"
+      );
+    } finally {
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
   await test("session-manager: get_startup_recovery caps large recovery lists", async () => {
     const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-recovery-cap-"));
 
@@ -3855,6 +4096,50 @@ async function testSessionManager() {
     }
   });
 
+  await test("session-store: discovery sanitizes malformed session header fields", async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), "pi-session-store-malformed-header-"));
+    const projectDir = join(baseDir, "project");
+    const homeDir = join(baseDir, "home");
+    const dataDir = join(baseDir, "data");
+    const sessionsDir = join(baseDir, "global-sessions");
+    const projectSessionsDir = join(projectDir, ".pi", "sessions");
+    const sessionPath = join(projectSessionsDir, `malformed-${Date.now()}.jsonl`);
+    const previousHome = process.env.HOME;
+    const previousCwd = process.cwd();
+
+    try {
+      mkdirSync(projectSessionsDir, { recursive: true });
+      mkdirSync(homeDir, { recursive: true });
+      writeFileSync(
+        sessionPath,
+        JSON.stringify({
+          type: "session",
+          version: 3,
+          cwd: { bad: true },
+          sessionName: { nope: true },
+        }) + "\n"
+      );
+
+      process.env.HOME = homeDir;
+      process.chdir(projectDir);
+
+      const store = new SessionStore({ dataDir, sessionsDir, serverVersion: "test" });
+      const grouped = await store.listSessionsGrouped();
+      assert.strictEqual(grouped.length, 1);
+      assert.strictEqual(grouped[0]?.cwd, "/unknown");
+      assert.strictEqual(grouped[0]?.displayPath, "/unknown");
+      assert.strictEqual(grouped[0]?.sessions[0]?.sessionName, undefined);
+    } finally {
+      process.chdir(previousCwd);
+      if (previousHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = previousHome;
+      }
+      rmSync(baseDir, { recursive: true, force: true });
+    }
+  });
+
   // Test: create_session persists metadata (ADR-0007)
   await test("session-manager: create_session persists metadata", async () => {
     const manager = new PiSessionManager();
@@ -3913,6 +4198,14 @@ async function testSessionManager() {
     // Verify sessions are gone
     const listAfter = await manager.executeCommand({ type: "list_sessions" });
     assert.strictEqual((listAfter as any).data.sessions.length, 0, "Should have 0 sessions");
+    assert.strictEqual(manager.getGovernor().getSessionCount(), 0, "Governor count must reset");
+
+    const recreated = await manager.executeCommand({
+      type: "create_session",
+      sessionId: "dispose3",
+    });
+    assert.strictEqual(recreated.success, true, recreated.error);
+    await manager.executeCommand({ type: "delete_session", sessionId: "dispose3" });
   });
 
   await test("session-store: failed save does not mutate cached metadata", async () => {
@@ -3942,9 +4235,7 @@ async function testSessionManager() {
         /disk full/
       );
 
-      const cachedSessionIds = (await store.list())
-        .map((entry) => entry.sessionId)
-        .sort();
+      const cachedSessionIds = (await store.list()).map((entry) => entry.sessionId).sort();
       assert.deepStrictEqual(cachedSessionIds, ["a"]);
 
       const persisted = JSON.parse(readFileSync(join(dataDir, "sessions-metadata.json"), "utf-8"));
@@ -3974,9 +4265,7 @@ async function testSessionManager() {
 
       await Promise.all([storeA.save(makeMeta("a")), storeB.save(makeMeta("b"))]);
 
-      const sessionIds = (await storeA.list())
-        .map((entry) => entry.sessionId)
-        .sort();
+      const sessionIds = (await storeA.list()).map((entry) => entry.sessionId).sort();
       assert.deepStrictEqual(sessionIds, ["a", "b"]);
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
@@ -4029,9 +4318,135 @@ async function testSessionManager() {
         closeEvent.reason.includes("Authentication"),
         `Unexpected close reason: ${closeEvent.reason}`
       );
-      assert.strictEqual(unhandled.length, 0, "Auth throw should not escape as unhandled rejection");
+      assert.strictEqual(
+        unhandled.length,
+        0,
+        "Auth throw should not escape as unhandled rejection"
+      );
     } finally {
       process.off("unhandledRejection", onUnhandled);
+      await server.stop(1000);
+    }
+  });
+
+  await test("server: auth identity is propagated into command execution context", async () => {
+    const server = new PiServer({
+      authProvider: {
+        authenticate() {
+          return { allowed: true, identity: "user-alice" };
+        },
+      },
+      startupRecoverySummaryEvent: { enabled: false },
+    });
+
+    let capturedPrincipal: string | undefined;
+    const managerAny = server.getSessionManager() as any;
+    managerAny.executeCommand = async (command: any, options: { principal?: string } = {}) => {
+      capturedPrincipal = options.principal;
+      return {
+        id: command.id,
+        type: "response",
+        command: command.type,
+        success: true,
+        data: { sessions: [] },
+      };
+    };
+
+    try {
+      await server.start(0);
+      const port = Number((server as any).wss?.address?.().port);
+      assert(Number.isFinite(port) && port > 0, "Expected ephemeral WebSocket port");
+
+      const response = await new Promise<any>((resolve, reject) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${port}`);
+        const timer = setTimeout(() => reject(new Error("Timed out waiting for response")), 4000);
+
+        ws.on("message", (data) => {
+          const parsed = JSON.parse(data.toString());
+          if (parsed.type === "server_ready") {
+            ws.send(JSON.stringify({ id: "principal-1", type: "list_sessions" }));
+            return;
+          }
+          if (parsed.type === "response" && parsed.id === "principal-1") {
+            clearTimeout(timer);
+            ws.close();
+            resolve(parsed);
+          }
+        });
+        ws.on("error", reject);
+      });
+
+      assert.strictEqual(response.success, true);
+      assert.strictEqual(capturedPrincipal, "user-alice");
+    } finally {
+      await server.stop(1000);
+    }
+  });
+
+  await test("server: per-connection pending command cap rejects overflow", async () => {
+    const server = new PiServer({
+      maxPendingCommandsPerConnection: 1,
+      startupRecoverySummaryEvent: { enabled: false },
+    });
+
+    let releaseFirst!: () => void;
+    const blocker = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const managerAny = server.getSessionManager() as any;
+    managerAny.executeCommand = async (command: any) => {
+      await blocker;
+      return {
+        id: command.id,
+        type: "response",
+        command: command.type,
+        success: true,
+        data: { sessions: [] },
+      };
+    };
+
+    try {
+      await server.start(0);
+      const port = Number((server as any).wss?.address?.().port);
+      assert(Number.isFinite(port) && port > 0, "Expected ephemeral WebSocket port");
+
+      const result = await new Promise<{ first: any; overflow: any }>((resolve, reject) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${port}`);
+        const seen: { first?: any; overflow?: any } = {};
+        const timer = setTimeout(
+          () => reject(new Error("Timed out waiting for capped responses")),
+          5000
+        );
+
+        ws.on("message", (data) => {
+          const parsed = JSON.parse(data.toString());
+          if (parsed.type === "server_ready") {
+            ws.send(JSON.stringify({ id: "cap-1", type: "list_sessions" }));
+            ws.send(JSON.stringify({ id: "cap-2", type: "list_sessions" }));
+            return;
+          }
+          if (parsed.type === "response" && parsed.id === "cap-2") {
+            seen.overflow = parsed;
+            releaseFirst();
+            return;
+          }
+          if (parsed.type === "response" && parsed.id === "cap-1") {
+            seen.first = parsed;
+          }
+          if (seen.first && seen.overflow) {
+            clearTimeout(timer);
+            ws.close();
+            resolve({ first: seen.first, overflow: seen.overflow });
+          }
+        });
+        ws.on("error", reject);
+      });
+
+      assert.strictEqual(result.overflow.success, false);
+      assert.ok(String(result.overflow.error || "").includes("Too many pending commands"));
+      assert.strictEqual(result.first.success, true);
+    } finally {
+      releaseFirst?.();
       await server.stop(1000);
     }
   });

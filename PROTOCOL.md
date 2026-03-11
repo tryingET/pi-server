@@ -172,8 +172,9 @@ Server emits these event families:
 
 ### 6.2 Global lifecycle events
 
-- Broadcast globally for admitted commands.
-- Carry command metadata and terminal outcome fields.
+- `command_accepted` / `command_started` are broadcast for newly admitted executions.
+- `command_finished` carries the terminal outcome for requests that reached replay/admission handling.
+- Replayed or pre-admission rejected requests may emit `command_finished` without prior `command_accepted`.
 
 ---
 
@@ -181,10 +182,11 @@ Server emits these event families:
 
 ### 7.1 Admission gate
 
-A command is **admitted** only after validation and shutdown checks succeed.
+A command is **admitted** only after validation, shutdown checks, replay checks, rate-limit checks, and in-flight tracking admission succeed.
 
-- Admitted commands MUST emit `command_accepted`.
-- Non-admitted commands MUST NOT emit lifecycle events.
+- Newly admitted executions MUST emit `command_accepted`.
+- Commands rejected before admission MUST NOT emit `command_accepted` or `command_started`.
+- Terminal `command_finished` events may still be emitted for replay hits and pre-admission rejections so clients can observe a final outcome.
 
 ### 7.2 Per-command phase order
 
@@ -210,10 +212,9 @@ Guarantees:
 
 Replay hits MUST emit:
 
-- `command_accepted`
 - `command_finished` with `replayed: true`
 
-Replay hits MUST NOT emit `command_started`.
+Replay hits MUST NOT emit `command_accepted` or `command_started`.
 
 ---
 
@@ -505,7 +506,7 @@ when the query exceeds those bounds.
 | `get_session_stats` | Token/cost statistics |
 | `export_html` | Export session as HTML |
 | `new_session` | Create child session |
-| `switch_session_file` | Switch to different file |
+| `switch_session_file` | Switch to different session file (same security rules as `load_session`) |
 | `fork` | Fork from message |
 | `get_fork_messages` | Get fork preview |
 | `get_tree` | Retrieve normalized session tree (all roles) |
@@ -781,11 +782,12 @@ Sessions can be persisted to disk and loaded later.
 }
 ```
 
-> **Security:** `sessionPath` must be an absolute path under an allowed session directory:
+> **Security:** `sessionPath` must be an absolute path to an **existing session file** under an allowed session directory:
 > - `~/.pi/agent/sessions/` (default session storage)
-> - Any `.pi/sessions/` directory (project-local)
+> - the current server working directory's `.pi/sessions/` ancestry roots (project-local)
 >
-> Paths with `..`, relative paths, or paths outside these directories are rejected with an error.
+> The file must already exist, must end with `.jsonl` or `.json`, and must look like a real session file header.
+> Paths with `..`, relative paths, outsider project-local roots, or non-session files are rejected with an error.
 
 ---
 
@@ -841,7 +843,7 @@ All commands can return error responses in this format:
 |---------|-------|-------|
 | Any | `"Session <id> not found"` | Invalid sessionId |
 | Any | `"Session limit reached"` | Too many active sessions |
-| `load_session` | `"sessionPath must be..."` | Path traversal attempt or invalid path |
+| `load_session` | `"sessionPath must be..."` | Invalid/out-of-scope path or file is not an existing session file |
 | `load_session` | `"Session <id> already exists"` | Duplicate sessionId |
 | `switch_session` | `"Session <id> not found"` | Unknown session |
 | `prompt` | `"Circuit breaker open"` | LLM provider failing (ADR-0010) |
@@ -874,8 +876,11 @@ For WebSocket connections, authentication runs during connection setup:
 
 ### 23.2 Stdio behavior
 
-Stdio is a local process transport and does not have a remote handshake context.
-Deployments requiring strong remote authentication SHOULD use WebSocket with an `AuthProvider` and network controls.
+Stdio is authenticated at transport setup using the configured `AuthProvider`.
+Because stdio has no HTTP handshake context, providers typically rely on transport identity alone (or allow-all for local workflows).
+
+- On success, stdio behaves normally.
+- On failure, commands receive error responses and the transport is not subscribed to server/session broadcasts.
 
 ## 24. Companion documents
 

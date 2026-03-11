@@ -37,6 +37,8 @@ export function createServerUIContext(
       options: string[],
       opts?: { signal?: AbortSignal; timeout?: number }
     ): Promise<string | undefined> {
+      if (opts?.signal?.aborted) return undefined;
+
       const request = extensionUI.createPendingRequest(sessionId, "select", {
         title,
         options,
@@ -70,6 +72,8 @@ export function createServerUIContext(
       message: string,
       opts?: { signal?: AbortSignal; timeout?: number }
     ): Promise<boolean> {
+      if (opts?.signal?.aborted) return false;
+
       const request = extensionUI.createPendingRequest(sessionId, "confirm", {
         title,
         message,
@@ -103,6 +107,8 @@ export function createServerUIContext(
       placeholder?: string,
       opts?: { signal?: AbortSignal; timeout?: number }
     ): Promise<string | undefined> {
+      if (opts?.signal?.aborted) return undefined;
+
       const request = extensionUI.createPendingRequest(sessionId, "input", {
         title,
         placeholder,
@@ -304,6 +310,11 @@ async function raceWithAbortAndSignal<T>(
 ): Promise<T> {
   if (!signal) {
     return promise;
+  }
+
+  if (signal.aborted) {
+    onCancel();
+    throw new Error("Aborted");
   }
 
   return new Promise<T>((resolve, reject) => {

@@ -1141,12 +1141,11 @@ async function testRateLimitingUnderLoad() {
         { id: deleteCommandId, type: "delete_session", sessionId: "rl-1" },
         10000
       );
-      if (!deleteResponse.success) {
-        assert.ok(
-          String(deleteResponse.error || "").includes("Rate limit"),
-          "delete_session may be rate-limited after saturation"
-        );
-      }
+      assert.strictEqual(
+        deleteResponse.success,
+        true,
+        `delete_session should use control-plane bucket: ${deleteResponse.error}`
+      );
       client.close();
     });
   });
@@ -1178,6 +1177,48 @@ async function testStdioTransport() {
       );
 
       assert.strictEqual(response.success, true);
+    } finally {
+      child.kill("SIGTERM");
+    }
+  });
+
+  await test("integration: stdio rejects commands when auth denies transport", async () => {
+    const script = `
+      import { PiServer } from "./dist/server.js";
+      const server = new PiServer({
+        authProvider: {
+          authenticate() {
+            return { allowed: false, reason: "stdio denied" };
+          },
+        },
+        startupRecoverySummaryEvent: { enabled: false },
+      });
+      await server.start(0);
+      process.on("SIGTERM", async () => {
+        await server.stop(1000);
+        process.exit(0);
+      });
+      setInterval(() => {}, 1000);
+    `;
+
+    const child = spawn("node", ["--input-type=module", "-e", script], {
+      cwd: process.cwd(),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    try {
+      const stdoutLines = readline.createInterface({ input: child.stdout! });
+      child.stdin!.write(JSON.stringify({ id: "stdio-auth-1", type: "list_sessions" }) + "\n");
+
+      const response = await waitForJsonLine(
+        stdoutLines,
+        (obj) => obj.type === "response" && obj.id === "stdio-auth-1",
+        8000
+      );
+
+      assert.strictEqual(response.success, false);
+      assert.strictEqual(response.command, "list_sessions");
+      assert.strictEqual(response.error, "stdio denied");
     } finally {
       child.kill("SIGTERM");
     }

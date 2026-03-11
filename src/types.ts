@@ -205,6 +205,7 @@ export type ServerResponse =
       data: {
         sessionCount: number;
         connectionCount: number;
+        pendingConnectionCount: number;
         totalCommandsExecuted: number;
         commandsRejected: {
           sessionLimit: number;
@@ -585,6 +586,8 @@ export type RpcBroadcast =
 export interface Subscriber {
   send: (data: string) => void;
   subscribedSessions: Set<string>;
+  /** Authenticated principal associated with this transport, if any. */
+  identity?: string;
 }
 
 // ============================================================================

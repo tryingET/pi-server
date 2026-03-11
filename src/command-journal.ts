@@ -31,6 +31,8 @@ export const MAX_COMMAND_HISTORY_LIMIT = 500;
 const DEFAULT_HISTORY_SCAN_MAX_ENTRIES = 20_000;
 /** Guardrail: max wall-clock scan duration per history query (ms). */
 const DEFAULT_HISTORY_SCAN_MAX_DURATION_MS = 1_000;
+/** Chunk size for reverse history scans. */
+const HISTORY_REVERSE_READ_CHUNK_BYTES = 64 * 1024;
 
 /**
  * In-process lock reference counts for journal lock paths.
@@ -942,6 +944,71 @@ export class DurableCommandJournal {
     return redacted;
   }
 
+  private async scanJournalLinesReverse(
+    onLine: (line: string) => boolean | Promise<boolean>
+  ): Promise<void> {
+    let handle: fs.FileHandle | null = null;
+
+    try {
+      handle = await fs.open(this.journalPath, "r");
+      const stats = await handle.stat();
+      let position = stats.size;
+      let leftover = Buffer.alloc(0);
+
+      while (position > 0) {
+        const readSize = Math.min(HISTORY_REVERSE_READ_CHUNK_BYTES, position);
+        position -= readSize;
+
+        const buffer = Buffer.alloc(readSize);
+        const { bytesRead } = await handle.read(buffer, 0, readSize, position);
+        if (bytesRead <= 0) {
+          break;
+        }
+
+        const chunk = Buffer.concat([buffer.subarray(0, bytesRead), leftover]);
+        let segmentEnd = chunk.length;
+
+        for (let i = chunk.length - 1; i >= 0; i--) {
+          if (chunk[i] !== 0x0a) {
+            continue;
+          }
+
+          const lineBuffer = chunk.subarray(i + 1, segmentEnd);
+          segmentEnd = i;
+
+          if (lineBuffer.length === 0) {
+            continue;
+          }
+
+          const line = lineBuffer.toString("utf-8").trim();
+          if (!line) {
+            continue;
+          }
+
+          const shouldStop = await onLine(line);
+          if (shouldStop) {
+            return;
+          }
+        }
+
+        leftover = chunk.subarray(0, segmentEnd);
+      }
+
+      const trailingLine = leftover.toString("utf-8").trim();
+      if (trailingLine) {
+        await onLine(trailingLine);
+      }
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (err.code === "ENOENT") {
+        return;
+      }
+      throw error;
+    } finally {
+      await handle?.close();
+    }
+  }
+
   async queryHistory(query: CommandHistoryQuery = {}): Promise<CommandHistoryResult> {
     const limit = this.clampHistoryLimit(query.limit);
 
@@ -965,23 +1032,12 @@ export class DurableCommandJournal {
 
     await this.ensureJournalFileExists();
 
-    let raw = "";
-    try {
-      raw = await fs.readFile(this.journalPath, "utf-8");
-    } catch {
-      raw = "";
-    }
-
-    const lines = raw.split(/\r?\n/);
     const entries: CommandHistoryEntry[] = [];
     let truncated = false;
     let scannedNonEmptyLines = 0;
     const scanStartedAt = Date.now();
 
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i]?.trim();
-      if (!line) continue;
-
+    await this.scanJournalLinesReverse((line) => {
       scannedNonEmptyLines += 1;
       const elapsedMs = Date.now() - scanStartedAt;
       if (
@@ -989,26 +1045,27 @@ export class DurableCommandJournal {
         elapsedMs > this.historyScanMaxDurationMs
       ) {
         truncated = true;
-        break;
+        return true;
       }
 
       const parsed = this.parseEntryInternal(line);
       if (!parsed.ok) {
-        continue;
+        return false;
       }
 
       const entry = parsed.entry;
       if (!this.matchesHistoryQuery(entry, query)) {
-        continue;
+        return false;
       }
 
       if (entries.length < limit) {
         entries.push(this.toHistoryEntry(entry));
-      } else {
-        truncated = true;
-        break;
+        return false;
       }
-    }
+
+      truncated = true;
+      return true;
+    });
 
     return this.applyExportRedaction(
       {
@@ -1291,61 +1348,42 @@ export class DurableCommandJournal {
     await this.ensureJournalFileExists();
     this.acquireProcessLock();
 
-    // Apply retention/compaction policy before startup rehydration so recovered
-    // outcomes match retained durable history.
-    this.compactNow();
-
-    // Reset mutable recovery state for deterministic startup behavior.
-    this.laneSequences.clear();
-    this.entriesScanned = 0;
-    this.malformedEntries = 0;
-    this.unsupportedVersionEntries = 0;
-    this.recoveredOutcomes = 0;
-    this.recoveredInFlightFailures = 0;
-
-    const inFlight = new Map<string, InFlightRecoveryState>();
-    const recoveredOutcomeById = new Map<string, CommandOutcomeRecord>();
-
-    const fileStream = fsRegular.createReadStream(this.journalPath, { encoding: "utf-8" });
-    let rl: ReturnType<typeof readline.createInterface> | undefined;
-
     try {
-      rl = readline.createInterface({
-        input: fileStream,
-        crlfDelay: Infinity,
-      });
+      // Apply retention/compaction policy before startup rehydration so recovered
+      // outcomes match retained durable history.
+      this.compactNow();
 
-      for await (const rawLine of rl) {
-        const line = rawLine.trim();
-        if (!line) continue;
+      // Reset mutable recovery state for deterministic startup behavior.
+      this.laneSequences.clear();
+      this.entriesScanned = 0;
+      this.malformedEntries = 0;
+      this.unsupportedVersionEntries = 0;
+      this.recoveredOutcomes = 0;
+      this.recoveredInFlightFailures = 0;
 
-        this.entriesScanned += 1;
-        const entry = this.parseEntry(line);
-        if (!entry) continue;
+      const inFlight = new Map<string, InFlightRecoveryState>();
+      const recoveredOutcomeById = new Map<string, CommandOutcomeRecord>();
 
-        this.bumpLaneSequenceFromRecord(entry);
+      const fileStream = fsRegular.createReadStream(this.journalPath, { encoding: "utf-8" });
+      let rl: ReturnType<typeof readline.createInterface> | undefined;
 
-        if (entry.phase === "command_accepted") {
-          inFlight.set(entry.commandId, {
-            commandId: entry.commandId,
-            commandType: entry.commandType,
-            laneKey: entry.laneKey,
-            fingerprint: entry.fingerprint,
-            explicitId: entry.explicitId,
-            sessionId: entry.sessionId,
-            dependsOn: entry.dependsOn,
-            ifSessionVersion: entry.ifSessionVersion,
-            idempotencyKey: entry.idempotencyKey,
-            lastPhase: "command_accepted",
-          });
-          continue;
-        }
+      try {
+        rl = readline.createInterface({
+          input: fileStream,
+          crlfDelay: Infinity,
+        });
 
-        if (entry.phase === "command_started") {
-          const existing = inFlight.get(entry.commandId);
-          if (existing) {
-            existing.lastPhase = "command_started";
-          } else {
+        for await (const rawLine of rl) {
+          const line = rawLine.trim();
+          if (!line) continue;
+
+          this.entriesScanned += 1;
+          const entry = this.parseEntry(line);
+          if (!entry) continue;
+
+          this.bumpLaneSequenceFromRecord(entry);
+
+          if (entry.phase === "command_accepted") {
             inFlight.set(entry.commandId, {
               commandId: entry.commandId,
               commandType: entry.commandType,
@@ -1356,113 +1394,137 @@ export class DurableCommandJournal {
               dependsOn: entry.dependsOn,
               ifSessionVersion: entry.ifSessionVersion,
               idempotencyKey: entry.idempotencyKey,
-              lastPhase: "command_started",
+              lastPhase: "command_accepted",
             });
+            continue;
           }
+
+          if (entry.phase === "command_started") {
+            const existing = inFlight.get(entry.commandId);
+            if (existing) {
+              existing.lastPhase = "command_started";
+            } else {
+              inFlight.set(entry.commandId, {
+                commandId: entry.commandId,
+                commandType: entry.commandType,
+                laneKey: entry.laneKey,
+                fingerprint: entry.fingerprint,
+                explicitId: entry.explicitId,
+                sessionId: entry.sessionId,
+                dependsOn: entry.dependsOn,
+                ifSessionVersion: entry.ifSessionVersion,
+                idempotencyKey: entry.idempotencyKey,
+                lastPhase: "command_started",
+              });
+            }
+            continue;
+          }
+
+          // command_finished
+          inFlight.delete(entry.commandId);
+
+          const outcome = this.makeOutcomeFromFinishedEntry(entry);
+          if (outcome) {
+            recoveredOutcomeById.set(outcome.commandId, outcome);
+          }
+        }
+      } finally {
+        rl?.close();
+        fileStream.destroy();
+      }
+
+      const recoveredInFlight: RecoveredInFlightCommand[] = [];
+
+      // Deterministic crash recovery policy (foundation):
+      // Pre-crash in-flight explicit commands are marked failed and journaled as terminal outcomes.
+      for (const state of inFlight.values()) {
+        if (!state.explicitId || state.commandId.startsWith(SYNTHETIC_ID_PREFIX)) {
           continue;
         }
 
-        // command_finished
-        inFlight.delete(entry.commandId);
+        const reason =
+          "Command did not finish before previous shutdown and was marked failed during recovery";
+        const response: RpcResponse = {
+          id: state.commandId,
+          type: "response",
+          command: state.commandType,
+          success: false,
+          error: reason,
+        };
 
-        const outcome = this.makeOutcomeFromFinishedEntry(entry);
-        if (outcome) {
-          recoveredOutcomeById.set(outcome.commandId, outcome);
-        }
+        const now = Date.now();
+        const recoveryOutcome: CommandOutcomeRecord = {
+          commandId: state.commandId,
+          commandType: state.commandType,
+          laneKey: state.laneKey,
+          fingerprint: state.fingerprint,
+          success: false,
+          error: reason,
+          response,
+          sessionVersion: undefined,
+          finishedAt: now,
+        };
+        recoveredOutcomeById.set(state.commandId, recoveryOutcome);
+
+        recoveredInFlight.push({
+          commandId: state.commandId,
+          commandType: state.commandType,
+          laneKey: state.laneKey,
+          fingerprint: state.fingerprint,
+          lastPhase: state.lastPhase,
+          reason,
+        });
+
+        const recoveryEntry: CommandJournalEntryV1 = {
+          schemaVersion: CURRENT_JOURNAL_SCHEMA_VERSION,
+          kind: "command_lifecycle",
+          phase: "command_finished",
+          recordedAt: now,
+          serverVersion: this.serverVersion,
+
+          commandId: state.commandId,
+          commandType: state.commandType,
+          laneKey: state.laneKey,
+          laneSequence: this.nextLaneSequence(state.laneKey),
+          fingerprint: state.fingerprint,
+          explicitId: state.explicitId,
+
+          sessionId: state.sessionId,
+          dependsOn: state.dependsOn,
+          ifSessionVersion: state.ifSessionVersion,
+          idempotencyKey: state.idempotencyKey,
+
+          success: false,
+          error: reason,
+          response,
+
+          recovered: true,
+          recoveryReason: "restart_inflight_marked_failed",
+        };
+
+        this.appendRecord(this.applyPersistenceRedaction(recoveryEntry));
       }
-    } finally {
-      rl?.close();
-      fileStream.destroy();
-    }
 
-    const recoveredInFlight: RecoveredInFlightCommand[] = [];
+      const recoveredOutcomes = [...recoveredOutcomeById.values()];
+      this.recoveredOutcomes = recoveredOutcomes.length;
+      this.recoveredInFlightFailures = recoveredInFlight.length;
+      this.initialized = true;
 
-    // Deterministic crash recovery policy (foundation):
-    // Pre-crash in-flight explicit commands are marked failed and journaled as terminal outcomes.
-    for (const state of inFlight.values()) {
-      if (!state.explicitId || state.commandId.startsWith(SYNTHETIC_ID_PREFIX)) {
-        continue;
-      }
-
-      const reason =
-        "Command did not finish before previous shutdown and was marked failed during recovery";
-      const response: RpcResponse = {
-        id: state.commandId,
-        type: "response",
-        command: state.commandType,
-        success: false,
-        error: reason,
-      };
-
-      const now = Date.now();
-      const recoveryOutcome: CommandOutcomeRecord = {
-        commandId: state.commandId,
-        commandType: state.commandType,
-        laneKey: state.laneKey,
-        fingerprint: state.fingerprint,
-        success: false,
-        error: reason,
-        response,
-        sessionVersion: undefined,
-        finishedAt: now,
-      };
-      recoveredOutcomeById.set(state.commandId, recoveryOutcome);
-
-      recoveredInFlight.push({
-        commandId: state.commandId,
-        commandType: state.commandType,
-        laneKey: state.laneKey,
-        fingerprint: state.fingerprint,
-        lastPhase: state.lastPhase,
-        reason,
-      });
-
-      const recoveryEntry: CommandJournalEntryV1 = {
+      return {
+        enabled: true,
+        journalPath: this.journalPath,
         schemaVersion: CURRENT_JOURNAL_SCHEMA_VERSION,
-        kind: "command_lifecycle",
-        phase: "command_finished",
-        recordedAt: now,
-        serverVersion: this.serverVersion,
-
-        commandId: state.commandId,
-        commandType: state.commandType,
-        laneKey: state.laneKey,
-        laneSequence: this.nextLaneSequence(state.laneKey),
-        fingerprint: state.fingerprint,
-        explicitId: state.explicitId,
-
-        sessionId: state.sessionId,
-        dependsOn: state.dependsOn,
-        ifSessionVersion: state.ifSessionVersion,
-        idempotencyKey: state.idempotencyKey,
-
-        success: false,
-        error: reason,
-        response,
-
-        recovered: true,
-        recoveryReason: "restart_inflight_marked_failed",
+        entriesScanned: this.entriesScanned,
+        malformedEntries: this.malformedEntries,
+        unsupportedVersionEntries: this.unsupportedVersionEntries,
+        recoveredOutcomes,
+        recoveredInFlight,
+        recoveredInFlightFailures: recoveredInFlight.length,
       };
-
-      this.appendRecord(this.applyPersistenceRedaction(recoveryEntry));
+    } catch (error) {
+      this.releaseProcessLock();
+      throw error;
     }
-
-    const recoveredOutcomes = [...recoveredOutcomeById.values()];
-    this.recoveredOutcomes = recoveredOutcomes.length;
-    this.recoveredInFlightFailures = recoveredInFlight.length;
-    this.initialized = true;
-
-    return {
-      enabled: true,
-      journalPath: this.journalPath,
-      schemaVersion: CURRENT_JOURNAL_SCHEMA_VERSION,
-      entriesScanned: this.entriesScanned,
-      malformedEntries: this.malformedEntries,
-      unsupportedVersionEntries: this.unsupportedVersionEntries,
-      recoveredOutcomes,
-      recoveredInFlight,
-      recoveredInFlightFailures: recoveredInFlight.length,
-    };
   }
 
   appendLifecycle(input: CommandJournalAppendInput): number | null {
@@ -1505,6 +1567,57 @@ export class DurableCommandJournal {
     };
 
     this.appendRecord(this.applyPersistenceRedaction(entry));
+    return laneSequence;
+  }
+
+  /**
+   * Append a terminal failure record without applying beforePersist redaction hooks.
+   *
+   * Used as a deterministic fallback when fail_closed mode rejects a command
+   * because the normal command_finished append path failed after a user-visible
+   * terminal response was already computed.
+   */
+  appendFailClosedTerminalFailure(input: Omit<CommandJournalAppendInput, "phase">): number | null {
+    if (!this.enabled) return null;
+
+    if (!this.initialized) {
+      throw new Error(
+        "DurableCommandJournal.appendFailClosedTerminalFailure called before initialize()"
+      );
+    }
+
+    const laneSequence = this.nextLaneSequence(input.laneKey);
+    const entry: CommandJournalEntryV1 = {
+      schemaVersion: CURRENT_JOURNAL_SCHEMA_VERSION,
+      kind: "command_lifecycle",
+      phase: "command_finished",
+      recordedAt: Date.now(),
+      serverVersion: this.serverVersion,
+
+      commandId: input.commandId,
+      commandType: input.commandType,
+      laneKey: input.laneKey,
+      laneSequence,
+      fingerprint: input.fingerprint,
+      explicitId: input.explicitId,
+
+      sessionId: input.sessionId,
+      dependsOn: input.dependsOn,
+      ifSessionVersion: input.ifSessionVersion,
+      idempotencyKey: input.idempotencyKey,
+
+      success: input.success,
+      error: input.error,
+      sessionVersion: input.sessionVersion,
+      replayed: input.replayed,
+      timedOut: input.timedOut,
+      response: input.response,
+
+      recovered: input.recovered,
+      recoveryReason: input.recoveryReason,
+    };
+
+    this.appendRecord(entry);
     return laneSequence;
   }
 }

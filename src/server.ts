@@ -164,6 +164,9 @@ interface StdioState {
   broken?: boolean;
 }
 
+/** Maximum commands allowed to be pending per transport connection. */
+const DEFAULT_MAX_PENDING_COMMANDS_PER_CONNECTION = 100;
+
 /**
  * Backpressure-aware stdio send.
  *
@@ -325,6 +328,8 @@ export interface PiServerOptions {
     /** Whether convenience events include sensitive details (journalPath, IDs, raw init error). */
     includeSensitiveData?: boolean;
   };
+  /** Max commands allowed to be pending concurrently per transport connection. */
+  maxPendingCommandsPerConnection?: number;
 }
 
 export class PiServer {
@@ -349,9 +354,17 @@ export class PiServer {
   private startupRecoverySummaryIncludeSensitiveData = false;
   /** Async stdout error handler for stdio transport resilience. */
   private stdoutErrorHandler: ((error: Error) => void) | null = null;
+  /** Max commands allowed to be pending concurrently per transport connection. */
+  private readonly maxPendingCommandsPerConnection: number;
 
   constructor(options: PiServerOptions = {}) {
     this.authProvider = options.authProvider ?? new AllowAllAuthProvider();
+    this.maxPendingCommandsPerConnection =
+      typeof options.maxPendingCommandsPerConnection === "number" &&
+      Number.isFinite(options.maxPendingCommandsPerConnection) &&
+      options.maxPendingCommandsPerConnection > 0
+        ? Math.floor(options.maxPendingCommandsPerConnection)
+        : DEFAULT_MAX_PENDING_COMMANDS_PER_CONNECTION;
     this.sessionManager = new PiSessionManager(undefined, {
       serverVersion: SERVER_VERSION,
       durableJournal: options.durableJournal,
@@ -631,6 +644,9 @@ export class PiServer {
       }
     }
 
+    // Prevent late command completions from mutating stores after shutdown timeout.
+    this.sessionManager.markRuntimeDisposed();
+
     // Dispose all sessions
     const disposeResult = this.sessionManager.disposeAllSessions();
     this.logger.info("Sessions disposed", {
@@ -658,6 +674,36 @@ export class PiServer {
       });
       return { allowed: false, reason: "Authentication error" };
     }
+  }
+
+  private sendCriticalWebSocket(
+    ws: WebSocket,
+    data: string,
+    cleanupConnection?: () => void
+  ): boolean {
+    const result = sendWithBackpressure(ws, data, { isCritical: true });
+    if (!result.ok) {
+      this.logger.warn("Critical WebSocket send failed", {
+        reason: result.reason,
+        error: result.error?.message,
+      });
+      cleanupConnection?.();
+      return false;
+    }
+    return true;
+  }
+
+  private sendCriticalStdio(data: string, rl?: readline.Interface | null): boolean {
+    const ok = sendWithStdioBackpressure(data, this.stdioState, { isCritical: true });
+    if (!ok) {
+      this.logger.error("Critical stdio send failed", {
+        transport: "stdio",
+        broken: this.stdioState.broken ?? false,
+        hasBackpressure: this.stdioState.hasBackpressure,
+      });
+      rl?.close();
+    }
+    return ok;
   }
 
   private registerStdoutErrorHandler(): void {
@@ -727,6 +773,7 @@ export class PiServer {
       let cleanedUp = false;
       let connectionActivated = false;
       let subscriberAdded = false;
+      let pendingCommandCount = 0;
       const cleanupConnection = () => {
         if (cleanedUp) return;
         cleanedUp = true;
@@ -782,6 +829,8 @@ export class PiServer {
         return;
       }
 
+      subscriber.identity = authResult.identity;
+
       governor.activateReservedConnection();
       connectionActivated = true;
 
@@ -798,7 +847,9 @@ export class PiServer {
           transports: ["websocket", "stdio"],
         },
       };
-      sendWithBackpressure(ws, JSON.stringify(readyEvent), { isCritical: true });
+      if (!this.sendCriticalWebSocket(ws, JSON.stringify(readyEvent), cleanupConnection)) {
+        return;
+      }
 
       // Send startup recovery summary convenience event.
       // Clients should still use get_startup_recovery as canonical source of truth.
@@ -807,7 +858,11 @@ export class PiServer {
           this.sessionManager.getStartupRecoverySummaryEvent({
             includeSensitiveData: this.startupRecoverySummaryIncludeSensitiveData,
           });
-        sendWithBackpressure(ws, JSON.stringify(startupRecoveryEvent), { isCritical: true });
+        if (
+          !this.sendCriticalWebSocket(ws, JSON.stringify(startupRecoveryEvent), cleanupConnection)
+        ) {
+          return;
+        }
       }
 
       this.sessionManager.addSubscriber(subscriber);
@@ -837,15 +892,42 @@ export class PiServer {
             error: sizeResult.reason,
           };
           // Error responses are critical - client needs to know why their message was rejected
-          sendWithBackpressure(ws, JSON.stringify(errorResponse), { isCritical: true });
+          this.sendCriticalWebSocket(ws, JSON.stringify(errorResponse), cleanupConnection);
           return;
         }
 
+        let command: RpcCommand;
         try {
-          const command: RpcCommand = JSON.parse(data.toString());
+          command = JSON.parse(data.toString());
+        } catch (error) {
+          const errorResponse: RpcResponse = {
+            type: "response",
+            command: "unknown",
+            success: false,
+            error: error instanceof Error ? error.message : "Invalid JSON",
+          };
+          // Parse error responses are critical
+          this.sendCriticalWebSocket(ws, JSON.stringify(errorResponse), cleanupConnection);
+          return;
+        }
+
+        if (pendingCommandCount >= this.maxPendingCommandsPerConnection) {
+          const errorResponse: RpcResponse = {
+            id: command.id,
+            type: "response",
+            command: command.type,
+            success: false,
+            error: `Too many pending commands for this connection (max ${this.maxPendingCommandsPerConnection})`,
+          };
+          this.sendCriticalWebSocket(ws, JSON.stringify(errorResponse), cleanupConnection);
+          return;
+        }
+
+        pendingCommandCount += 1;
+        try {
           await this.handleCommand(command, subscriber, (response: RpcResponse) => {
             // Command responses are critical - client is waiting for them
-            sendWithBackpressure(ws, JSON.stringify(response), { isCritical: true });
+            return this.sendCriticalWebSocket(ws, JSON.stringify(response), cleanupConnection);
           });
         } catch (error) {
           const errorResponse: RpcResponse = {
@@ -855,7 +937,9 @@ export class PiServer {
             error: error instanceof Error ? error.message : "Invalid JSON",
           };
           // Parse error responses are critical
-          sendWithBackpressure(ws, JSON.stringify(errorResponse), { isCritical: true });
+          this.sendCriticalWebSocket(ws, JSON.stringify(errorResponse), cleanupConnection);
+        } finally {
+          pendingCommandCount = Math.max(0, pendingCommandCount - 1);
         }
       });
     });
@@ -879,6 +963,7 @@ export class PiServer {
     };
     const authResult = await this.authenticateTransport(authContext);
     const stdioAuthenticated = authResult.allowed;
+    let pendingCommandCount = 0;
 
     if (!stdioAuthenticated) {
       this.logger.warn("Authentication failed", {
@@ -894,6 +979,7 @@ export class PiServer {
         sendWithStdioBackpressure(data, this.stdioState, { isCritical: false });
       },
       subscribedSessions: new Set(),
+      identity: authResult.allowed ? authResult.identity : undefined,
     };
 
     if (stdioAuthenticated) {
@@ -912,58 +998,70 @@ export class PiServer {
           error: sizeResult.reason,
         };
         // Error responses are critical
-        sendWithStdioBackpressure(JSON.stringify(errorResponse), this.stdioState, {
-          isCritical: true,
-        });
+        this.sendCriticalStdio(JSON.stringify(errorResponse), rl);
         return;
+      }
+
+      let parsedCommand: Partial<RpcCommand> | undefined;
+      try {
+        parsedCommand = JSON.parse(line) as Partial<RpcCommand>;
+      } catch {
+        parsedCommand = undefined;
       }
 
       if (!stdioAuthenticated) {
-        let id: string | undefined;
-        let commandName = "unknown";
-        try {
-          const parsed = JSON.parse(line) as Partial<RpcCommand>;
-          if (typeof parsed.id === "string") {
-            id = parsed.id;
-          }
-          if (typeof parsed.type === "string") {
-            commandName = parsed.type;
-          }
-        } catch {
-          // Ignore parse failures; auth failure still takes precedence.
-        }
-
         const errorResponse: RpcResponse = {
-          id,
+          id: typeof parsedCommand?.id === "string" ? parsedCommand.id : undefined,
           type: "response",
-          command: commandName,
+          command: typeof parsedCommand?.type === "string" ? parsedCommand.type : "unknown",
           success: false,
           error: authResult.reason,
         };
-        sendWithStdioBackpressure(JSON.stringify(errorResponse), this.stdioState, {
-          isCritical: true,
-        });
+        this.sendCriticalStdio(JSON.stringify(errorResponse), rl);
         return;
       }
 
-      try {
-        const command: RpcCommand = JSON.parse(line);
-        await this.handleCommand(command, subscriber, (response: RpcResponse) => {
-          // Command responses are critical
-          sendWithStdioBackpressure(JSON.stringify(response), this.stdioState, {
-            isCritical: true,
-          });
-        });
-      } catch (error) {
+      if (!parsedCommand || typeof parsedCommand.type !== "string") {
         const errorResponse: RpcResponse = {
           type: "response",
           command: "unknown",
           success: false,
+          error: "Invalid JSON",
+        };
+        this.sendCriticalStdio(JSON.stringify(errorResponse), rl);
+        return;
+      }
+
+      const command = parsedCommand as RpcCommand;
+      if (pendingCommandCount >= this.maxPendingCommandsPerConnection) {
+        const errorResponse: RpcResponse = {
+          id: command.id,
+          type: "response",
+          command: command.type,
+          success: false,
+          error: `Too many pending commands for this transport (max ${this.maxPendingCommandsPerConnection})`,
+        };
+        this.sendCriticalStdio(JSON.stringify(errorResponse), rl);
+        return;
+      }
+
+      pendingCommandCount += 1;
+      try {
+        await this.handleCommand(command, subscriber, (response: RpcResponse) => {
+          // Command responses are critical
+          return this.sendCriticalStdio(JSON.stringify(response), rl);
+        });
+      } catch (error) {
+        const errorResponse: RpcResponse = {
+          id: command.id,
+          type: "response",
+          command: command.type,
+          success: false,
           error: error instanceof Error ? error.message : "Invalid JSON",
         };
-        sendWithStdioBackpressure(JSON.stringify(errorResponse), this.stdioState, {
-          isCritical: true,
-        });
+        this.sendCriticalStdio(JSON.stringify(errorResponse), rl);
+      } finally {
+        pendingCommandCount = Math.max(0, pendingCommandCount - 1);
       }
     });
 
@@ -983,14 +1081,16 @@ export class PiServer {
   private async handleCommand(
     command: RpcCommand,
     subscriber: Subscriber,
-    respond: (response: RpcResponse) => void
+    respond: (response: RpcResponse) => boolean | undefined
   ): Promise<void> {
     // Execute command
-    const response = await this.sessionManager.executeCommand(command);
-    respond(response);
+    const response = await this.sessionManager.executeCommand(command, {
+      principal: subscriber.identity,
+    });
+    const delivered = respond(response);
 
     // Handle subscription AFTER successful switch_session
-    if (command.type === "switch_session" && response.success) {
+    if (delivered !== false && command.type === "switch_session" && response.success) {
       const sessionId = getSessionIdFromCmd(command);
       if (sessionId) {
         this.sessionManager.subscribeToSession(subscriber, sessionId);

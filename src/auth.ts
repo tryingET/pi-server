@@ -30,6 +30,8 @@ export type AuthResult = { allowed: true; identity?: string } | { allowed: false
  * Context information available to auth providers.
  */
 export interface AuthContext {
+  /** Active transport attempting admission */
+  transport: "websocket" | "stdio";
   /** Raw HTTP request (for headers, cookies, TLS info) */
   request?: IncomingMessage;
   /** WebSocket connection info */
@@ -73,7 +75,7 @@ export interface AuthProvider {
    * Authenticate a new connection.
    *
    * Called once when a WebSocket connection is established or when
-   * stdio receives its first command.
+   * the stdio transport is initialized.
    *
    * @param ctx Context information for the connection
    * @returns Auth result with optional identity on success

@@ -11,7 +11,7 @@ Hardcoding a single auth mechanism (for example, one token format) would lock de
 
 ## Decision
 
-Introduce a pluggable `AuthProvider` interface and authenticate at **connection setup**.
+Introduce a pluggable `AuthProvider` interface and authenticate at **transport admission/setup**.
 
 ```ts
 interface AuthProvider {
@@ -29,8 +29,11 @@ interface AuthProvider {
 
 ### Integration point
 
-`PiServer` invokes `authProvider.authenticate()` in the WebSocket connection handler before registering the connection.
-If auth fails, the socket is closed with code `1008` (policy violation).
+`PiServer` invokes `authProvider.authenticate()` before admitting either transport:
+- **WebSocket:** before promoting the reserved connection slot to an active connection. If auth fails, the socket is closed with code `1008` (policy violation).
+- **Stdio:** during transport setup. If auth fails, stdin commands receive auth error responses and stdio is not subscribed to broadcasts.
+
+Auth-provider exceptions fail closed and are treated as authentication errors rather than leaving transports half-admitted.
 
 ## Why this model
 
