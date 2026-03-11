@@ -76,15 +76,17 @@ The `load_session` command validates the `sessionPath` parameter to prevent path
 
 **Allowed directories:**
 - `~/.pi/agent/sessions/` (default session storage)
-- Any `.pi/sessions/` directory (project-local)
+- Project-local `.pi/sessions/` roots anchored to the server working directory ancestry
 
 **Validation rules:**
 - Must be an absolute path
 - Must end with `.jsonl` or `.json` extension
 - Cannot contain `..`, `~`, or null bytes
-- Must be under an allowed directory
+- Must be under an allowed directory for this server instance
+- Must already exist on disk for `load_session` / `switch_session_file`
+- Must look like a real session file header before the server hands it to upstream session loading
 
-**Implementation:** `src/validation.ts` → `validateSessionPath()`
+**Implementation:** `src/validation.ts` → `validateSessionPath()` / `validateSessionFileAccess()`
 
 ## Implementation
 
@@ -118,6 +120,7 @@ class SessionStore {
 - Sessions survive server restarts
 - Users can browse and load old sessions
 - Works with existing session file format
+- Session lifecycle semantics are now failure-atomic: session runtime state is not published until metadata persistence succeeds, and failed deletes do not tear down runtime state after durable delete failure (see ADR-0020)
 
 ### Negative
 
@@ -145,3 +148,4 @@ class SessionStore {
 - `src/session-store.ts` — Implementation
 - `src/types.ts` — Type definitions
 - PROTOCOL.md §20 — Protocol documentation
+- `docs/adr/0020-failure-atomic-lifecycle-and-canonical-replay.md`

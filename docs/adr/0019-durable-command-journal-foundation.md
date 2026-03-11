@@ -98,6 +98,8 @@ This preserves rollback safety while validating operational behavior.
 - ✅ append write-failure strictness policy (`durableJournal.appendFailurePolicy`: `best_effort` / `fail_closed`)
 - ✅ redaction hooks for persistence/export surfaces (`durableJournal.redaction.beforePersist` / `beforeExport`)
 - ✅ chaos coverage for malformed/partial journal lines around recovery + compaction
+- ✅ newest-first command history queries for incident usefulness
+- ✅ canonical replay identity and failure-atomic session lifecycle integration at the runtime boundary (see ADR-0020)
 - optional SQLite backend evaluation (decision gate revisit)
 - schema migration tooling and fixtures
 - deterministic replay/export tooling for incident workflows
@@ -107,3 +109,4 @@ This preserves rollback safety while validating operational behavior.
 - `src/command-journal.ts`
 - `src/session-manager.ts`
 - `ROADMAP.md` (Level 4)
+- `docs/adr/0020-failure-atomic-lifecycle-and-canonical-replay.md`
