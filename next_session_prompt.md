@@ -1,17 +1,15 @@
 # pi-server: Next Session Prompt
 
-**Operating mode:** Production-ready, reliability-first  
-**Current phase:** Trust-boundary hardening + failure-atomic lifecycle pass complete  
-**Version:** 2.1.0 (current)  
+**Operating mode:** Reliability-first, adversarially reviewed  
+**Current phase:** NEXUS hardening + atomic-completion pass landed and verified  
+**Version:** 2.1.0 (working tree)  
 **Formalization Level:** 2 (Bounded Run)
 
 ---
 
 ## SESSION STATUS (2026-03-11)
 
-## ✅ TWO RELIABILITY PASSES ARE NOW LANDED
-
-This repo now has two recent reliability-oriented change sets landed:
+The codebase now includes **three stacked reliability passes** in effect:
 
 1. **Trust-boundary hardening pass**
    - transport auth parity
@@ -27,209 +25,201 @@ This repo now has two recent reliability-oriented change sets landed:
    - in-flight idempotency-key dedupe
    - newest-first durable command history
    - async stdout error hardening for stdio transport
-   - `load_session` now persists source session cwd correctly
+   - `load_session` persists source session cwd
+
+3. **NEXUS + atomic-completion pass**
+   - control-plane vs data-plane command policy
+   - dedicated rate-limit buckets for control-plane commands
+   - `command_accepted` semantics moved to true post-admission behavior
+   - `load_session` runtime cwd now uses the source session cwd
+   - `disposeAllSessions()` now clears governor accounting correctly
+   - durable journal init failure releases writer lock
+   - session discovery sanitizes malformed header fields
+   - authenticated principal now propagates into command execution context
+   - per-connection pending-command caps added for websocket + stdio
+   - critical send failures now fail-stop instead of being silently ignored
+   - `validateCwd()` now requires absolute, existing directories
+   - `delete_session` now surfaces runtime cleanup failure instead of returning false success
+   - `get_command_history` now reverse-scans the journal instead of full-file reading
+   - fail-closed `command_finished` append failures now remain deterministic across restart
+   - shutdown escalation now aborts active sessions and blocks late state mutation
+   - SessionStore cache freshness now uses `mtimeMs + ctimeMs + size`
 
 ---
 
-## LATEST COMMITS
+## RESOLVED THIS PASS
 
-- `83135cc` — `Implement failure-atomic lifecycle and canonical replay`
-- `d72d748` — `Cross-link ADR-0020 into persistence and journal docs`
-
-New ADR:
-- `docs/adr/0020-failure-atomic-lifecycle-and-canonical-replay.md`
-
-Cross-linked ADRs:
-- `docs/adr/0007-session-persistence.md`
-- `docs/adr/0019-durable-command-journal-foundation.md`
-
----
-
-## WHAT CHANGED IN THE MOST RECENT PASS
-
-### 1) Session lifecycle is now failure-atomic
-
-`createSession()` and `loadSession()` no longer publish runtime-visible session state before metadata persistence succeeds.
-
-New ordering:
-1. reserve capacity
-2. create/bind/switch underlying session
-3. persist metadata
-4. subscribe
-5. commit runtime state
-
-Rollback behavior:
-- failed create/load disposes the session
-- governor reservation is released
-- no ghost session remains in runtime maps
-
-`deleteSession()` now removes metadata before runtime teardown.
-
-Net effect:
-- if delete fails, the session is still live
-- if delete succeeds, runtime and durable metadata agree
-
-### 2) SessionStore is now copy-on-write
-
-`SessionStore` no longer mutates cached metadata in place before disk write completes.
-
-New behavior:
-- clone metadata map before mutation
-- save durable state first
-- swap cache only after save succeeds
-- invalidate cache under lock before mutation reads
-- use file snapshot checks (`mtimeMs` + `size`) rather than loose clock-only freshness
-- stale metadata lock cleanup now checks owner PID liveness before stealing aged locks
-
-Net effect:
-- no phantom metadata after failed writes
-- better cross-instance mutation correctness
-
-### 3) Replay identity is now canonicalized
-
-`getCommandFingerprint()` no longer depends on raw object insertion order.
-
-New behavior:
-- stable key-sorted serialization
-- retry identity (`id`, `idempotencyKey`) still excluded
-
-Net effect:
-- semantically identical commands no longer conflict because of client/library key ordering drift
-
-### 4) Idempotency now dedupes in-flight retries
-
-Replay now has two layers for idempotency keys:
-- terminal cache
-- in-flight map
-
-Net effect:
-- concurrent requests sharing the same `idempotencyKey` collapse to one execution instead of double-running
-
-### 5) Durable history is now newest-first
-
-`get_command_history` now scans newest-to-oldest.
-
-Net effect:
-- bounded history queries surface the freshest incident evidence first
-- operational debugging is materially better under journal growth
-
-### 6) Stdio transport now hardens async stream failure
-
-The server now registers a `stdout` error handler while stdio transport is active.
-
-Net effect:
-- async stdout failures degrade stdio transport instead of crashing the process through an unhandled stream error event
-
-### 7) `load_session` now persists the source session cwd
-
-Metadata for loaded sessions now reflects the session file’s own header cwd, not just the server process cwd.
-
-Net effect:
-- loaded session metadata is more truthful for cross-project loads and future browsing/recovery flows
+- **Control-plane starvation:** `delete_session` / `switch_session` no longer share session data-plane rate-limit buckets.
+- **Admission semantics drift:** replay hits and pre-admission rejections no longer emit misleading `command_accepted` / `command_started` events.
+- **`load_session` cwd drift:** runtime session creation now uses the source session header cwd when valid.
+- **Governor slot leak on disposal:** `disposeAllSessions()` now unregisters sessions correctly.
+- **Journal init lock leak:** failed durable init now releases the single-writer lock.
+- **Malformed discovery header poisoning:** non-string `cwd` / `sessionName` values now sanitize to safe defaults.
+- **Dropped auth principal:** authenticated identity now flows from transport admission into command execution context.
+- **Per-connection concurrency amplification:** websocket and stdio now reject overflow beyond a configured pending-command cap.
+- **Best-effort critical send lie:** critical websocket/stdio send failures are now observable and fail-stop.
+- **Weak cwd validation:** `validateCwd()` now rejects relative, missing, and non-directory paths.
+- **False-success delete:** runtime cleanup failures during `delete_session` now surface as command failure.
+- **Unbounded history read:** `get_command_history` now reverse-scans in chunks instead of `readFile()`ing the full journal.
+- **Fail-closed replay drift across restart:** fallback terminal persistence preserves explicit-ID determinism after restart.
+- **Late mutation after shutdown timeout:** shutdown now aborts active sessions and blocks late state mutation after final teardown.
+- **Cross-instance SessionStore stale-cache race:** cache freshness now detects same-size/same-mtime file replacement using `ctimeMs` too.
 
 ---
 
-## FILES TO UNDERSTAND FIRST NEXT SESSION
-
-Core implementation:
-- `src/session-manager.ts`
-- `src/session-store.ts`
-- `src/command-replay-store.ts`
-- `src/command-journal.ts`
-- `src/server.ts`
-
-Regression coverage:
-- `src/test.ts`
-- `src/test-command-replay-store.ts`
-- `src/test-integration.ts`
-- `src/test-fuzz.ts`
-
-Documentation:
-- `docs/adr/0020-failure-atomic-lifecycle-and-canonical-replay.md`
-- `docs/adr/0007-session-persistence.md`
-- `docs/adr/0019-durable-command-journal-foundation.md`
-- `AGENTS.md`
-
----
-
-## TEST / VERIFICATION SNAPSHOT (CURRENT)
+## VERIFICATION SNAPSHOT (CURRENT)
 
 | Check | Status |
 |---|---|
 | `npm run build` | ✅ |
-| `npm test` | ✅ 177 passed, 0 failed |
+| `npm test` | ✅ 185 passed, 0 failed |
 | `npm run test:integration` | ✅ 32 passed, 0 failed |
 | `npm run test:fuzz` | ✅ 17 passed, 0 failed |
+| `npm run check` | ✅ typecheck + lint clean |
 
-Notable verification added recently:
-- create/load rollback on metadata failure
-- delete preserves runtime state when metadata delete fails
-- SessionStore failed writes do not mutate cached state
-- fingerprints are stable across object key order
-- concurrent idempotency-key retries replay in-flight execution
-- command history returns newest entries first
-- stdout error handler is registered/unregistered with stdio transport lifecycle
-- `load_session` persists the loaded session’s own cwd
-
----
-
-## OPERATIONAL GUARDRails (CURRENT)
-
-- **Fail-closed auth:** transport admission errors deny instead of partially admitting
-- **Anchored session-file access:** file-bearing session commands require allowed roots + existing session-looking files
-- **Replay determinism:** explicit IDs remain replay-stable; timeout responses remain terminal outcomes
-- **Canonical replay identity:** semantic equality no longer depends on object construction order
-- **In-flight idempotency safety:** concurrent same-key retries do not double-execute
-- **Persistence integrity:** SessionStore mutations are failure-atomic and copy-on-write
-- **Lifecycle integrity:** create/load/delete now preserve runtime/durable agreement on surfaced failure paths
-- **Diagnostic usefulness:** durable history now returns newest evidence first
-- **Stdio resilience:** async stdout errors no longer explode the process via unhandled stream error events
+Notable regression coverage now includes:
+- rate-limited commands do not emit `command_accepted`
+- `delete_session` uses control-plane rate-limit bucket
+- `load_session` uses source cwd for runtime creation
+- journal init failure releases lock
+- malformed discovery headers are sanitized
+- `disposeAllSessions()` resets governor accounting
+- fail-closed terminal failure remains deterministic across restart
+- auth identity reaches command execution context
+- per-connection pending-command cap rejects overflow
+- SessionStore cross-instance metadata mutations remain serialized
 
 ---
 
-## REPO STATE TO BE AWARE OF
+## FILES TO READ FIRST NEXT SESSION
 
-There are still unrelated unstaged changes in the working tree that were **not** part of the two recent commits.
+### Core implementation
+- `src/session-manager.ts`
+- `src/server.ts`
+- `src/command-journal.ts`
+- `src/session-store.ts`
+- `src/command-classification.ts`
+- `src/resource-governor.ts`
+- `src/server-command-handlers.ts`
+- `src/types.ts`
 
-Current remaining modified files include:
-- `AGENTS.md`
+### Regression coverage
+- `src/test.ts`
+- `src/test-command-classification.ts`
+- `src/test-integration.ts`
+- `src/test-fuzz.ts`
+
+### Documentation
 - `PROTOCOL.md`
+- `docs/client-guide.md`
+- `docs/adr/0020-failure-atomic-lifecycle-and-canonical-replay.md`
+- `docs/adr/0019-durable-command-journal-foundation.md`
+- `docs/adr/0007-session-persistence.md`
+- `AGENTS.md`
+
+---
+
+## WORKING TREE STATE
+
+The repo is **not clean**.
+
+This pass directly updated:
+- `src/command-classification.ts`
+- `src/command-journal.ts`
+- `src/resource-governor.ts`
+- `src/server-command-handlers.ts`
+- `src/server.ts`
+- `src/session-manager.ts`
+- `src/session-store.ts`
+- `src/types.ts`
+- `src/test-command-classification.ts`
+- `src/test-integration.ts`
+- `src/test.ts`
+- `PROTOCOL.md`
+- `docs/client-guide.md`
+- `next_session_prompt.md`
+
+Other files are also already dirty in the working tree and should be treated carefully unless explicitly continuing them:
+- `AGENTS.md`
 - `docs/adr/0014-pluggable-authentication.md`
 - `src/auth.ts`
 - `src/command-router.ts`
-- `src/resource-governor.ts`
 - `src/server-ui-context.ts`
-- `src/test-integration.ts`
-- `src/types.ts`
 - `src/validation.ts`
 
-Treat those as separate work unless explicitly continuing them.
+Do **not** assume the tree is ready to commit as one blob without reviewing file-by-file intent.
 
 ---
 
-## RECOMMENDED NEXT STEPS
+## OPERATIONAL GUARDRAILS (CURRENT)
 
-1. Finish migrating remaining core `console.*` paths to the structured logger abstraction.
-2. Decide whether newest-first history should remain file-read based or move to a reverse-scan strategy if journal size grows materially.
-3. Review the remaining unstaged trust-boundary/doc changes and either land or discard them explicitly.
-4. If multi-user deployment becomes real, define principal propagation + session authorization before expanding server exposure.
-5. If multi-root serving is needed, design an explicit root registry/capability model rather than broadening cwd ancestry implicitly.
+- **Control-plane isolation:** cleanup/inspection commands are no longer throttled by hot session traffic.
+- **Admission truthfulness:** `command_accepted` means actual post-replay/post-rate-limit admission.
+- **Replay determinism:** explicit IDs remain stable, including fail-closed terminal failures across restart.
+- **Durable history bounded work:** history queries now scan tail-first in chunks instead of full-file materialization.
+- **Critical transport honesty:** broken critical sends are surfaced and stop the transport instead of silently pretending delivery.
+- **Principal propagation:** authenticated identity now reaches command execution context.
+- **Shutdown hardening:** timeout escalation aborts active session work and blocks late store mutation after teardown.
+- **Session discovery resilience:** malformed session headers degrade safely to `/unknown` rather than poisoning grouping logic.
+- **SessionStore freshness:** cross-instance metadata updates no longer rely only on `mtimeMs + size`.
 
 ---
 
-## ROLLBACK (LATEST PASSES)
+## DEFERRED WITH CONTRACT
+
+| Finding | Rationale | Owner | Trigger | Deadline | Blast Radius |
+|---|---|---|---|---|---|
+| Exact guaranteed terminal response delivery over broken transports | This pass made critical send failures fail-stop and observable, but true guaranteed delivery needs protocol-level ack/resume or a durable outbound queue. That is a wire-contract change, not a safe local patch. | pi-server maintainer + protocol owner | ADR approving response-ack / resumable delivery semantics | Before the next release that claims reliable terminal delivery | Clients can still miss a terminal response on transport break and must rely on explicit IDs + replay/retry |
+| Two-phase durable lifecycle intents for create/load/delete crash windows | Closing the remaining crash window between durable mutation and runtime publication/teardown requires persisted lifecycle intents plus boot recovery semantics. Too invasive for a same-pass safe landing. | pi-server maintainer | Lifecycle-intent ADR / state-machine design approval | Before clustering, multi-process orchestration, or supervisor-driven recovery work | A crash at the wrong point can still leave runtime/durable state transiently divergent until restart recovery |
+| Shrinking session-ID lock scope without reintroducing races/slot leaks | Current lock scope is correct but wide. Reducing it safely needs a reserved-session state model so slow upstream creation/switch work can move outside the critical section. | pi-server maintainer | Performance/scalability workstream or lock-timeout telemetry | Before the next performance-focused release | Same-session create/load/delete can still time out under slow upstream session operations |
+| Hard cancellation of upstream work after shutdown timeout | This pass added best-effort abort escalation and server-side mutation gating, but true hard-stop semantics need upstream `AgentSession` support for stronger cancellation guarantees. | upstream `@mariozechner/pi-coding-agent` owner + pi-server maintainer | Upstream exposes hard cancellation / shutdown-safe abort contract | Before advertising strict bounded shutdown guarantees | Upstream work may continue after timeout, though server-side state is now protected from late mutation |
+
+---
+
+## RECOMMENDED NEXT STEP ORDER
+
+If continuing immediately, use this order:
+
+1. **Protocol/ADR work for reliable terminal delivery**
+   - define ack/resume or durable outbound semantics
+2. **Lifecycle-intent ADR**
+   - add persisted `creating` / `deleting` / `loading` intent model
+3. **Lock-scope reduction design**
+   - reduce session-ID lock hold times without reopening slot leaks/races
+4. **Upstream cancellation contract**
+   - align with upstream on hard-stop semantics after shutdown timeout
+
+If not doing design work next, the safest tactical task is:
+- finish reviewing the remaining unrelated dirty files and split them into intentional commits or reverts.
+
+---
+
+## ROLLBACK (CURRENT PASS ONLY)
+
+If the current uncommitted hardening pass needs to be abandoned:
 
 ```bash
-# Revert failure-atomic lifecycle implementation
-git revert 83135cc
-
-# Revert ADR cross-links
-git revert d72d748
+git restore --source=HEAD -- \
+  src/command-classification.ts \
+  src/command-journal.ts \
+  src/resource-governor.ts \
+  src/server-command-handlers.ts \
+  src/server.ts \
+  src/session-manager.ts \
+  src/session-store.ts \
+  src/types.ts \
+  src/test-command-classification.ts \
+  src/test-integration.ts \
+  src/test.ts \
+  PROTOCOL.md \
+  docs/client-guide.md \
+  next_session_prompt.md
 
 npm run build
 npm test
 npm run test:integration
 npm run test:fuzz
+npm run check
 ```
 
 ---
@@ -238,5 +228,6 @@ npm run test:fuzz
 
 - `docs/adr/0001-atomic-outcome-storage.md`
 - `docs/adr/0007-session-persistence.md`
+- `docs/adr/0014-pluggable-authentication.md`
 - `docs/adr/0019-durable-command-journal-foundation.md`
 - `docs/adr/0020-failure-atomic-lifecycle-and-canonical-replay.md`
