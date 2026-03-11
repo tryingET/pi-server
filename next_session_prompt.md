@@ -1,137 +1,230 @@
 # pi-server: Next Session Prompt
 
 **Operating mode:** Production-ready, reliability-first  
-**Current phase:** Level 4 (Durable command journal + replay) — ADR-0019 hardening continuation complete  
-**Version:** 2.0.1 (current)  
+**Current phase:** Trust-boundary hardening + failure-atomic lifecycle pass complete  
+**Version:** 2.1.0 (current)  
 **Formalization Level:** 2 (Bounded Run)
 
 ---
 
-## SESSION STATUS (2026-03-03)
+## SESSION STATUS (2026-03-11)
 
-## ✅ ADR-0019 NEXT-STEPS PASS COMPLETE
+## ✅ TWO RELIABILITY PASSES ARE NOW LANDED
 
-This pass completed the previously deferred Level 4 hardening items:
-1. append write-failure strictness policy
-2. redaction hooks for persistence/export surfaces
-3. corruption/partial-write chaos coverage around recovery + compaction
+This repo now has two recent reliability-oriented change sets landed:
 
----
+1. **Trust-boundary hardening pass**
+   - transport auth parity
+   - anchored session-file capability validation
+   - pre-execution admission refund fixes
+   - SessionStore multi-writer serialization
+   - discovery/access alignment for project-local sessions
 
-## WHAT CHANGED THIS PASS
-
-### 1) Append write-failure strictness policy is now explicit
-
-New durable journal option:
-- `durableJournal.appendFailurePolicy`
-  - `"best_effort"` (default): log append failures and continue command flow
-  - `"fail_closed"`: mark durable state failed and fail command flow closed
-
-Fail-closed semantics:
-- Append failure during `command_accepted` / `command_started` causes command failure for non-observability commands.
-- Durable init state transitions to `failed` with explicit error details.
-- `get_startup_recovery` and `get_command_history` remain available for diagnostics.
-
-### 2) Redaction hooks added for persistence/export surfaces
-
-New durable journal hooks:
-- `durableJournal.redaction.beforePersist(entry)`
-- `durableJournal.redaction.beforeExport(result, { query })`
-
-Behavior:
-- `beforePersist` runs before journal append.
-- Immutable identity fields are protected (`commandId`, lane/phase/sequence, fingerprint, etc.).
-- `beforeExport` can redact history query payloads (entries and/or metadata like `journalPath`).
-
-### 3) Chaos coverage for malformed/partial writes
-
-Added deterministic tests for:
-- truncated/malformed tail lines during startup recovery
-- compaction behavior with malformed partial lines mixed with valid entries
-
-Guarantees validated:
-- malformed lines are skipped safely
-- recovery remains deterministic for valid explicit outcomes/in-flight entries
-- compaction rewrites to parseable retained entries while preserving replay semantics
-
-### 4) NEXUS hardening closure (deep-review addendum)
-
-Additional reliability fixes completed in the same pass:
-- `fail_closed` now enforces terminal failure when `command_finished` append fails.
-- Replay/idempotency persistence now stores the **finalized** terminal response to preserve determinism.
-- Redaction invariants now block replay-critical terminal corruption (`response` removal / `response.id` drift).
-- Stdio backpressure drop accounting increments `droppedCount` on each dropped non-critical write.
-- `PiServerOptions.durableInitTimeoutMs` now forwards to `PiSessionManager`.
+2. **Failure-atomic lifecycle + canonical replay pass**
+   - failure-atomic `create_session` / `load_session` / `delete_session`
+   - copy-on-write SessionStore mutation semantics
+   - canonical key-stable replay fingerprints
+   - in-flight idempotency-key dedupe
+   - newest-first durable command history
+   - async stdout error hardening for stdio transport
+   - `load_session` now persists source session cwd correctly
 
 ---
 
-## IMPLEMENTED IN THIS SESSION
+## LATEST COMMITS
 
-| Feature | Description | Files |
-|---|---|---|
-| Append strictness policy | Codified `best_effort` vs `fail_closed`; fail-closed latches durable state failure and fails non-observability command flow | `src/command-journal.ts`, `src/session-manager.ts`, `src/test.ts` |
-| Redaction hooks | Added `beforePersist` and `beforeExport` hooks with invariant checks for persistence safety | `src/command-journal.ts`, `src/test.ts` |
-| Journal observability extensions | `get_metrics.stores.journal` now exposes append policy + redaction hook enablement | `src/session-manager.ts`, `src/types.ts`, `src/test.ts` |
-| NEXUS hardening fixes | Terminal fail-closed enforcement + finalized outcome storage + replay-critical redaction guards + stdio drop counter + server timeout plumbing | `src/session-manager.ts`, `src/command-journal.ts`, `src/server.ts`, `src/test.ts` |
-| Chaos tests | Added partial-write recovery and malformed-compaction tests | `src/test.ts` |
+- `83135cc` — `Implement failure-atomic lifecycle and canonical replay`
+- `d72d748` — `Cross-link ADR-0020 into persistence and journal docs`
+
+New ADR:
+- `docs/adr/0020-failure-atomic-lifecycle-and-canonical-replay.md`
+
+Cross-linked ADRs:
+- `docs/adr/0007-session-persistence.md`
+- `docs/adr/0019-durable-command-journal-foundation.md`
 
 ---
 
-## TEST / VERIFICATION SNAPSHOT (THIS PASS)
+## WHAT CHANGED IN THE MOST RECENT PASS
+
+### 1) Session lifecycle is now failure-atomic
+
+`createSession()` and `loadSession()` no longer publish runtime-visible session state before metadata persistence succeeds.
+
+New ordering:
+1. reserve capacity
+2. create/bind/switch underlying session
+3. persist metadata
+4. subscribe
+5. commit runtime state
+
+Rollback behavior:
+- failed create/load disposes the session
+- governor reservation is released
+- no ghost session remains in runtime maps
+
+`deleteSession()` now removes metadata before runtime teardown.
+
+Net effect:
+- if delete fails, the session is still live
+- if delete succeeds, runtime and durable metadata agree
+
+### 2) SessionStore is now copy-on-write
+
+`SessionStore` no longer mutates cached metadata in place before disk write completes.
+
+New behavior:
+- clone metadata map before mutation
+- save durable state first
+- swap cache only after save succeeds
+- invalidate cache under lock before mutation reads
+- use file snapshot checks (`mtimeMs` + `size`) rather than loose clock-only freshness
+- stale metadata lock cleanup now checks owner PID liveness before stealing aged locks
+
+Net effect:
+- no phantom metadata after failed writes
+- better cross-instance mutation correctness
+
+### 3) Replay identity is now canonicalized
+
+`getCommandFingerprint()` no longer depends on raw object insertion order.
+
+New behavior:
+- stable key-sorted serialization
+- retry identity (`id`, `idempotencyKey`) still excluded
+
+Net effect:
+- semantically identical commands no longer conflict because of client/library key ordering drift
+
+### 4) Idempotency now dedupes in-flight retries
+
+Replay now has two layers for idempotency keys:
+- terminal cache
+- in-flight map
+
+Net effect:
+- concurrent requests sharing the same `idempotencyKey` collapse to one execution instead of double-running
+
+### 5) Durable history is now newest-first
+
+`get_command_history` now scans newest-to-oldest.
+
+Net effect:
+- bounded history queries surface the freshest incident evidence first
+- operational debugging is materially better under journal growth
+
+### 6) Stdio transport now hardens async stream failure
+
+The server now registers a `stdout` error handler while stdio transport is active.
+
+Net effect:
+- async stdout failures degrade stdio transport instead of crashing the process through an unhandled stream error event
+
+### 7) `load_session` now persists the source session cwd
+
+Metadata for loaded sessions now reflects the session file’s own header cwd, not just the server process cwd.
+
+Net effect:
+- loaded session metadata is more truthful for cross-project loads and future browsing/recovery flows
+
+---
+
+## FILES TO UNDERSTAND FIRST NEXT SESSION
+
+Core implementation:
+- `src/session-manager.ts`
+- `src/session-store.ts`
+- `src/command-replay-store.ts`
+- `src/command-journal.ts`
+- `src/server.ts`
+
+Regression coverage:
+- `src/test.ts`
+- `src/test-command-replay-store.ts`
+- `src/test-integration.ts`
+- `src/test-fuzz.ts`
+
+Documentation:
+- `docs/adr/0020-failure-atomic-lifecycle-and-canonical-replay.md`
+- `docs/adr/0007-session-persistence.md`
+- `docs/adr/0019-durable-command-journal-foundation.md`
+- `AGENTS.md`
+
+---
+
+## TEST / VERIFICATION SNAPSHOT (CURRENT)
 
 | Check | Status |
 |---|---|
-| `npm run typecheck` | ✅ |
-| `npm run lint` | ✅ |
 | `npm run build` | ✅ |
-| `npm test` | ✅ 152 passed, 0 failed |
-| `npm run test:integration` | ✅ 31 passed, 0 failed |
+| `npm test` | ✅ 177 passed, 0 failed |
+| `npm run test:integration` | ✅ 32 passed, 0 failed |
 | `npm run test:fuzz` | ✅ 17 passed, 0 failed |
-| `node --experimental-vm-modules dist/test-command-classification.js` | ✅ 36 passed, 0 failed |
-| `npm run ci` | ✅ |
 
-Notable verification:
-- Fail-closed append policy rejects command flow deterministically and keeps diagnostics surfaces available.
-- Best-effort policy preserves availability under append faults.
-- Redaction hooks affect both persisted and exported history payloads as configured.
-- Truncated/malformed journal lines do not corrupt deterministic recovery or retained replay behavior.
-- Fail-closed terminal append failures now downgrade final response and persist deterministically.
-- CI script now includes integration + fuzz gates (not just unit/main suite).
-
-## PRODUCTION READINESS GUARDRAILS (CURRENT)
-
-- **Replay determinism:** explicit command IDs always replay the same stored terminal outcome.
-- **Timeout semantics:** timeout remains a terminal response and is replay-stable.
-- **Fail-closed durability mode:** append failures can intentionally fail command flow when configured (`appendFailurePolicy: "fail_closed"`).
-- **Durability observability continuity:** `get_startup_recovery` and `get_command_history` remain available for diagnostics under durable-init/append failure conditions.
-- **Rate-limit + lifecycle ordering:** replay remains free; new executions are still bounded by governor and lifecycle events remain emitted.
+Notable verification added recently:
+- create/load rollback on metadata failure
+- delete preserves runtime state when metadata delete fails
+- SessionStore failed writes do not mutate cached state
+- fingerprints are stable across object key order
+- concurrent idempotency-key retries replay in-flight execution
+- command history returns newest entries first
+- stdout error handler is registered/unregistered with stdio transport lifecycle
+- `load_session` persists the loaded session’s own cwd
 
 ---
 
-## DEFERRED CONTRACTS
+## OPERATIONAL GUARDRails (CURRENT)
 
-No new deferred contracts were introduced in this pass.
-
-Remaining broader roadmap items:
-- optional SQLite backend decision gate
-- deterministic replay engine placement (in-process vs offline tooling)
-- schema migration tooling and fixtures
-
----
-
-## NEXT STEPS
-
-1. Evaluate and codify compliance envelope for redaction policy presets (safe defaults + examples).
-2. Add deterministic replay/export tooling contract (CLI/offline path) on top of redacted history surface.
-3. Add fault-injection matrix for journal I/O errors beyond malformed-line chaos (ENOSPC/EIO simulation harness).
+- **Fail-closed auth:** transport admission errors deny instead of partially admitting
+- **Anchored session-file access:** file-bearing session commands require allowed roots + existing session-looking files
+- **Replay determinism:** explicit IDs remain replay-stable; timeout responses remain terminal outcomes
+- **Canonical replay identity:** semantic equality no longer depends on object construction order
+- **In-flight idempotency safety:** concurrent same-key retries do not double-execute
+- **Persistence integrity:** SessionStore mutations are failure-atomic and copy-on-write
+- **Lifecycle integrity:** create/load/delete now preserve runtime/durable agreement on surfaced failure paths
+- **Diagnostic usefulness:** durable history now returns newest evidence first
+- **Stdio resilience:** async stdout errors no longer explode the process via unhandled stream error events
 
 ---
 
-## ROLLBACK (SESSION CHANGES)
+## REPO STATE TO BE AWARE OF
+
+There are still unrelated unstaged changes in the working tree that were **not** part of the two recent commits.
+
+Current remaining modified files include:
+- `AGENTS.md`
+- `PROTOCOL.md`
+- `docs/adr/0014-pluggable-authentication.md`
+- `src/auth.ts`
+- `src/command-router.ts`
+- `src/resource-governor.ts`
+- `src/server-ui-context.ts`
+- `src/test-integration.ts`
+- `src/types.ts`
+- `src/validation.ts`
+
+Treat those as separate work unless explicitly continuing them.
+
+---
+
+## RECOMMENDED NEXT STEPS
+
+1. Finish migrating remaining core `console.*` paths to the structured logger abstraction.
+2. Decide whether newest-first history should remain file-read based or move to a reverse-scan strategy if journal size grows materially.
+3. Review the remaining unstaged trust-boundary/doc changes and either land or discard them explicitly.
+4. If multi-user deployment becomes real, define principal propagation + session authorization before expanding server exposure.
+5. If multi-root serving is needed, design an explicit root registry/capability model rather than broadening cwd ancestry implicitly.
+
+---
+
+## ROLLBACK (LATEST PASSES)
 
 ```bash
-git checkout -- src/command-journal.ts src/session-manager.ts src/server.ts src/types.ts \
-  src/test.ts package.json next_session_prompt.md
+# Revert failure-atomic lifecycle implementation
+git revert 83135cc
+
+# Revert ADR cross-links
+git revert d72d748
 
 npm run build
 npm test
@@ -141,11 +234,9 @@ npm run test:fuzz
 
 ---
 
-## UPSTREAM PROPOSALS
+## ADR INDEX FOR THIS AREA
 
-See `~/programming/pi-extensions/issue-tracker/pi-mono-upstream/` for pending upstream requests:
-- `extension-ui-wouldexceedlimit.md`
-- `shared-protocol-package.md`
-
-Historical proposal in this repo:
-- `upstream-proposal-abortcontroller.md`
+- `docs/adr/0001-atomic-outcome-storage.md`
+- `docs/adr/0007-session-persistence.md`
+- `docs/adr/0019-durable-command-journal-foundation.md`
+- `docs/adr/0020-failure-atomic-lifecycle-and-canonical-replay.md`
