@@ -965,54 +965,49 @@ export class DurableCommandJournal {
 
     await this.ensureJournalFileExists();
 
+    let raw = "";
+    try {
+      raw = await fs.readFile(this.journalPath, "utf-8");
+    } catch {
+      raw = "";
+    }
+
+    const lines = raw.split(/\r?\n/);
     const entries: CommandHistoryEntry[] = [];
     let truncated = false;
     let scannedNonEmptyLines = 0;
     const scanStartedAt = Date.now();
 
-    const fileStream = fsRegular.createReadStream(this.journalPath, { encoding: "utf-8" });
-    let rl: ReturnType<typeof readline.createInterface> | undefined;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i]?.trim();
+      if (!line) continue;
 
-    try {
-      rl = readline.createInterface({
-        input: fileStream,
-        crlfDelay: Infinity,
-      });
-
-      for await (const rawLine of rl) {
-        const line = rawLine.trim();
-        if (!line) continue;
-
-        scannedNonEmptyLines += 1;
-        const elapsedMs = Date.now() - scanStartedAt;
-        if (
-          scannedNonEmptyLines > this.historyScanMaxEntries ||
-          elapsedMs > this.historyScanMaxDurationMs
-        ) {
-          truncated = true;
-          break;
-        }
-
-        const parsed = this.parseEntryInternal(line);
-        if (!parsed.ok) {
-          continue;
-        }
-
-        const entry = parsed.entry;
-        if (!this.matchesHistoryQuery(entry, query)) {
-          continue;
-        }
-
-        if (entries.length < limit) {
-          entries.push(this.toHistoryEntry(entry));
-        } else {
-          truncated = true;
-          break;
-        }
+      scannedNonEmptyLines += 1;
+      const elapsedMs = Date.now() - scanStartedAt;
+      if (
+        scannedNonEmptyLines > this.historyScanMaxEntries ||
+        elapsedMs > this.historyScanMaxDurationMs
+      ) {
+        truncated = true;
+        break;
       }
-    } finally {
-      rl?.close();
-      fileStream.destroy();
+
+      const parsed = this.parseEntryInternal(line);
+      if (!parsed.ok) {
+        continue;
+      }
+
+      const entry = parsed.entry;
+      if (!this.matchesHistoryQuery(entry, query)) {
+        continue;
+      }
+
+      if (entries.length < limit) {
+        entries.push(this.toHistoryEntry(entry));
+      } else {
+        truncated = true;
+        break;
+      }
     }
 
     return this.applyExportRedaction(

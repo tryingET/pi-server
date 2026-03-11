@@ -45,7 +45,11 @@ import {
 } from "./server-command-handlers.js";
 import { ExtensionUIManager } from "./extension-ui.js";
 import { createServerUIContext } from "./server-ui-context.js";
-import { validateCommand, formatValidationErrors, validateSessionPath } from "./validation.js";
+import {
+  validateCommand,
+  formatValidationErrors,
+  validateSessionFileAccess,
+} from "./validation.js";
 import { ResourceGovernor, DEFAULT_CONFIG } from "./resource-governor.js";
 import {
   CommandReplayStore,
@@ -647,6 +651,23 @@ export class PiSessionManager implements SessionResolver {
   // SESSION LIFECYCLE
   // ==========================================================================
 
+  private buildSessionInfoFromSession(
+    sessionId: string,
+    session: AgentSession,
+    createdAt: Date
+  ): SessionInfo {
+    return {
+      sessionId,
+      sessionName: session.sessionName,
+      sessionFile: session.sessionFile,
+      model: session.model,
+      thinkingLevel: session.thinkingLevel,
+      isStreaming: session.isStreaming,
+      messageCount: session.messages.length,
+      createdAt: createdAt.toISOString(),
+    };
+  }
+
   async createSession(sessionId: string, cwd?: string): Promise<SessionInfo> {
     // Validate session ID (validation doesn't need lock)
     const sessionIdError = this.governor.validateSessionId(sessionId);
@@ -665,6 +686,11 @@ export class PiSessionManager implements SessionResolver {
     // Acquire lock for this session ID to prevent concurrent create/delete races
     const lock = await this.lockManager.acquire(sessionId, "createSession");
 
+    let session: AgentSession | undefined;
+    let unsubscribe: (() => void) | undefined;
+    let releaseSessionSlotOnFailure = false;
+    let metadataSaved = false;
+
     try {
       // Check for duplicate UNDER LOCK - prevents race condition
       if (this.sessions.has(sessionId)) {
@@ -677,57 +703,92 @@ export class PiSessionManager implements SessionResolver {
           `Session limit reached (${this.governor.getConfig().maxSessions} sessions)`
         );
       }
+      releaseSessionSlotOnFailure = true;
 
-      try {
-        const { session } = await this.createAgentSessionWithSanitizedNpmEnv({
-          cwd: cwd ?? process.cwd(),
-        });
+      ({ session } = await this.createAgentSessionWithSanitizedNpmEnv({
+        cwd: cwd ?? process.cwd(),
+      }));
 
-        // Wire extension UI - this is the nexus intervention!
-        // Without this, extension UI requests (select, confirm, input, etc.) hang.
-        await session.bindExtensions({
-          uiContext: createServerUIContext(sessionId, this.extensionUI, (sid, event) =>
-            this.broadcastEvent(sid, event)
-          ),
-        });
+      // Wire extension UI before exposing the session to callers.
+      await session.bindExtensions({
+        uiContext: createServerUIContext(sessionId, this.extensionUI, (sid, event) =>
+          this.broadcastEvent(sid, event)
+        ),
+      });
 
-        // Final check still under lock - handles edge case of session creation side effects
-        if (this.sessions.has(sessionId)) {
-          session.dispose();
-          throw new Error(`Session ${sessionId} already exists`);
-        }
-
-        this.sessions.set(sessionId, session);
-        this.sessionCreatedAt.set(sessionId, new Date());
-        this.versionStore.initialize(sessionId);
-        // Record heartbeat (session count already incremented by tryReserveSessionSlot)
-        this.governor.recordHeartbeat(sessionId);
-
-        // Subscribe to all events from this session
-        const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
-          this.broadcastEvent(sessionId, event);
-        });
-        this.unsubscribers.set(sessionId, unsubscribe);
-
-        // ADR-0007: Persist session metadata
-        const sessionInfo = this.getSessionInfo(sessionId)!;
-        if (!session.sessionFile) {
-          throw new Error("Session created without session file - cannot persist");
-        }
-        await this.sessionStore.save({
-          sessionId,
-          sessionFile: session.sessionFile,
-          cwd: cwd ?? process.cwd(),
-          createdAt: sessionInfo.createdAt,
-          modelId: session.model?.id,
-        });
-
-        return sessionInfo;
-      } catch (error) {
-        // Release the slot if session creation failed
-        this.governor.releaseSessionSlot();
-        throw error;
+      // Final check still under lock - handles edge case of session creation side effects
+      if (this.sessions.has(sessionId)) {
+        throw new Error(`Session ${sessionId} already exists`);
       }
+
+      if (!session.sessionFile) {
+        throw new Error("Session created without session file - cannot persist");
+      }
+
+      const createdAt = new Date();
+      const sessionInfo = this.buildSessionInfoFromSession(sessionId, session, createdAt);
+
+      // Persist metadata BEFORE publishing the live session into runtime maps.
+      await this.sessionStore.save({
+        sessionId,
+        sessionFile: session.sessionFile,
+        cwd: cwd ?? process.cwd(),
+        createdAt: sessionInfo.createdAt,
+        modelId: session.model?.id,
+      });
+      metadataSaved = true;
+
+      // Subscribe and then commit the session into runtime state.
+      unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+        this.broadcastEvent(sessionId, event);
+      });
+      this.sessions.set(sessionId, session);
+      this.sessionCreatedAt.set(sessionId, createdAt);
+      this.versionStore.initialize(sessionId);
+      this.governor.recordHeartbeat(sessionId);
+      this.unsubscribers.set(sessionId, unsubscribe);
+
+      releaseSessionSlotOnFailure = false;
+      return sessionInfo;
+    } catch (error) {
+      if (unsubscribe) {
+        try {
+          unsubscribe();
+        } catch (unsubscribeError) {
+          console.error(`[createSession] Failed to unsubscribe during rollback:`, unsubscribeError);
+        }
+      }
+      this.unsubscribers.delete(sessionId);
+      this.sessions.delete(sessionId);
+      this.sessionCreatedAt.delete(sessionId);
+      this.versionStore.delete(sessionId);
+      this.extensionUI.cancelSessionRequests(sessionId);
+
+      if (metadataSaved) {
+        try {
+          await this.sessionStore.delete(sessionId);
+        } catch (rollbackError) {
+          console.error(
+            `[createSession] Failed to roll back persisted metadata for ${sessionId}:`,
+            rollbackError
+          );
+        }
+      }
+
+      if (session) {
+        try {
+          session.dispose();
+        } catch (disposeError) {
+          console.error(`[createSession] Failed to dispose rolled-back session:`, disposeError);
+        }
+      }
+
+      if (releaseSessionSlotOnFailure) {
+        this.governor.releaseSessionSlot();
+        this.governor.cleanupStaleData(new Set(this.sessions.keys()));
+      }
+
+      throw error;
     } finally {
       lock.release();
     }
@@ -742,6 +803,11 @@ export class PiSessionManager implements SessionResolver {
       if (!session) {
         throw new Error(`Session ${sessionId} not found`);
       }
+
+      // Remove persisted metadata first so a reported delete failure does not
+      // leave runtime and durable state disagreeing about whether the session
+      // still exists.
+      await this.sessionStore.delete(sessionId);
 
       // Cancel any pending extension UI requests for this session
       this.extensionUI.cancelSessionRequests(sessionId);
@@ -777,9 +843,6 @@ export class PiSessionManager implements SessionResolver {
       for (const subscriber of this.subscribers) {
         subscriber.subscribedSessions.delete(sessionId);
       }
-
-      // ADR-0007: Remove session metadata
-      await this.sessionStore.delete(sessionId);
     } finally {
       lock.release();
     }
@@ -846,14 +909,25 @@ export class PiSessionManager implements SessionResolver {
       throw new Error(sessionIdError);
     }
 
-    // Validate session path (prevents path traversal)
-    const sessionPathError = validateSessionPath(sessionPath);
+    // Validate session path (prevents path traversal, outsider paths, and file clobbering)
+    const sessionPathError = validateSessionFileAccess(sessionPath, {
+      cwd: process.cwd(),
+      requireExistingFile: true,
+      requireSessionHeader: true,
+    });
     if (sessionPathError) {
       throw new Error(sessionPathError);
     }
 
+    const persistedFileMetadata = await this.sessionStore.readSessionFileMetadata(sessionPath);
+
     // Acquire lock for this session ID
     const lock = await this.lockManager.acquire(sessionId, "loadSession");
+
+    let session: AgentSession | undefined;
+    let unsubscribe: (() => void) | undefined;
+    let releaseSessionSlotOnFailure = false;
+    let metadataSaved = false;
 
     try {
       // Check for duplicate UNDER LOCK
@@ -867,62 +941,99 @@ export class PiSessionManager implements SessionResolver {
           `Session limit reached (${this.governor.getConfig().maxSessions} sessions)`
         );
       }
+      releaseSessionSlotOnFailure = true;
 
-      try {
-        // Create session and switch to the specified file
-        const { session } = await this.createAgentSessionWithSanitizedNpmEnv({
-          cwd: process.cwd(),
-        });
+      // Create session and switch to the specified file
+      ({ session } = await this.createAgentSessionWithSanitizedNpmEnv({
+        cwd: process.cwd(),
+      }));
 
-        // Switch to the specified session file
-        const switched = await session.switchSession(sessionPath);
-        if (!switched) {
-          session.dispose();
-          throw new Error(`Failed to load session from ${sessionPath}`);
-        }
-
-        // Wire extension UI
-        await session.bindExtensions({
-          uiContext: createServerUIContext(sessionId, this.extensionUI, (sid, event) =>
-            this.broadcastEvent(sid, event)
-          ),
-        });
-
-        // Final check still under lock
-        if (this.sessions.has(sessionId)) {
-          session.dispose();
-          throw new Error(`Session ${sessionId} already exists`);
-        }
-
-        this.sessions.set(sessionId, session);
-        this.sessionCreatedAt.set(sessionId, new Date());
-        this.versionStore.initialize(sessionId);
-        this.governor.recordHeartbeat(sessionId);
-
-        // Subscribe to events
-        const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
-          this.broadcastEvent(sessionId, event);
-        });
-        this.unsubscribers.set(sessionId, unsubscribe);
-
-        // Update session metadata
-        const sessionInfo = this.getSessionInfo(sessionId)!;
-        if (!session.sessionFile) {
-          throw new Error("Session loaded without session file - cannot persist metadata");
-        }
-        await this.sessionStore.save({
-          sessionId,
-          sessionFile: session.sessionFile,
-          cwd: process.cwd(),
-          createdAt: sessionInfo.createdAt,
-          modelId: session.model?.id,
-        });
-
-        return sessionInfo;
-      } catch (error) {
-        this.governor.releaseSessionSlot();
-        throw error;
+      // Switch to the specified session file
+      const switched = await session.switchSession(sessionPath);
+      if (!switched) {
+        throw new Error(`Failed to load session from ${sessionPath}`);
       }
+
+      // Wire extension UI before exposing the session.
+      await session.bindExtensions({
+        uiContext: createServerUIContext(sessionId, this.extensionUI, (sid, event) =>
+          this.broadcastEvent(sid, event)
+        ),
+      });
+
+      // Final check still under lock
+      if (this.sessions.has(sessionId)) {
+        throw new Error(`Session ${sessionId} already exists`);
+      }
+
+      if (!session.sessionFile) {
+        throw new Error("Session loaded without session file - cannot persist metadata");
+      }
+
+      const createdAt = new Date();
+      const sessionInfo = this.buildSessionInfoFromSession(sessionId, session, createdAt);
+
+      // Persist metadata BEFORE publishing runtime visibility.
+      await this.sessionStore.save({
+        sessionId,
+        sessionFile: session.sessionFile,
+        cwd: persistedFileMetadata.cwd,
+        createdAt: sessionInfo.createdAt,
+        modelId: session.model?.id,
+        sessionName: session.sessionName,
+      });
+      metadataSaved = true;
+
+      unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+        this.broadcastEvent(sessionId, event);
+      });
+      this.sessions.set(sessionId, session);
+      this.sessionCreatedAt.set(sessionId, createdAt);
+      this.versionStore.initialize(sessionId);
+      this.governor.recordHeartbeat(sessionId);
+      this.unsubscribers.set(sessionId, unsubscribe);
+
+      releaseSessionSlotOnFailure = false;
+      return sessionInfo;
+    } catch (error) {
+      if (unsubscribe) {
+        try {
+          unsubscribe();
+        } catch (unsubscribeError) {
+          console.error(`[loadSession] Failed to unsubscribe during rollback:`, unsubscribeError);
+        }
+      }
+      this.unsubscribers.delete(sessionId);
+      this.sessions.delete(sessionId);
+      this.sessionCreatedAt.delete(sessionId);
+      this.versionStore.delete(sessionId);
+      this.extensionUI.cancelSessionRequests(sessionId);
+
+      if (metadataSaved) {
+        try {
+          await this.sessionStore.delete(sessionId);
+        } catch (rollbackError) {
+          console.error(
+            `[loadSession] Failed to roll back persisted metadata for ${sessionId}:`,
+            rollbackError
+          );
+        }
+      }
+
+      if (session) {
+        try {
+          session.dispose();
+        } catch (disposeError) {
+          console.error(`[loadSession] Failed to dispose rolled-back session:`, disposeError);
+        }
+      }
+
+      if (releaseSessionSlotOnFailure) {
+        this.governor.releaseSessionSlot();
+        this.governor.cleanupStaleData(new Set(this.sessions.keys()));
+      }
+
+      throw error;
     } finally {
       lock.release();
     }
@@ -1561,10 +1672,23 @@ export class PiSessionManager implements SessionResolver {
       });
     }
 
+    let extensionUIRateLimitGeneration: number | undefined;
+    const refundAdmissionCharges = () => {
+      if (typeof rateLimitResult.generation === "number") {
+        this.governor.refundCommand(rateLimitKey, rateLimitResult.generation);
+      }
+      if (sessionId && typeof extensionUIRateLimitGeneration === "number") {
+        this.governor.refundExtensionUIResponse(sessionId, extensionUIRateLimitGeneration);
+      }
+    };
+
     // Additional rate limiting for extension_ui_response (prevents spam)
     if (commandType === "extension_ui_response" && sessionId) {
       const extRateLimitResult = this.governor.canExecuteExtensionUIResponse(sessionId);
       if (!extRateLimitResult.allowed) {
+        if (typeof rateLimitResult.generation === "number") {
+          this.governor.refundCommand(rateLimitKey, rateLimitResult.generation);
+        }
         return finalizeResponse({
           id,
           type: "response",
@@ -1573,11 +1697,13 @@ export class PiSessionManager implements SessionResolver {
           error: extRateLimitResult.reason,
         });
       }
+      extensionUIRateLimitGeneration = extRateLimitResult.generation;
     }
 
     // Reject before starting execution if we cannot track this explicit command ID.
     // This prevents side effects from commands that are rejected as "server busy".
     if (isExplicitId && !this.replayStore.canRegisterInFlight(id)) {
+      refundAdmissionCharges();
       return finalizeResponse({
         id,
         type: "response",
@@ -1667,19 +1793,21 @@ export class PiSessionManager implements SessionResolver {
       }
     );
 
-    // Track in-flight if we have an explicit ID
-    let inFlightRecord: InFlightCommandRecord | undefined;
-    if (id) {
-      inFlightRecord = {
-        commandType,
-        laneKey,
-        fingerprint,
-        promise: commandExecution,
-      };
+    // Track in-flight execution for duplicate ID replay and concurrent idempotency-key dedupe.
+    const inFlightRecord: InFlightCommandRecord = {
+      commandType,
+      laneKey,
+      fingerprint,
+      promise: commandExecution,
+    };
+    let explicitInFlightRegistered = false;
+    let idempotencyInFlightRegistered = false;
 
+    if (id) {
       // ADR-0001: Reject if in-flight limit reached (don't evict - breaks dependencies)
       const registered = this.replayStore.registerInFlight(id, inFlightRecord);
       if (!registered) {
+        refundAdmissionCharges();
         return finalizeResponse({
           id,
           type: "response",
@@ -1688,6 +1816,12 @@ export class PiSessionManager implements SessionResolver {
           error: "Server busy - too many concurrent commands. Please retry.",
         });
       }
+      explicitInFlightRegistered = true;
+    }
+
+    if (idempotencyKey) {
+      this.replayStore.registerIdempotencyInFlight(command, idempotencyKey, inFlightRecord);
+      idempotencyInFlightRegistered = true;
     }
 
     this.registerInFlightCommand(commandExecution);
@@ -1738,14 +1872,14 @@ export class PiSessionManager implements SessionResolver {
       } catch (outcomeError) {
         console.error(`[executeCommand] Failed to store command outcome for ${id}:`, outcomeError);
       }
+    }
 
-      // Unregister in-flight after storing outcome
-      if (this.replayStore.getInFlight(id) === inFlightRecord) {
-        this.replayStore.unregisterInFlight(id, inFlightRecord!);
-      }
-    } else if (id && this.replayStore.getInFlight(id) === inFlightRecord) {
-      // Synthetic ID: still need to unregister in-flight
-      this.replayStore.unregisterInFlight(id, inFlightRecord!);
+    if (explicitInFlightRegistered && id && this.replayStore.getInFlight(id) === inFlightRecord) {
+      this.replayStore.unregisterInFlight(id, inFlightRecord);
+    }
+
+    if (idempotencyInFlightRegistered && idempotencyKey) {
+      this.replayStore.unregisterIdempotencyInFlight(command, idempotencyKey, inFlightRecord);
     }
 
     // Cache terminal idempotency outcome (including timeout responses)

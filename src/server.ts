@@ -16,7 +16,12 @@ import { PiSessionManager } from "./session-manager.js";
 import type { DurableCommandJournalOptions } from "./command-journal.js";
 import type { RpcCommand, RpcResponse, Subscriber, RpcBroadcast } from "./types.js";
 import { getSessionId as getSessionIdFromCmd, isCreateSessionResponse } from "./types.js";
-import { type AuthProvider, type AuthContext, AllowAllAuthProvider } from "./auth.js";
+import {
+  type AuthProvider,
+  type AuthContext,
+  type AuthResult,
+  AllowAllAuthProvider,
+} from "./auth.js";
 import {
   MetricsEmitter,
   type MetricsSink,
@@ -155,6 +160,8 @@ interface StdioState {
   droppedCount: number;
   /** Whether drain handler is registered. */
   drainHandlerRegistered: boolean;
+  /** Whether stdout has entered a broken terminal state after an async stream error. */
+  broken?: boolean;
 }
 
 /**
@@ -170,6 +177,13 @@ export function sendWithStdioBackpressure(
   options: { isCritical?: boolean } = {}
 ): boolean {
   const { isCritical = false } = options;
+
+  if (state.broken) {
+    if (!isCritical) {
+      state.droppedCount += 1;
+    }
+    return false;
+  }
 
   // Under active backpressure, drop non-critical messages.
   if (state.hasBackpressure && !isCritical) {
@@ -333,6 +347,8 @@ export class PiServer {
   private startupRecoverySummaryEventEnabled = true;
   /** Whether startup_recovery_summary includes sensitive details. */
   private startupRecoverySummaryIncludeSensitiveData = false;
+  /** Async stdout error handler for stdio transport resilience. */
+  private stdoutErrorHandler: ((error: Error) => void) | null = null;
 
   constructor(options: PiServerOptions = {}) {
     this.authProvider = options.authProvider ?? new AllowAllAuthProvider();
@@ -452,7 +468,13 @@ export class PiServer {
     });
 
     // Setup stdio transport
-    this.stdinInterface = this.setupStdio();
+    this.registerStdoutErrorHandler();
+    try {
+      this.stdinInterface = await this.setupStdio();
+    } catch (error) {
+      this.unregisterStdoutErrorHandler();
+      throw error;
+    }
 
     // ADR-0007: Start periodic session metadata cleanup (every hour)
     this.sessionManager.startSessionCleanup(3600000);
@@ -581,6 +603,7 @@ export class PiServer {
       this.stdinInterface = null;
       this.logger.debug("Stdin closed");
     }
+    this.unregisterStdoutErrorHandler();
 
     // Initiate session manager shutdown (broadcasts notification, drains commands)
     const result = await this.sessionManager.initiateShutdown(timeoutMs);
@@ -625,14 +648,55 @@ export class PiServer {
     this.logger.info("Shutdown complete", { uptimeMs });
   }
 
+  private async authenticateTransport(authContext: AuthContext): Promise<AuthResult> {
+    try {
+      return await Promise.resolve(this.authProvider.authenticate(authContext));
+    } catch (error) {
+      const authError = error instanceof Error ? error : new Error(String(error));
+      this.logger.logError("Authentication provider threw", authError, {
+        transport: authContext.transport,
+      });
+      return { allowed: false, reason: "Authentication error" };
+    }
+  }
+
+  private registerStdoutErrorHandler(): void {
+    if (this.stdoutErrorHandler) {
+      return;
+    }
+
+    this.stdoutErrorHandler = (error: Error) => {
+      this.stdioState.broken = true;
+      this.stdioState.hasBackpressure = true;
+      this.logger.logError("Stdout stream error; stdio transport degraded", error, {
+        transport: "stdio",
+      });
+    };
+
+    process.stdout.on("error", this.stdoutErrorHandler);
+  }
+
+  private unregisterStdoutErrorHandler(): void {
+    if (!this.stdoutErrorHandler) {
+      return;
+    }
+
+    process.stdout.off("error", this.stdoutErrorHandler);
+    this.stdoutErrorHandler = null;
+    this.stdioState.broken = false;
+  }
+
   // ==========================================================================
   // WEBSOCKET TRANSPORT
   // ==========================================================================
 
   private setupWebSocket(wss: WebSocketServer): void {
     wss.on("connection", async (ws: WebSocket, request: any) => {
-      // Check connection limit
-      const connResult = this.sessionManager.getGovernor().canAcceptConnection();
+      const governor = this.sessionManager.getGovernor();
+
+      // Reserve connection capacity before auth completes so pending auth flows
+      // cannot bypass maxConnections.
+      const connResult = governor.tryReserveConnectionSlot();
       if (!connResult.allowed) {
         this.logger.warn("Connection rejected", { reason: connResult.reason });
         try {
@@ -643,39 +707,7 @@ export class PiServer {
         return;
       }
 
-      // Authenticate connection
-      const authContext: AuthContext = {
-        request,
-        websocket: {
-          remoteAddress: request.socket?.remoteAddress,
-          secure: request.socket?.encrypted ?? false,
-        },
-        serverStartTime: this.serverStartTime,
-        connectionCount: this.sessionManager.getGovernor().getConnectionCount(),
-      };
-
-      const authResult = await Promise.resolve(this.authProvider.authenticate(authContext));
-      if (!authResult.allowed) {
-        this.logger.warn("Authentication failed", { reason: authResult.reason });
-        try {
-          ws.close(1008, authResult.reason); // 1008 = Policy Violation
-        } catch {
-          // Ignore close errors
-        }
-        return;
-      }
-
-      // Register connection
-      this.sessionManager.getGovernor().registerConnection();
-
-      // Record connection metric
-      this.metrics.counter(MetricNames.CONNECTIONS_TOTAL, 1);
-      this.metrics.gauge(
-        MetricNames.CONNECTIONS_ACTIVE,
-        this.sessionManager.getGovernor().getConnectionCount()
-      );
-
-      // Initialize heartbeat state
+      // Initialize heartbeat state early so cleanup is safe on any path.
       const heartbeatState: WebSocketConnectionState = {
         waitingForPong: false,
         lastPongAt: Date.now(),
@@ -691,6 +723,71 @@ export class PiServer {
         },
         subscribedSessions: new Set(),
       };
+
+      let cleanedUp = false;
+      let connectionActivated = false;
+      let subscriberAdded = false;
+      const cleanupConnection = () => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        stopHeartbeat(heartbeatState);
+        if (subscriberAdded) {
+          this.sessionManager.removeSubscriber(subscriber);
+        }
+        if (connectionActivated) {
+          governor.unregisterConnection();
+          this.metrics.gauge(MetricNames.CONNECTIONS_ACTIVE, governor.getConnectionCount());
+        } else {
+          governor.releaseReservedConnection();
+        }
+      };
+
+      ws.on("close", () => {
+        cleanupConnection();
+      });
+
+      ws.on("error", (error) => {
+        console.error(`[WebSocket] Connection error:`, error);
+        cleanupConnection();
+      });
+
+      // Authenticate connection
+      const authContext: AuthContext = {
+        transport: "websocket",
+        request,
+        websocket: {
+          remoteAddress: request.socket?.remoteAddress,
+          secure: request.socket?.encrypted ?? false,
+        },
+        serverStartTime: this.serverStartTime,
+        connectionCount: governor.getConnectionCount(),
+      };
+
+      const authResult = await this.authenticateTransport(authContext);
+      if (!authResult.allowed) {
+        this.logger.warn("Authentication failed", {
+          transport: "websocket",
+          reason: authResult.reason,
+        });
+        cleanupConnection();
+        try {
+          ws.close(1008, authResult.reason); // 1008 = Policy Violation
+        } catch {
+          // Ignore close errors
+        }
+        return;
+      }
+
+      if (cleanedUp) {
+        return;
+      }
+
+      governor.activateReservedConnection();
+      connectionActivated = true;
+
+      // Record connection metric
+      this.metrics.counter(MetricNames.CONNECTIONS_TOTAL, 1);
+      this.metrics.gauge(MetricNames.CONNECTIONS_ACTIVE, governor.getConnectionCount());
 
       // Send server_ready to new connection (critical - must be delivered)
       const readyEvent: RpcBroadcast = {
@@ -714,20 +811,7 @@ export class PiServer {
       }
 
       this.sessionManager.addSubscriber(subscriber);
-
-      let cleanedUp = false;
-      const cleanupConnection = () => {
-        if (cleanedUp) return;
-        cleanedUp = true;
-        stopHeartbeat(heartbeatState);
-        this.sessionManager.removeSubscriber(subscriber);
-        this.sessionManager.getGovernor().unregisterConnection();
-        // Update connection metrics
-        this.metrics.gauge(
-          MetricNames.CONNECTIONS_ACTIVE,
-          this.sessionManager.getGovernor().getConnectionCount()
-        );
-      };
+      subscriberAdded = true;
 
       // Start heartbeat monitoring
       startHeartbeat(ws, heartbeatState);
@@ -744,7 +828,7 @@ export class PiServer {
 
       ws.on("message", async (data: Buffer) => {
         // Check message size limit
-        const sizeResult = this.sessionManager.getGovernor().canAcceptMessage(data.length);
+        const sizeResult = governor.canAcceptMessage(data.length);
         if (!sizeResult.allowed) {
           const errorResponse: RpcResponse = {
             type: "response",
@@ -774,15 +858,6 @@ export class PiServer {
           sendWithBackpressure(ws, JSON.stringify(errorResponse), { isCritical: true });
         }
       });
-
-      ws.on("close", () => {
-        cleanupConnection();
-      });
-
-      ws.on("error", (error) => {
-        console.error(`[WebSocket] Connection error:`, error);
-        cleanupConnection();
-      });
     });
   }
 
@@ -790,24 +865,40 @@ export class PiServer {
   // STDIO TRANSPORT
   // ==========================================================================
 
-  private setupStdio(): readline.Interface {
+  private async setupStdio(): Promise<readline.Interface> {
     const rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
       terminal: false,
     });
 
+    const authContext: AuthContext = {
+      transport: "stdio",
+      serverStartTime: this.serverStartTime,
+      connectionCount: this.sessionManager.getGovernor().getConnectionCount(),
+    };
+    const authResult = await this.authenticateTransport(authContext);
+    const stdioAuthenticated = authResult.allowed;
+
+    if (!stdioAuthenticated) {
+      this.logger.warn("Authentication failed", {
+        transport: "stdio",
+        reason: authResult.reason,
+      });
+    }
+
     const subscriber: Subscriber = {
       send: (data: string) => {
+        if (!stdioAuthenticated) return;
         // Use backpressure-aware write (non-critical - broadcasts can be dropped)
-        if (!sendWithStdioBackpressure(data, this.stdioState, { isCritical: false })) {
-          this.stdioState.droppedCount++;
-        }
+        sendWithStdioBackpressure(data, this.stdioState, { isCritical: false });
       },
       subscribedSessions: new Set(),
     };
 
-    this.sessionManager.addSubscriber(subscriber);
+    if (stdioAuthenticated) {
+      this.sessionManager.addSubscriber(subscriber);
+    }
 
     rl.on("line", async (line: string) => {
       // Check message size limit (bytes, not UTF-16 code units)
@@ -821,6 +912,34 @@ export class PiServer {
           error: sizeResult.reason,
         };
         // Error responses are critical
+        sendWithStdioBackpressure(JSON.stringify(errorResponse), this.stdioState, {
+          isCritical: true,
+        });
+        return;
+      }
+
+      if (!stdioAuthenticated) {
+        let id: string | undefined;
+        let commandName = "unknown";
+        try {
+          const parsed = JSON.parse(line) as Partial<RpcCommand>;
+          if (typeof parsed.id === "string") {
+            id = parsed.id;
+          }
+          if (typeof parsed.type === "string") {
+            commandName = parsed.type;
+          }
+        } catch {
+          // Ignore parse failures; auth failure still takes precedence.
+        }
+
+        const errorResponse: RpcResponse = {
+          id,
+          type: "response",
+          command: commandName,
+          success: false,
+          error: authResult.reason,
+        };
         sendWithStdioBackpressure(JSON.stringify(errorResponse), this.stdioState, {
           isCritical: true,
         });
@@ -849,7 +968,9 @@ export class PiServer {
     });
 
     rl.on("close", () => {
-      this.sessionManager.removeSubscriber(subscriber);
+      if (stdioAuthenticated) {
+        this.sessionManager.removeSubscriber(subscriber);
+      }
     });
 
     return rl;

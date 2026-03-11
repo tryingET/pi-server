@@ -110,6 +110,34 @@ describe("command-replay-store", () => {
       // Same semantic command, completely different retry identity
       assert.strictEqual(store.getCommandFingerprint(cmd1), store.getCommandFingerprint(cmd2));
     });
+
+    it("is stable across object key order", () => {
+      const store = new CommandReplayStore();
+      const cmd1 = makeCommand({
+        type: "navigate_tree",
+        sessionId: "s1",
+        targetId: "node-1",
+        options: {
+          summarize: true,
+          customInstructions: "focus",
+          replaceInstructions: false,
+          label: "alpha",
+        },
+      });
+      const cmd2 = makeCommand({
+        options: {
+          label: "alpha",
+          replaceInstructions: false,
+          customInstructions: "focus",
+          summarize: true,
+        },
+        targetId: "node-1",
+        sessionId: "s1",
+        type: "navigate_tree",
+      });
+
+      assert.strictEqual(store.getCommandFingerprint(cmd1), store.getCommandFingerprint(cmd2));
+    });
   });
 
   // ==========================================================================
@@ -364,6 +392,43 @@ describe("command-replay-store", () => {
       if (result.kind === "conflict") {
         assert.strictEqual(result.response.success, false);
         assert.ok(result.response.error?.includes("Conflicting idempotencyKey"));
+      }
+    });
+
+    it("returns replay_inflight for matching in-flight idempotency key", async () => {
+      const store = new CommandReplayStore();
+      const command1 = makeCommand({
+        id: "cmd-1",
+        type: "get_state",
+        sessionId: "s1",
+        idempotencyKey: "key1",
+      });
+      const command2 = makeCommand({
+        id: "cmd-2",
+        type: "get_state",
+        sessionId: "s1",
+        idempotencyKey: "key1",
+      });
+      const fingerprint = store.getCommandFingerprint(command1);
+
+      const responsePromise = Promise.resolve(
+        makeResponse({ id: "cmd-1", command: "get_state", success: true })
+      );
+      const inFlight = {
+        commandType: "get_state",
+        laneKey: "session:s1",
+        fingerprint,
+        promise: responsePromise,
+      };
+
+      store.registerIdempotencyInFlight(command1, "key1", inFlight);
+
+      const result = store.checkReplay(command2, fingerprint);
+      assert.strictEqual(result.kind, "replay_inflight");
+      if (result.kind === "replay_inflight") {
+        const response = await result.promise;
+        assert.strictEqual(response.id, "cmd-2");
+        assert.strictEqual(response.replayed, true);
       }
     });
 

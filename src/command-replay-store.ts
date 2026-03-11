@@ -23,6 +23,52 @@ const DEFAULT_MAX_IN_FLIGHT_COMMANDS = 10000;
 /** Reserved prefix for server-generated command IDs. Client IDs matching this are rejected. */
 export const SYNTHETIC_ID_PREFIX = "anon:";
 
+function stableJsonStringify(value: unknown, seen = new WeakSet<object>()): string | undefined {
+  if (value === null) return "null";
+
+  switch (typeof value) {
+    case "string":
+    case "boolean":
+      return JSON.stringify(value);
+    case "number":
+      return Number.isFinite(value) ? JSON.stringify(value) : "null";
+    case "bigint":
+      return JSON.stringify(value.toString());
+    case "undefined":
+    case "function":
+    case "symbol":
+      return undefined;
+    case "object": {
+      if (Array.isArray(value)) {
+        return `[${value.map((item) => stableJsonStringify(item, seen) ?? "null").join(",")}]`;
+      }
+
+      if (seen.has(value)) {
+        return JSON.stringify("[Circular]");
+      }
+      seen.add(value);
+
+      const entries = Object.entries(value)
+        .filter(([, entryValue]) => {
+          const entryType = typeof entryValue;
+          return (
+            entryValue !== undefined &&
+            entryType !== "function" &&
+            entryType !== "symbol"
+          );
+        })
+        .sort(([left], [right]) => left.localeCompare(right));
+
+      const serialized = `{${entries
+        .map(([key, entryValue]) => `${JSON.stringify(key)}:${stableJsonStringify(entryValue, seen)}`)
+        .join(",")}}`;
+
+      seen.delete(value);
+      return serialized;
+    }
+  }
+}
+
 /**
  * Record of a completed command execution.
  * Used for dependency resolution and duplicate-id replay.
@@ -144,6 +190,8 @@ export class CommandReplayStore {
 
   /** Idempotency replay cache. */
   private idempotencyCache = new Map<string, IdempotencyCacheEntry>();
+  /** In-flight commands by idempotency key for concurrent retry deduplication. */
+  private idempotencyInFlightByKey = new Map<string, InFlightCommandRecord>();
 
   /** Sequence for synthetic command IDs when client omits id. */
   private syntheticCommandSequence = 0;
@@ -218,7 +266,7 @@ export class CommandReplayStore {
    */
   getCommandFingerprint(command: RpcCommand): string {
     const { id: _id, idempotencyKey: _key, ...rest } = command;
-    return JSON.stringify(rest);
+    return stableJsonStringify(rest) ?? "null";
   }
 
   // ==========================================================================
@@ -255,6 +303,26 @@ export class CommandReplayStore {
       fingerprint: input.fingerprint,
       response: input.response,
     });
+  }
+
+  registerIdempotencyInFlight(
+    command: RpcCommand,
+    idempotencyKey: string,
+    record: InFlightCommandRecord
+  ): void {
+    const cacheKey = this.buildIdempotencyCacheKey(command, idempotencyKey);
+    this.idempotencyInFlightByKey.set(cacheKey, record);
+  }
+
+  unregisterIdempotencyInFlight(
+    command: RpcCommand,
+    idempotencyKey: string,
+    record: InFlightCommandRecord
+  ): void {
+    const cacheKey = this.buildIdempotencyCacheKey(command, idempotencyKey);
+    if (this.idempotencyInFlightByKey.get(cacheKey) === record) {
+      this.idempotencyInFlightByKey.delete(cacheKey);
+    }
   }
 
   // ==========================================================================
@@ -434,6 +502,29 @@ export class CommandReplayStore {
           response: this.cloneResponseForRequest({ ...cached.response, replayed: true }, id),
         };
       }
+
+      const inFlightByKey = this.idempotencyInFlightByKey.get(cacheKey);
+      if (inFlightByKey) {
+        if (inFlightByKey.fingerprint !== fingerprint) {
+          return {
+            kind: "conflict",
+            response: this.createConflictResponse(
+              id,
+              commandType,
+              "idempotencyKey",
+              idempotencyKey,
+              inFlightByKey.commandType
+            ),
+          };
+        }
+
+        return {
+          kind: "replay_inflight",
+          promise: inFlightByKey.promise.then((response) =>
+            this.cloneResponseForRequest({ ...response, replayed: true }, id)
+          ),
+        };
+      }
     }
 
     // 2. Check for explicit command ID
@@ -496,6 +587,7 @@ export class CommandReplayStore {
     this.commandOutcomes.clear();
     this.commandOutcomeOrder = [];
     this.idempotencyCache.clear();
+    this.idempotencyInFlightByKey.clear();
     // Don't reset syntheticCommandSequence - processStartTime ensures uniqueness
     this.inFlightRejections = 0;
   }

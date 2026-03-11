@@ -16,6 +16,7 @@ import fs from "fs/promises";
 import fsRegular from "fs";
 import path from "path";
 import type { SessionInfo } from "./types.js";
+import { getDefaultAllowedSessionDirectories } from "./validation.js";
 
 /** Metadata persisted for each session. */
 export interface StoredSessionMetadata {
@@ -97,23 +98,41 @@ const METADATA_FILE = "sessions-metadata.json";
 /** Maximum metadata file size (prevent OOM from corrupt files) */
 const MAX_METADATA_SIZE = 1024 * 1024; // 1MB
 
+/** Cross-process metadata lock acquisition timeout. */
+const METADATA_LOCK_TIMEOUT_MS = 5000;
+/** Wait between metadata lock retries. */
+const METADATA_LOCK_RETRY_MS = 25;
+/** Stale metadata lock timeout (e.g. crashed writer). */
+const METADATA_LOCK_STALE_MS = 30000;
+/** Bound recursive discovery of session roots. */
+const MAX_DISCOVERY_DEPTH = 4;
+const MAX_DISCOVERY_NODES = 10000;
+
 /**
  * Session metadata store.
  *
- * Thread-safety: All operations are atomic via file locking.
- * Callers should use SessionLockManager for in-memory coordination.
+ * Process-safety: metadata mutations are serialized through a single in-process
+ * writer chain and a cross-process lock file so concurrent save/delete/update
+ * operations cannot lose updates across SessionStore instances.
+ * Callers should still use SessionLockManager for per-session in-memory coordination.
  */
 export class SessionStore {
   private readonly dataDir: string;
   private readonly sessionsDir: string;
   private readonly serverVersion: string;
   private readonly metadataPath: string;
+  private readonly metadataLockPath: string;
   private metadataCache: Map<string, StoredSessionMetadata> | null = null;
   private lastLoadTime = 0;
+  private cachedMetadataMtimeMs: number | null = null;
+  private cachedMetadataSize: number | null = null;
+  private cachedMetadataMissing = true;
   /** Cache TTL in ms (5 seconds) */
   private readonly cacheTtl = 5000;
   /** Count of metadata resets due to oversized/corrupt files */
   private metadataResetCount = 0;
+  /** Serializes metadata mutations to prevent lost updates under concurrency. */
+  private mutationChain: Promise<void> = Promise.resolve();
 
   constructor(config: SessionStoreConfig = {}) {
     this.dataDir = config.dataDir ?? path.join(process.env.HOME ?? "~", ".pi", "agent", "server");
@@ -121,6 +140,7 @@ export class SessionStore {
       config.sessionsDir ?? path.join(process.env.HOME ?? "~", ".pi", "agent", "sessions");
     this.serverVersion = config.serverVersion ?? DEFAULT_SERVER_VERSION;
     this.metadataPath = path.join(this.dataDir, METADATA_FILE);
+    this.metadataLockPath = `${this.metadataPath}.lock`;
   }
 
   /**
@@ -142,9 +162,22 @@ export class SessionStore {
   private async loadMetadata(): Promise<Map<string, StoredSessionMetadata>> {
     const now = Date.now();
 
-    // Return cached if fresh
+    // Return cached if fresh AND the metadata file snapshot still matches.
     if (this.metadataCache && now - this.lastLoadTime < this.cacheTtl) {
-      return this.metadataCache;
+      try {
+        const stat = await fs.stat(this.metadataPath);
+        if (
+          !this.cachedMetadataMissing &&
+          this.cachedMetadataMtimeMs === stat.mtimeMs &&
+          this.cachedMetadataSize === stat.size
+        ) {
+          return this.metadataCache;
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT" && this.cachedMetadataMissing) {
+          return this.metadataCache;
+        }
+      }
     }
 
     await this.ensureDataDir();
@@ -169,6 +202,9 @@ export class SessionStore {
         }
         this.metadataCache = new Map();
         this.lastLoadTime = now;
+        this.cachedMetadataMtimeMs = null;
+        this.cachedMetadataSize = null;
+        this.cachedMetadataMissing = true;
         return this.metadataCache;
       }
 
@@ -203,12 +239,18 @@ export class SessionStore {
 
       this.metadataCache = map;
       this.lastLoadTime = now;
+      this.cachedMetadataMtimeMs = stat.mtimeMs;
+      this.cachedMetadataSize = stat.size;
+      this.cachedMetadataMissing = false;
       return map;
     } catch (error) {
       if ((error as any).code === "ENOENT") {
         // File doesn't exist yet - return empty map
         this.metadataCache = new Map();
         this.lastLoadTime = now;
+        this.cachedMetadataMtimeMs = null;
+        this.cachedMetadataSize = null;
+        this.cachedMetadataMissing = true;
         return this.metadataCache;
       }
 
@@ -216,6 +258,9 @@ export class SessionStore {
       // Return empty on error (don't crash)
       this.metadataCache = new Map();
       this.lastLoadTime = now;
+      this.cachedMetadataMtimeMs = null;
+      this.cachedMetadataSize = null;
+      this.cachedMetadataMissing = false;
       return this.metadataCache;
     }
   }
@@ -252,9 +297,151 @@ export class SessionStore {
     await fs.writeFile(tempPath, JSON.stringify(data, null, 2), "utf-8");
     await fs.rename(tempPath, this.metadataPath);
 
-    // Update cache
-    this.metadataCache = metadata;
+    // Update cache with an isolated copy so failed future mutations cannot leak
+    // unpersisted state back into readers through shared object references.
+    this.metadataCache = this.cloneMetadataMap(metadata);
     this.lastLoadTime = Date.now();
+
+    try {
+      const stat = await fs.stat(this.metadataPath);
+      this.cachedMetadataMtimeMs = stat.mtimeMs;
+      this.cachedMetadataSize = stat.size;
+      this.cachedMetadataMissing = false;
+    } catch {
+      this.cachedMetadataMtimeMs = null;
+      this.cachedMetadataSize = null;
+      this.cachedMetadataMissing = false;
+    }
+  }
+
+  private cloneMetadataMap(
+    metadata: Map<string, StoredSessionMetadata>
+  ): Map<string, StoredSessionMetadata> {
+    return new Map(
+      Array.from(metadata.entries(), ([sessionId, value]) => [sessionId, { ...value }])
+    );
+  }
+
+  private readMetadataLockInfo(): { pid?: number; acquiredAt?: number } {
+    try {
+      const raw = fsRegular.readFileSync(this.metadataLockPath, "utf-8").trim();
+      if (!raw) {
+        return {};
+      }
+
+      const parsed = JSON.parse(raw) as { pid?: unknown; acquiredAt?: unknown };
+      return {
+        pid:
+          typeof parsed.pid === "number" && Number.isInteger(parsed.pid) && parsed.pid > 0
+            ? parsed.pid
+            : undefined,
+        acquiredAt:
+          typeof parsed.acquiredAt === "number" && Number.isFinite(parsed.acquiredAt)
+            ? parsed.acquiredAt
+            : undefined,
+      };
+    } catch {
+      return {};
+    }
+  }
+
+  private isPidAlive(pid: number): boolean {
+    if (!Number.isInteger(pid) || pid <= 0) {
+      return false;
+    }
+
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      return err?.code === "EPERM";
+    }
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  private async withMetadataFileLock<T>(operation: () => Promise<T>): Promise<T> {
+    await this.ensureDataDir();
+
+    const deadline = Date.now() + METADATA_LOCK_TIMEOUT_MS;
+    let handle: fs.FileHandle | undefined;
+
+    while (!handle) {
+      try {
+        handle = await fs.open(this.metadataLockPath, "wx");
+        await handle.writeFile(
+          JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }),
+          "utf-8"
+        );
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "EEXIST") {
+          throw error;
+        }
+
+        try {
+          const { pid, acquiredAt } = this.readMetadataLockInfo();
+          const lockAgeMs = Date.now() - (acquiredAt ?? 0);
+
+          if (lockAgeMs > METADATA_LOCK_STALE_MS) {
+            const ownerAlive = pid !== undefined && pid !== process.pid && this.isPidAlive(pid);
+            if (!ownerAlive) {
+              await fs.rm(this.metadataLockPath, { force: true });
+              continue;
+            }
+          }
+        } catch {
+          // If the lock file vanished or is unreadable, retry normally.
+        }
+
+        if (Date.now() >= deadline) {
+          throw new Error(
+            `Timed out acquiring session metadata lock after ${METADATA_LOCK_TIMEOUT_MS}ms`
+          );
+        }
+
+        await this.sleep(METADATA_LOCK_RETRY_MS);
+      }
+    }
+
+    try {
+      return await operation();
+    } finally {
+      try {
+        await handle.close();
+      } catch {
+        // Ignore close errors during lock release.
+      }
+      await fs.rm(this.metadataLockPath, { force: true });
+    }
+  }
+
+  /**
+   * Serialize metadata mutations through a single writer chain.
+   */
+  private async runMetadataMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.mutationChain;
+
+    let releaseCurrent: (() => void) | undefined;
+    this.mutationChain = new Promise<void>((resolve) => {
+      releaseCurrent = resolve;
+    });
+
+    await previous.catch(() => {
+      // Preserve queue progress even if a previous mutation failed.
+    });
+
+    try {
+      return await this.withMetadataFileLock(async () => {
+        this.invalidateCache();
+        return operation();
+      });
+    } finally {
+      releaseCurrent?.();
+    }
   }
 
   /**
@@ -263,18 +450,24 @@ export class SessionStore {
   invalidateCache(): void {
     this.metadataCache = null;
     this.lastLoadTime = 0;
+    this.cachedMetadataMtimeMs = null;
+    this.cachedMetadataSize = null;
+    this.cachedMetadataMissing = true;
   }
 
   /**
    * Save session metadata.
    */
   async save(meta: SaveSessionInput): Promise<void> {
-    const metadata = await this.loadMetadata();
-    metadata.set(meta.sessionId, {
-      ...meta,
-      serverVersion: this.serverVersion,
+    await this.runMetadataMutation(async () => {
+      const currentMetadata = await this.loadMetadata();
+      const nextMetadata = this.cloneMetadataMap(currentMetadata);
+      nextMetadata.set(meta.sessionId, {
+        ...meta,
+        serverVersion: this.serverVersion,
+      });
+      await this.saveMetadata(nextMetadata);
     });
-    await this.saveMetadata(metadata);
   }
 
   /**
@@ -289,13 +482,16 @@ export class SessionStore {
    * Delete session metadata.
    */
   async delete(sessionId: string): Promise<boolean> {
-    const metadata = await this.loadMetadata();
-    if (!metadata.has(sessionId)) {
-      return false;
-    }
-    metadata.delete(sessionId);
-    await this.saveMetadata(metadata);
-    return true;
+    return this.runMetadataMutation(async () => {
+      const currentMetadata = await this.loadMetadata();
+      if (!currentMetadata.has(sessionId)) {
+        return false;
+      }
+      const nextMetadata = this.cloneMetadataMap(currentMetadata);
+      nextMetadata.delete(sessionId);
+      await this.saveMetadata(nextMetadata);
+      return true;
+    });
   }
 
   /**
@@ -347,58 +543,97 @@ export class SessionStore {
   // SESSION DISCOVERY (ADR-0007)
   // ==========================================================================
 
+  private getDiscoveryRoots(): string[] {
+    return Array.from(
+      new Set([this.sessionsDir, ...getDefaultAllowedSessionDirectories(process.cwd())])
+    );
+  }
+
+  private async collectSessionFiles(rootDir: string): Promise<string[]> {
+    const files: string[] = [];
+    const stack: Array<{ dir: string; depth: number }> = [{ dir: rootDir, depth: 0 }];
+    let visited = 0;
+
+    while (stack.length > 0) {
+      if (visited >= MAX_DISCOVERY_NODES) {
+        break;
+      }
+
+      const item = stack.pop();
+      if (!item) {
+        break;
+      }
+      visited++;
+
+      let entries: fsRegular.Dirent[];
+      try {
+        entries = await fs.readdir(item.dir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+
+      for (const entry of entries) {
+        const fullPath = path.join(item.dir, entry.name);
+        if (entry.isDirectory()) {
+          if (item.depth < MAX_DISCOVERY_DEPTH) {
+            stack.push({ dir: fullPath, depth: item.depth + 1 });
+          }
+          continue;
+        }
+
+        if (
+          entry.isFile() &&
+          (entry.name.endsWith(".jsonl") || entry.name.endsWith(".json"))
+        ) {
+          files.push(fullPath);
+        }
+      }
+    }
+
+    return files;
+  }
+
   /**
-   * Discover all session files in the sessions directory.
-   * This scans ~/.pi/agent/sessions/ for .jsonl files.
-   * Reads the first line of each file to get the correct cwd.
+   * Discover all accessible session files for this server instance.
+   * Scans the global session root and project-local .pi/sessions roots derived
+   * from the current working directory ancestry.
    */
   async discoverSessions(): Promise<StoredSessionInfo[]> {
     const results: StoredSessionInfo[] = [];
 
-    try {
-      const entries = await fs.readdir(this.sessionsDir, { withFileTypes: true });
+    for (const rootDir of this.getDiscoveryRoots()) {
+      const sessionFiles = await this.collectSessionFiles(rootDir);
 
-      for (const entry of entries) {
-        if (!entry.isDirectory()) continue;
-        const subdir = path.join(this.sessionsDir, entry.name);
-
+      for (const filePath of sessionFiles) {
+        const file = path.basename(filePath);
         try {
-          const files = await fs.readdir(subdir);
+          const stats = await fs.stat(filePath);
 
-          for (const file of files) {
-            if (!file.endsWith(".jsonl")) continue;
+          // Extract timestamp from filename: 2026-02-22T16-09-11-130Z_6f572984.jsonl
+          const createdAt = this.extractTimestampFromFilename(file) ?? stats.mtime.toISOString();
 
-            const filePath = path.join(subdir, file);
-            const stats = await fs.stat(filePath);
+          // Use file path as session ID (or extract from filename)
+          const sessionId = file.replace(/\.(jsonl|json)$/, "");
 
-            // Extract timestamp from filename: 2026-02-22T16-09-11-130Z_6f572984.jsonl
-            const createdAt = this.extractTimestampFromFilename(file) ?? stats.mtime.toISOString();
+          // Read first line to get cwd and sessionName
+          const { cwd, sessionName } = await this.readSessionFileMetadata(filePath);
 
-            // Use file path as session ID (or extract from filename)
-            const sessionId = file.replace(/\.jsonl$/, "");
-
-            // Read first line to get cwd and sessionName
-            const { cwd, sessionName } = await this.readSessionFileMetadata(filePath);
-
-            results.push({
-              sessionId,
-              sessionFile: filePath,
-              sessionPath: filePath, // Alias for consistency with load_session
-              cwd,
-              sessionName,
-              createdAt,
-              thinkingLevel: "medium",
-              isStreaming: false,
-              messageCount: 0,
-              fileExists: true,
-            });
-          }
+          results.push({
+            sessionId,
+            sessionFile: filePath,
+            sessionPath: filePath, // Alias for consistency with load_session
+            cwd,
+            sessionName,
+            createdAt,
+            thinkingLevel: "medium",
+            isStreaming: false,
+            messageCount: 0,
+            fileExists: true,
+          });
         } catch {
-          // Ignore errors reading subdirectory
+          // Ignore unreadable/malformed session files during discovery.
         }
       }
-    } catch {
-      // Sessions directory doesn't exist yet
     }
 
     // Sort by creation date (newest first)
@@ -411,7 +646,7 @@ export class SessionStore {
    * Read the first line of a session file to get metadata.
    * Uses readline to properly handle UTF-8 and avoid truncation issues.
    */
-  private async readSessionFileMetadata(
+  async readSessionFileMetadata(
     filePath: string
   ): Promise<{ cwd: string; sessionName?: string }> {
     const readline = await import("readline");
@@ -562,40 +797,51 @@ export class SessionStore {
    * Update session name in metadata.
    */
   async updateName(sessionId: string, name: string): Promise<boolean> {
-    const metadata = await this.loadMetadata();
-    const existing = metadata.get(sessionId);
-    if (!existing) {
-      return false;
-    }
-    existing.sessionName = name;
-    await this.saveMetadata(metadata);
-    return true;
+    return this.runMetadataMutation(async () => {
+      const currentMetadata = await this.loadMetadata();
+      const existing = currentMetadata.get(sessionId);
+      if (!existing) {
+        return false;
+      }
+      const nextMetadata = this.cloneMetadataMap(currentMetadata);
+      nextMetadata.set(sessionId, {
+        ...existing,
+        sessionName: name,
+      });
+      await this.saveMetadata(nextMetadata);
+      return true;
+    });
   }
 
   /**
    * Clean up metadata entries for sessions whose files no longer exist.
    */
   async cleanup(): Promise<{ removed: number; kept: number }> {
-    const metadata = await this.loadMetadata();
-    const toRemove: string[] = [];
+    return this.runMetadataMutation(async () => {
+      const currentMetadata = await this.loadMetadata();
+      const toRemove: string[] = [];
 
-    for (const [sessionId, meta] of metadata) {
-      try {
-        await fs.access(meta.sessionFile);
-      } catch {
-        toRemove.push(sessionId);
+      for (const [sessionId, meta] of currentMetadata) {
+        try {
+          await fs.access(meta.sessionFile);
+        } catch {
+          toRemove.push(sessionId);
+        }
       }
-    }
 
-    for (const sessionId of toRemove) {
-      metadata.delete(sessionId);
-    }
+      if (toRemove.length === 0) {
+        return { removed: 0, kept: currentMetadata.size };
+      }
 
-    if (toRemove.length > 0) {
-      await this.saveMetadata(metadata);
-    }
+      const nextMetadata = this.cloneMetadataMap(currentMetadata);
+      for (const sessionId of toRemove) {
+        nextMetadata.delete(sessionId);
+      }
 
-    return { removed: toRemove.length, kept: metadata.size };
+      await this.saveMetadata(nextMetadata);
+
+      return { removed: toRemove.length, kept: nextMetadata.size };
+    });
   }
 
   /**
