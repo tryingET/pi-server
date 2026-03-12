@@ -2,6 +2,18 @@
 
 This document captures patterns, anti-patterns, and gotchas discovered during development. Read this before working on pi-server.
 
+Because parent/global AGENTS files are concatenated into every session, keep this file repo-specific and prefer pointing to canonical docs instead of duplicating large policy blocks.
+
+---
+
+## Canonical References
+
+Start here before changing behavior that crosses repo boundaries:
+- `README.md` — package shape, architecture overview, release flow
+- `PROTOCOL.md` — wire contract and client-visible semantics
+- `docs/release-policy.md` — commit, changelog, and breaking-change policy
+- `next_session_prompt.md` — current handoff / immediate priorities
+
 ---
 
 ## Architecture Principles
@@ -1081,6 +1093,8 @@ if (command.type === "switch_session") {
 ---
 
 ## Adding a New Command
+
+Quick checklist: update `types.ts`, `validation.ts`, the handler/router map, `PROTOCOL.md`, and tests. Treat stricter validation or semantic behavior changes as potential release-note / breaking-change candidates per `docs/release-policy.md`.
 
 1. **Add type to `types.ts`:**
 ```typescript
