@@ -94,6 +94,7 @@ The protocol uses semantic versioning (`MAJOR.MINOR.PATCH`):
 - Every frame MUST contain exactly one JSON object.
 - Commands are client → server.
 - Responses and events are server → client.
+- For **stdio**, server protocol output MUST use `stdout` only for newline-delimited JSON frames. Diagnostics/logging MUST use `stderr` or external sinks.
 
 ### 3.2 Admission limits
 
@@ -236,6 +237,8 @@ Replay hits MUST NOT emit `command_accepted` or `command_started`.
 
 A fingerprint is semantic payload equivalence used to detect intent drift.
 Changing semantic payload under the same identity token is a protocol conflict.
+
+Implementations SHOULD treat fingerprints as **versioned opaque digests**, not raw payload echoes. This preserves replay semantics without exposing plaintext command bodies in durable history or diagnostics.
 
 ---
 

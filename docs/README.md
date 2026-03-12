@@ -23,3 +23,8 @@ This directory holds focused documentation for different audiences.
 - **ADR-0010 (Circuit breaker):** [`adr/0010-circuit-breaker.md`](./adr/0010-circuit-breaker.md)
 - **ADR-0014 (Pluggable authentication):** [`adr/0014-pluggable-authentication.md`](./adr/0014-pluggable-authentication.md)
 - **ADR-0019 (Durable command journal foundation):** [`adr/0019-durable-command-journal-foundation.md`](./adr/0019-durable-command-journal-foundation.md)
+- **ADR-0021 (Command contract registry + protocol purity):** [`adr/0021-command-contract-registry-and-protocol-purity.md`](./adr/0021-command-contract-registry-and-protocol-purity.md)
+
+## Implementation plans
+
+- **ADR-0021 follow-through plan:** [`implementation-plan-adr-0021-follow-through.md`](./implementation-plan-adr-0021-follow-through.md)

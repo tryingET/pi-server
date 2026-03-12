@@ -53,6 +53,8 @@ echo '{"type":"create_session","sessionId":"test"}
 {"id":"cmd-1","type":"prompt","sessionId":"test","message":"Hello!"}' | npx pi-server
 ```
 
+Built-in diagnostics use `stderr` so `stdout` stays reserved for newline-delimited protocol JSON.
+
 ## Architecture
 
 ```
@@ -205,6 +207,7 @@ This validates:
 | [ADR-0010](./docs/adr/0010-circuit-breaker.md) | Circuit breaker for LLM calls |
 | [ADR-0014](./docs/adr/0014-pluggable-authentication.md) | Pluggable connection authentication (implemented) |
 | [ADR-0019](./docs/adr/0019-durable-command-journal-foundation.md) | Durable command journal foundation (Level 4) |
+| [ADR-0021](./docs/adr/0021-command-contract-registry-and-protocol-purity.md) | Command contract registry, protocol-pure stdio, and opaque replay identity |
 | [ROADMAP.md](./ROADMAP.md) | Phase tracking and milestones |
 
 ## License
