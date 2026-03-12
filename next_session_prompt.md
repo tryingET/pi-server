@@ -1,233 +1,193 @@
 # pi-server: Next Session Prompt
 
 **Operating mode:** Reliability-first, adversarially reviewed  
-**Current phase:** NEXUS hardening + atomic-completion pass landed and verified  
-**Version:** 2.1.0 (working tree)  
-**Formalization Level:** 2 (Bounded Run)
+**Current phase:** Hardening pass verified; SessionStore race fixed  
+**Version:** 2.1.0  
+**Formalization level:** 2 (Bounded Run)
 
 ---
 
-## SESSION STATUS (2026-03-11)
+## START HERE
 
-The codebase now includes **three stacked reliability passes** in effect:
+The repo should now be in a **clean working-tree state** after the latest fixes land.
 
-1. **Trust-boundary hardening pass**
-   - transport auth parity
-   - anchored session-file capability validation
-   - pre-execution admission refund fixes
-   - SessionStore multi-writer serialization
-   - discovery/access alignment for project-local sessions
+Most recent commits:
+- `f2bba0b` — `fix(session-store): harden cross-instance metadata locking`
+- `726b87e` — `style(replay): apply biome formatting`
+- `5993557` — `docs(prompt): refresh next session handoff`
+- `efcceb9` — `fix(server): harden transport and lifecycle boundaries`
 
-2. **Failure-atomic lifecycle + canonical replay pass**
-   - failure-atomic `create_session` / `load_session` / `delete_session`
-   - copy-on-write SessionStore mutation semantics
-   - canonical key-stable replay fingerprints
-   - in-flight idempotency-key dedupe
-   - newest-first durable command history
-   - async stdout error hardening for stdio transport
-   - `load_session` persists source session cwd
+The large hardening pass and the SessionStore follow-up are now **landed and verified**.
 
-3. **NEXUS + atomic-completion pass**
-   - control-plane vs data-plane command policy
-   - dedicated rate-limit buckets for control-plane commands
-   - `command_accepted` semantics moved to true post-admission behavior
-   - `load_session` runtime cwd now uses the source session cwd
-   - `disposeAllSessions()` now clears governor accounting correctly
-   - durable journal init failure releases writer lock
-   - session discovery sanitizes malformed header fields
-   - authenticated principal now propagates into command execution context
-   - per-connection pending-command caps added for websocket + stdio
-   - critical send failures now fail-stop instead of being silently ignored
-   - `validateCwd()` now requires absolute, existing directories
-   - `delete_session` now surfaces runtime cleanup failure instead of returning false success
-   - `get_command_history` now reverse-scans the journal instead of full-file reading
-   - fail-closed `command_finished` append failures now remain deterministic across restart
-   - shutdown escalation now aborts active sessions and blocks late state mutation
-   - SessionStore cache freshness now uses `mtimeMs + ctimeMs + size`
+The immediate next session is **not** “reproduce the SessionStore race” anymore.
+The right current framing is:
+
+> **Start from a clean tree, assume the known SessionStore regression is fixed, and choose the next reliability/design task deliberately.**
 
 ---
 
-## RESOLVED THIS PASS
+## CURRENT AUTHORITATIVE STATUS
 
-- **Control-plane starvation:** `delete_session` / `switch_session` no longer share session data-plane rate-limit buckets.
-- **Admission semantics drift:** replay hits and pre-admission rejections no longer emit misleading `command_accepted` / `command_started` events.
-- **`load_session` cwd drift:** runtime session creation now uses the source session header cwd when valid.
-- **Governor slot leak on disposal:** `disposeAllSessions()` now unregisters sessions correctly.
-- **Journal init lock leak:** failed durable init now releases the single-writer lock.
-- **Malformed discovery header poisoning:** non-string `cwd` / `sessionName` values now sanitize to safe defaults.
-- **Dropped auth principal:** authenticated identity now flows from transport admission into command execution context.
-- **Per-connection concurrency amplification:** websocket and stdio now reject overflow beyond a configured pending-command cap.
-- **Best-effort critical send lie:** critical websocket/stdio send failures are now observable and fail-stop.
-- **Weak cwd validation:** `validateCwd()` now rejects relative, missing, and non-directory paths.
-- **False-success delete:** runtime cleanup failures during `delete_session` now surface as command failure.
-- **Unbounded history read:** `get_command_history` now reverse-scans in chunks instead of `readFile()`ing the full journal.
-- **Fail-closed replay drift across restart:** fallback terminal persistence preserves explicit-ID determinism after restart.
-- **Late mutation after shutdown timeout:** shutdown now aborts active sessions and blocks late state mutation after final teardown.
-- **Cross-instance SessionStore stale-cache race:** cache freshness now detects same-size/same-mtime file replacement using `ctimeMs` too.
+### Verified now
+Latest verification snapshot:
+- `npm run check` → **PASSED**
+- `npm test` → **PASSED**
+- `npm run ci` → **PASSED**
+
+### SessionStore regression root cause
+The flaky cross-instance metadata-mutation failure was traced to **metadata lock handling**, not just cache freshness.
+
+Observed failure mode:
+- one `SessionStore` instance could observe a newly created metadata lock file
+- before that lock file's JSON payload was fully readable
+- treat it as stale/orphaned
+- remove it
+- and enter the critical section concurrently with the real writer
+
+That could collapse persisted metadata from `['a', 'b']` to only one session entry.
+
+### What fixed it
+The stabilization patch now:
+- tracks same-process live metadata locks in runtime state
+- treats the lock file's freshness (`mtime`) as authoritative during stale-lock decisions
+- only reaps stale locks conservatively
+- strengthens the regression test by running the cross-instance mutation scenario repeatedly
+
+### What is solidly landed
+The recent hardening work includes:
+- control-plane vs data-plane rate-limit policy
+- truthful `command_accepted` semantics
+- source-cwd-aligned `load_session`
+- correct governor cleanup on `disposeAllSessions()`
+- durable journal init lock release on failure
+- reverse-scan command history
+- auth principal propagation into command execution context
+- per-connection pending-command caps
+- fail-stop handling for critical transport-send failures
+- stronger `validateCwd()`
+- surfaced runtime cleanup failure for `delete_session`
+- deterministic fail-closed terminal replay across restart
+- shutdown escalation + late-mutation guard
+- SessionStore cache freshness using `mtimeMs + ctimeMs + size`
+- SessionStore cross-instance lock-race stabilization
 
 ---
 
-## VERIFICATION SNAPSHOT (CURRENT)
+## NEXT SESSION OBJECTIVE
 
-| Check | Status |
-|---|---|
-| `npm run build` | ✅ |
-| `npm test` | ✅ 185 passed, 0 failed |
-| `npm run test:integration` | ✅ 32 passed, 0 failed |
-| `npm run test:fuzz` | ✅ 17 passed, 0 failed |
-| `npm run check` | ✅ typecheck + lint clean |
+### Primary objective
+There is no known failing gate right now.
 
-Notable regression coverage now includes:
-- rate-limited commands do not emit `command_accepted`
-- `delete_session` uses control-plane rate-limit bucket
-- `load_session` uses source cwd for runtime creation
-- journal init failure releases lock
-- malformed discovery headers are sanitized
-- `disposeAllSessions()` resets governor accounting
-- fail-closed terminal failure remains deterministic across restart
-- auth identity reaches command execution context
-- per-connection pending-command cap rejects overflow
-- SessionStore cross-instance metadata mutations remain serialized
+Choose the next highest-leverage task **intentionally**, with preference for reliability/design debt that already has a clear trigger or ADR-sized shape.
+
+### Recommended starting options
+1. **Exact guaranteed terminal response delivery over broken transports**
+   - requires protocol-level ack/resume or a durable outbound delivery design
+2. **Two-phase durable lifecycle intents**
+   - requires a persisted lifecycle-intent state machine and recovery semantics
+3. **Narrower session-ID lock scope**
+   - only if there is a concrete perf/scalability reason to pay the complexity cost
+4. **Hard cancellation after shutdown timeout**
+   - depends on stronger upstream `AgentSession` guarantees
+
+### Do not start with
+- speculative new feature work without an explicit priority signal
+- cosmetic refactors
+- broad architectural rewrites without tests or an ADR trail
+
+If a new externally reported bug arrives, override this list with that concrete defect.
 
 ---
 
-## FILES TO READ FIRST NEXT SESSION
+## FILES TO READ FIRST
 
-### Core implementation
-- `src/session-manager.ts`
-- `src/server.ts`
-- `src/command-journal.ts`
+### If continuing SessionStore / persistence work
 - `src/session-store.ts`
-- `src/command-classification.ts`
-- `src/resource-governor.ts`
-- `src/server-command-handlers.ts`
-- `src/types.ts`
-
-### Regression coverage
 - `src/test.ts`
-- `src/test-command-classification.ts`
-- `src/test-integration.ts`
-- `src/test-fuzz.ts`
+- `AGENTS.md`
+- `README.md`
 
-### Documentation
-- `PROTOCOL.md`
-- `docs/client-guide.md`
-- `docs/adr/0020-failure-atomic-lifecycle-and-canonical-replay.md`
+### If picking up larger reliability/design work
+- `AGENTS.md`
+- `README.md`
 - `docs/adr/0019-durable-command-journal-foundation.md`
-- `docs/adr/0007-session-persistence.md`
-- `AGENTS.md`
-
----
-
-## WORKING TREE STATE
-
-The repo is **not clean**.
-
-This pass directly updated:
-- `src/command-classification.ts`
-- `src/command-journal.ts`
-- `src/resource-governor.ts`
-- `src/server-command-handlers.ts`
-- `src/server.ts`
 - `src/session-manager.ts`
-- `src/session-store.ts`
-- `src/types.ts`
-- `src/test-command-classification.ts`
-- `src/test-integration.ts`
-- `src/test.ts`
-- `PROTOCOL.md`
-- `docs/client-guide.md`
-- `next_session_prompt.md`
-
-Other files are also already dirty in the working tree and should be treated carefully unless explicitly continuing them:
-- `AGENTS.md`
-- `docs/adr/0014-pluggable-authentication.md`
-- `src/auth.ts`
-- `src/command-router.ts`
-- `src/server-ui-context.ts`
-- `src/validation.ts`
-
-Do **not** assume the tree is ready to commit as one blob without reviewing file-by-file intent.
+- `src/server.ts`
 
 ---
 
-## OPERATIONAL GUARDRAILS (CURRENT)
+## VALIDATION COMMANDS
 
-- **Control-plane isolation:** cleanup/inspection commands are no longer throttled by hot session traffic.
-- **Admission truthfulness:** `command_accepted` means actual post-replay/post-rate-limit admission.
-- **Replay determinism:** explicit IDs remain stable, including fail-closed terminal failures across restart.
-- **Durable history bounded work:** history queries now scan tail-first in chunks instead of full-file materialization.
-- **Critical transport honesty:** broken critical sends are surfaced and stop the transport instead of silently pretending delivery.
-- **Principal propagation:** authenticated identity now reaches command execution context.
-- **Shutdown hardening:** timeout escalation aborts active session work and blocks late store mutation after teardown.
-- **Session discovery resilience:** malformed session headers degrade safely to `/unknown` rather than poisoning grouping logic.
-- **SessionStore freshness:** cross-instance metadata updates no longer rely only on `mtimeMs + size`.
-
----
-
-## DEFERRED WITH CONTRACT
-
-| Finding | Rationale | Owner | Trigger | Deadline | Blast Radius |
-|---|---|---|---|---|---|
-| Exact guaranteed terminal response delivery over broken transports | This pass made critical send failures fail-stop and observable, but true guaranteed delivery needs protocol-level ack/resume or a durable outbound queue. That is a wire-contract change, not a safe local patch. | pi-server maintainer + protocol owner | ADR approving response-ack / resumable delivery semantics | Before the next release that claims reliable terminal delivery | Clients can still miss a terminal response on transport break and must rely on explicit IDs + replay/retry |
-| Two-phase durable lifecycle intents for create/load/delete crash windows | Closing the remaining crash window between durable mutation and runtime publication/teardown requires persisted lifecycle intents plus boot recovery semantics. Too invasive for a same-pass safe landing. | pi-server maintainer | Lifecycle-intent ADR / state-machine design approval | Before clustering, multi-process orchestration, or supervisor-driven recovery work | A crash at the wrong point can still leave runtime/durable state transiently divergent until restart recovery |
-| Shrinking session-ID lock scope without reintroducing races/slot leaks | Current lock scope is correct but wide. Reducing it safely needs a reserved-session state model so slow upstream creation/switch work can move outside the critical section. | pi-server maintainer | Performance/scalability workstream or lock-timeout telemetry | Before the next performance-focused release | Same-session create/load/delete can still time out under slow upstream session operations |
-| Hard cancellation of upstream work after shutdown timeout | This pass added best-effort abort escalation and server-side mutation gating, but true hard-stop semantics need upstream `AgentSession` support for stronger cancellation guarantees. | upstream `@mariozechner/pi-coding-agent` owner + pi-server maintainer | Upstream exposes hard cancellation / shutdown-safe abort contract | Before advertising strict bounded shutdown guarantees | Upstream work may continue after timeout, though server-side state is now protected from late mutation |
-
----
-
-## RECOMMENDED NEXT STEP ORDER
-
-If continuing immediately, use this order:
-
-1. **Protocol/ADR work for reliable terminal delivery**
-   - define ack/resume or durable outbound semantics
-2. **Lifecycle-intent ADR**
-   - add persisted `creating` / `deleting` / `loading` intent model
-3. **Lock-scope reduction design**
-   - reduce session-ID lock hold times without reopening slot leaks/races
-4. **Upstream cancellation contract**
-   - align with upstream on hard-stop semantics after shutdown timeout
-
-If not doing design work next, the safest tactical task is:
-- finish reviewing the remaining unrelated dirty files and split them into intentional commits or reverts.
-
----
-
-## ROLLBACK (CURRENT PASS ONLY)
-
-If the current uncommitted hardening pass needs to be abandoned:
-
+### Fast gate
 ```bash
-git restore --source=HEAD -- \
-  src/command-classification.ts \
-  src/command-journal.ts \
-  src/resource-governor.ts \
-  src/server-command-handlers.ts \
-  src/server.ts \
-  src/session-manager.ts \
-  src/session-store.ts \
-  src/types.ts \
-  src/test-command-classification.ts \
-  src/test-integration.ts \
-  src/test.ts \
-  PROTOCOL.md \
-  docs/client-guide.md \
-  next_session_prompt.md
-
-npm run build
-npm test
-npm run test:integration
-npm run test:fuzz
 npm run check
+```
+
+### Full gate
+```bash
+npm run ci
+```
+
+Optional extra confidence when touching concurrency/replay behavior:
+```bash
+npm test
+npm run test:fuzz
 ```
 
 ---
 
-## ADR INDEX FOR THIS AREA
+## KNOWN DEFERRED ITEMS
 
-- `docs/adr/0001-atomic-outcome-storage.md`
-- `docs/adr/0007-session-persistence.md`
-- `docs/adr/0014-pluggable-authentication.md`
-- `docs/adr/0019-durable-command-journal-foundation.md`
-- `docs/adr/0020-failure-atomic-lifecycle-and-canonical-replay.md`
+| Finding | Rationale | Owner | Trigger | Deadline | Blast Radius |
+|---|---|---|---|---|---|
+| Exact guaranteed terminal response delivery over broken transports | Needs protocol-level ack/resume or durable outbound queue | pi-server maintainer + protocol owner | delivery ADR approval | before any release claiming reliable terminal delivery | clients can still miss a terminal response on transport break |
+| Two-phase durable lifecycle intents | Needs persisted lifecycle-intent state machine and recovery design | pi-server maintainer | lifecycle-intent ADR | before clustering / multi-process orchestration | crash windows can still transiently diverge durable/runtime state |
+| Narrower session-ID lock scope | Needs reserved-session model to preserve correctness | pi-server maintainer | perf/scalability workstream | before next perf-focused release | same-session ops can still time out under slow upstream work |
+| Hard cancellation after shutdown timeout | Needs upstream AgentSession guarantees | upstream `@mariozechner/pi-coding-agent` owner + pi-server maintainer | upstream cancellation contract | before advertising strict bounded shutdown | upstream work may continue after timeout, though server-side state is protected |
+
+---
+
+## GUARDRAILS FOR THE NEXT SESSION
+
+- Prefer **small, test-backed changes** over broad rewrites.
+- Preserve the current hardening invariants:
+  - explicit-ID replay determinism
+  - truthful admission semantics
+  - control-plane isolation
+  - fail-stop critical transport behavior
+  - shutdown late-mutation protection
+- If touching SessionStore locking again, do **not** weaken stale-lock handling without proving the replacement interleaving is safe.
+- If touching protocol/lifecycle semantics, add or update ADR/documentation intentionally.
+
+---
+
+## SUCCESS CONDITION
+
+You are done with the next session only when all are true:
+- the selected task is resolved or deliberately advanced with clear evidence
+- relevant tests are added or updated
+- `npm run check` passes
+- `npm run ci` passes before handoff if behavior changed materially
+- the next handoff prompt matches reality
+
+---
+
+## ROLLBACK
+
+If the next session goes sideways while investigating a new issue:
+
+```bash
+git restore --source=HEAD -- <touched-files>
+npm run check
+npm test
+```
+
+---
+
+## NOTE
+
+The previous handoff prompt that said “one cross-instance SessionStore race remains” is now obsolete.
+
+The right current framing is:
+
+> **The hardening pass and the SessionStore follow-up are verified; start from a clean tree and pick the next deliberate reliability target.**
