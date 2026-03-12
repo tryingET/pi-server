@@ -109,6 +109,16 @@ const MAX_DISCOVERY_DEPTH = 4;
 const MAX_DISCOVERY_NODES = 10000;
 
 /**
+ * Tracks lock paths currently held by this process.
+ *
+ * Root cause note: another SessionStore instance can observe a freshly created
+ * lock file before its JSON payload is fully readable. Freshness must therefore
+ * be derived from the lock file's mtime first, and same-process ownership must
+ * come from live runtime state rather than partially written lock contents.
+ */
+const ACTIVE_METADATA_LOCKS = new Set<string>();
+
+/**
  * Session metadata store.
  *
  * Process-safety: metadata mutations are serialized through a single in-process
@@ -375,15 +385,20 @@ export class SessionStore {
     await this.ensureDataDir();
 
     const deadline = Date.now() + METADATA_LOCK_TIMEOUT_MS;
-    let handle: fs.FileHandle | undefined;
+    let lockHeld = false;
 
-    while (!handle) {
+    while (!lockHeld) {
       try {
-        handle = await fs.open(this.metadataLockPath, "wx");
-        await handle.writeFile(
+        await fs.writeFile(
+          this.metadataLockPath,
           JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }),
-          "utf-8"
+          {
+            encoding: "utf-8",
+            flag: "wx",
+          }
         );
+        ACTIVE_METADATA_LOCKS.add(this.metadataLockPath);
+        lockHeld = true;
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
         if (code !== "EEXIST") {
@@ -391,15 +406,21 @@ export class SessionStore {
         }
 
         try {
+          const stat = await fs.stat(this.metadataLockPath);
           const { pid, acquiredAt } = this.readMetadataLockInfo();
-          const lockAgeMs = Date.now() - (acquiredAt ?? 0);
+          const fileAgeMs = Date.now() - stat.mtimeMs;
+          const recordedAgeMs =
+            acquiredAt !== undefined ? Math.max(0, Date.now() - acquiredAt) : fileAgeMs;
+          const effectiveAgeMs = Math.min(fileAgeMs, recordedAgeMs);
+          const ownerAlive =
+            ACTIVE_METADATA_LOCKS.has(this.metadataLockPath) ||
+            (pid !== undefined && pid !== process.pid && this.isPidAlive(pid));
 
-          if (lockAgeMs > METADATA_LOCK_STALE_MS) {
-            const ownerAlive = pid !== undefined && pid !== process.pid && this.isPidAlive(pid);
-            if (!ownerAlive) {
-              await fs.rm(this.metadataLockPath, { force: true });
-              continue;
-            }
+          // Fresh lock files can exist briefly before their JSON payload is readable.
+          // Treat freshness as authoritative and only reap when the file itself is stale.
+          if (effectiveAgeMs > METADATA_LOCK_STALE_MS && !ownerAlive) {
+            await fs.rm(this.metadataLockPath, { force: true });
+            continue;
           }
         } catch {
           // If the lock file vanished or is unreadable, retry normally.
@@ -418,11 +439,7 @@ export class SessionStore {
     try {
       return await operation();
     } finally {
-      try {
-        await handle.close();
-      } catch {
-        // Ignore close errors during lock release.
-      }
+      ACTIVE_METADATA_LOCKS.delete(this.metadataLockPath);
       await fs.rm(this.metadataLockPath, { force: true });
     }
   }

@@ -4249,26 +4249,28 @@ async function testSessionManager() {
   });
 
   await test("session-store: serializes concurrent metadata mutations across instances", async () => {
-    const dataDir = mkdtempSync(join(tmpdir(), "pi-session-store-race-"));
-    const storeA = new SessionStore({ dataDir, sessionsDir: dataDir, serverVersion: "test" });
-    const storeB = new SessionStore({ dataDir, sessionsDir: dataDir, serverVersion: "test" });
-    const makeMeta = (sessionId: string) => ({
-      sessionId,
-      sessionFile: join(dataDir, `${sessionId}.jsonl`),
-      cwd: dataDir,
-      createdAt: new Date().toISOString(),
-    });
+    for (let iteration = 0; iteration < 50; iteration++) {
+      const dataDir = mkdtempSync(join(tmpdir(), "pi-session-store-race-"));
+      const storeA = new SessionStore({ dataDir, sessionsDir: dataDir, serverVersion: "test" });
+      const storeB = new SessionStore({ dataDir, sessionsDir: dataDir, serverVersion: "test" });
+      const makeMeta = (sessionId: string) => ({
+        sessionId,
+        sessionFile: join(dataDir, `${sessionId}.jsonl`),
+        cwd: dataDir,
+        createdAt: new Date().toISOString(),
+      });
 
-    try {
-      writeFileSync(join(dataDir, "a.jsonl"), "");
-      writeFileSync(join(dataDir, "b.jsonl"), "");
+      try {
+        writeFileSync(join(dataDir, "a.jsonl"), "");
+        writeFileSync(join(dataDir, "b.jsonl"), "");
 
-      await Promise.all([storeA.save(makeMeta("a")), storeB.save(makeMeta("b"))]);
+        await Promise.all([storeA.save(makeMeta("a")), storeB.save(makeMeta("b"))]);
 
-      const sessionIds = (await storeA.list()).map((entry) => entry.sessionId).sort();
-      assert.deepStrictEqual(sessionIds, ["a", "b"]);
-    } finally {
-      rmSync(dataDir, { recursive: true, force: true });
+        const sessionIds = (await storeA.list()).map((entry) => entry.sessionId).sort();
+        assert.deepStrictEqual(sessionIds, ["a", "b"], `iteration ${iteration}`);
+      } finally {
+        rmSync(dataDir, { recursive: true, force: true });
+      }
     }
   });
 
