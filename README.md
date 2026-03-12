@@ -167,7 +167,17 @@ This project uses [release-please](https://github.com/googleapis/release-please)
 
 1. Push to `main` → release-please creates/updates a release PR
 2. Merge the release PR → Creates GitHub release + git tag
-3. Release published → GitHub Action publishes to npm with provenance
+3. Verify npm publication after the release until publish automation is fully trusted
+
+### Changelog + Commit Policy
+
+Release notes are generated from Conventional Commit messages. `CHANGELOG.md` is treated as a generated release artifact for released versions rather than a hand-maintained diary.
+
+See [docs/release-policy.md](./docs/release-policy.md) for:
+- commit-message rules for releasable work
+- breaking-change marking (`!` / `BREAKING CHANGE:`)
+- changelog policy (including no manual `[Unreleased]` section)
+- release review expectations
 
 ### Manual Release Check
 
@@ -188,6 +198,7 @@ This validates:
 |----------|---------|
 | [AGENTS.md](./AGENTS.md) | Crystallized learnings, patterns, anti-patterns |
 | [PROTOCOL.md](./PROTOCOL.md) | Normative wire contract |
+| [docs/release-policy.md](./docs/release-policy.md) | Commit, changelog, and release-note policy |
 | [ADR-0001](./docs/adr/0001-atomic-outcome-storage.md) | Atomic outcome storage (timeout semantics) |
 | [ADR-0007](./docs/adr/0007-session-persistence.md) | Session persistence |
 | [ADR-0009](./docs/adr/0009-connection-authentication.md) | Historical authentication proposal (superseded) |

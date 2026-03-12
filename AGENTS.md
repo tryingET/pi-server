@@ -1294,8 +1294,20 @@ pi-server uses [release-please](https://github.com/googleapis/release-please) fo
 ```
 Push to main → release-please creates/updates release PR
 Merge release PR → Creates GitHub release + tag (vX.Y.Z)
-Release published → publish.yml triggers → npm publish --provenance
+Verify npm publication after release until publish automation is fully trusted
 ```
+
+### Commit + Changelog Policy
+
+Canonical doc: `docs/release-policy.md`
+
+Operational rules for this repo:
+1. Optimize commit subjects for release-note quality, not just local git history.
+2. Prefer one user-visible change per commit; split docs/test/style/chore away from `feat` / `fix` when practical.
+3. Choose commit type by **external effect**. A reliability or validation correction that changes observable behavior is usually a `fix`, not a `refactor`.
+4. Mark breaking changes explicitly with `!` and a `BREAKING CHANGE:` footer.
+5. Treat `CHANGELOG.md` as generated release output for released versions; do not hand-maintain a manual `[Unreleased]` section.
+6. Review generated release notes in the release PR before merge, and verify npm dist-tags after GitHub release creation.
 
 ### Release Commands
 
@@ -1322,7 +1334,7 @@ npm publish --provenance --access public
 |----------|--------|---------|
 | `ci.yml` | Push/PR to main | Full CI (typecheck, lint, build, test) |
 | `release-please.yml` | Push to main | Creates/updates release PR |
-| `publish.yml` | Release published | Publishes to npm with provenance |
+| `publish.yml` | Release published | Intended npm publish path; verify resulting dist-tags |
 
 ### First-time Setup
 
