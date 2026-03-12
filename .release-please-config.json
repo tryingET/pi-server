@@ -6,7 +6,7 @@
   "packages": {
     ".": {
       "release-type": "node",
-      "changelog-types": ["feat", "fix", "docs", "chore", "refactor", "test"]
+      "changelog-types": ["feat", "fix"]
     }
   }
 }
