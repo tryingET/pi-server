@@ -175,7 +175,10 @@ export class ConsoleSink implements MetricsSink {
     private options: {
       /** Only log these metric names (if set) */
       filter?: Set<string>;
-      /** Log to console.error instead of console.log */
+      /**
+       * Write to stderr instead of stdout.
+       * Defaults to true so stdio protocol stdout stays machine-parseable.
+       */
       stderr?: boolean;
     } = {}
   ) {}
@@ -185,7 +188,8 @@ export class ConsoleSink implements MetricsSink {
       return;
     }
 
-    const log = this.options.stderr ? console.error : console.log;
+    const useStderr = this.options.stderr ?? true;
+    const log = useStderr ? console.error : console.log;
     const tags = event.tags ? ` ${JSON.stringify(event.tags)}` : "";
     log(`[metrics] ${event.type}:${event.name}=${event.value ?? 1}${tags}`);
   }

@@ -128,6 +128,15 @@ function createDeferred<T>(): Deferred<T> {
 }
 
 /**
+ * Global mutex for AgentSession creation while process.env is temporarily sanitized.
+ *
+ * Root cause: createAgentSession currently reads process-global environment.
+ * Two concurrent calls that both delete/restore npm_config_prefix can otherwise
+ * interleave and reintroduce the very env leakage we are trying to prevent.
+ */
+let sanitizedAgentSessionCreationTail: Promise<void> = Promise.resolve();
+
+/**
  * npm env keys inherited from npm scripts that can hijack global installs.
  * When present (e.g. npm_config_prefix=<project>), createAgentSession's
  * package manager may install "global" packages into the project directory.
@@ -2193,6 +2202,16 @@ export class PiSessionManager implements SessionResolver {
   private async createAgentSessionWithSanitizedNpmEnv(
     options: Parameters<typeof createAgentSession>[0]
   ): Promise<Awaited<ReturnType<typeof createAgentSession>>> {
+    const previousCreation = sanitizedAgentSessionCreationTail;
+    let releaseCreation: (() => void) | undefined;
+    sanitizedAgentSessionCreationTail = new Promise<void>((resolve) => {
+      releaseCreation = resolve;
+    });
+
+    await previousCreation.catch(() => {
+      // Preserve queue progress even if an earlier creation failed.
+    });
+
     const snapshots = SANITIZED_NPM_ENV_KEYS.map((key) => ({
       key,
       had: Object.hasOwn(process.env, key),
@@ -2227,6 +2246,7 @@ export class PiSessionManager implements SessionResolver {
           process.env[snapshot.key] = snapshot.value;
         }
       }
+      releaseCreation?.();
     }
   }
 

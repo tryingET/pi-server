@@ -138,6 +138,23 @@ describe("command-replay-store", () => {
 
       assert.strictEqual(store.getCommandFingerprint(cmd1), store.getCommandFingerprint(cmd2));
     });
+
+    it("returns a versioned hash instead of raw command payload", () => {
+      const store = new CommandReplayStore();
+      const command = makeCommand({
+        type: "prompt",
+        sessionId: "s1",
+        message: "secret-project-name",
+      });
+
+      const fingerprint = store.getCommandFingerprint(command);
+      assert.ok(fingerprint.startsWith("v2:sha256:"));
+      assert.strictEqual(
+        fingerprint.includes("secret-project-name"),
+        false,
+        "Fingerprint must not expose raw command content"
+      );
+    });
   });
 
   // ==========================================================================
@@ -444,6 +461,26 @@ describe("command-replay-store", () => {
         fingerprint,
         success: true,
         response: makeResponse({ id: "cmd-1", command: "get_state", success: true }),
+        finishedAt: Date.now(),
+      });
+
+      const result = store.checkReplay(command, fingerprint);
+      assert.strictEqual(result.kind, "replay_cached");
+    });
+
+    it("accepts legacy raw JSON fingerprints for replay compatibility", () => {
+      const store = new CommandReplayStore();
+      const command = makeCommand({ id: "cmd-legacy", type: "get_state", sessionId: "s1" });
+      const fingerprint = store.getCommandFingerprint(command);
+      const legacyFingerprint = '{"sessionId":"s1","type":"get_state"}';
+
+      store.storeCommandOutcome({
+        commandId: "cmd-legacy",
+        commandType: "get_state",
+        laneKey: "session:s1",
+        fingerprint: legacyFingerprint,
+        success: true,
+        response: makeResponse({ id: "cmd-legacy", command: "get_state", success: true }),
         finishedAt: Date.now(),
       });
 

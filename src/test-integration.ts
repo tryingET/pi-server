@@ -104,15 +104,24 @@ async function waitForJsonLine(
     }, timeoutMs);
 
     const onLine = (line: string) => {
+      if (line.trim().length === 0) {
+        return;
+      }
+
+      let obj: Record<string, unknown>;
       try {
-        const obj = JSON.parse(line) as Record<string, unknown>;
-        if (predicate(obj)) {
-          clearTimeout(timer);
-          lines.off("line", onLine);
-          resolve(obj);
-        }
+        obj = JSON.parse(line) as Record<string, unknown>;
       } catch {
-        // ignore non-JSON lines
+        clearTimeout(timer);
+        lines.off("line", onLine);
+        reject(new Error(`Received non-JSON stdout line: ${line}`));
+        return;
+      }
+
+      if (predicate(obj)) {
+        clearTimeout(timer);
+        lines.off("line", onLine);
+        resolve(obj);
       }
     };
 

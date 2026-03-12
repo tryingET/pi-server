@@ -278,6 +278,15 @@ export abstract class BaseLogger implements Logger {
 // BUILT-IN LOGGERS
 // =============================================================================
 
+function writeDiagnosticLine(line: string): void {
+  const output = line.endsWith("\n") ? line : `${line}\n`;
+  try {
+    process.stderr.write(output);
+  } catch {
+    console.error(line);
+  }
+}
+
 /**
  * NoOpLogger - Discards all log messages.
  * Use this when logging is not needed.
@@ -336,23 +345,8 @@ export class ConsoleLogger extends BaseLogger {
       }
     }
 
-    // Use appropriate console method
-    switch (entry.level) {
-      case "trace":
-      case "debug":
-        console.debug(message);
-        break;
-      case "info":
-        console.info(message);
-        break;
-      case "warn":
-        console.warn(message);
-        break;
-      case "error":
-      case "fatal":
-        console.error(message);
-        break;
-    }
+    // Protocol purity rule: built-in diagnostics must never write to stdout.
+    writeDiagnosticLine(message);
   }
 
   private logJson(entry: LogEntry): void {
@@ -377,7 +371,8 @@ export class ConsoleLogger extends BaseLogger {
       };
     }
 
-    console.log(JSON.stringify(output));
+    // JSON logs also go to stderr so stdio protocol stdout stays machine-parseable.
+    writeDiagnosticLine(JSON.stringify(output));
   }
 
   child(context: Record<string, unknown>): Logger {

@@ -2695,6 +2695,96 @@ async function testSessionManager() {
     }
   });
 
+  await test("session-manager: set_session_name waits for durable mutation instead of timing out", async () => {
+    const localManager = new PiSessionManager(undefined, {
+      shortCommandTimeoutMs: 50,
+      defaultCommandTimeoutMs: 50,
+    });
+    const managerAny = localManager as any;
+
+    const fakeSession = {
+      dispose: () => {},
+      sessionFile: "/tmp/rename-timeout.jsonl",
+      model: undefined,
+      thinkingLevel: "medium",
+      isStreaming: false,
+      messages: [],
+      sessionName: "before",
+      setSessionName(name: string) {
+        fakeSession.sessionName = name;
+      },
+    };
+
+    managerAny.sessions.set("rename-safe", fakeSession);
+    managerAny.sessionCreatedAt.set("rename-safe", new Date());
+    managerAny.versionStore.initialize("rename-safe");
+    managerAny.governor.tryReserveSessionSlot();
+    managerAny.governor.recordHeartbeat("rename-safe");
+    managerAny.sessionStore.updateName = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      return true;
+    };
+
+    const startedAt = Date.now();
+    const response = await localManager.executeCommand({
+      id: "rename-safe-1",
+      type: "set_session_name",
+      sessionId: "rename-safe",
+      name: "after",
+    } as any);
+
+    assert.strictEqual(response.success, true);
+    assert.strictEqual(response.timedOut, undefined);
+    assert.ok(Date.now() - startedAt >= 100, "Expected command to wait for durable mutation");
+    assert.strictEqual(fakeSession.sessionName, "after");
+    localManager.disposeAllSessions();
+  });
+
+  await test("session-manager: delete_session waits for durable mutation instead of timing out", async () => {
+    const localManager = new PiSessionManager(undefined, {
+      shortCommandTimeoutMs: 50,
+      defaultCommandTimeoutMs: 50,
+    });
+    const managerAny = localManager as any;
+
+    const fakeSession = {
+      dispose: () => {
+        (fakeSession as any).disposed = true;
+      },
+      sessionFile: "/tmp/delete-timeout.jsonl",
+      model: undefined,
+      thinkingLevel: "medium",
+      isStreaming: false,
+      messages: [],
+      sessionName: "delete-me",
+    };
+
+    managerAny.sessions.set("delete-safe", fakeSession);
+    managerAny.sessionCreatedAt.set("delete-safe", new Date());
+    managerAny.versionStore.initialize("delete-safe");
+    managerAny.governor.tryReserveSessionSlot();
+    managerAny.governor.recordHeartbeat("delete-safe");
+    managerAny.sessionStore.delete = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      return true;
+    };
+
+    const startedAt = Date.now();
+    const response = await localManager.executeCommand({
+      id: "delete-safe-1",
+      type: "delete_session",
+      sessionId: "delete-safe",
+    } as any);
+
+    assert.strictEqual(response.success, true);
+    assert.strictEqual(response.timedOut, undefined);
+    assert.ok(Date.now() - startedAt >= 100, "Expected delete to wait for durable mutation");
+    assert.strictEqual(localManager.getSession("delete-safe"), undefined);
+    assert.strictEqual((fakeSession as any).disposed, true);
+    assert.strictEqual(localManager.getGovernor().getSessionCount(), 0);
+    localManager.disposeAllSessions();
+  });
+
   await test("session-manager: create_session rolls back runtime state on metadata failure", async () => {
     const dataDir = mkdtempSync(join(tmpdir(), "pi-create-rollback-"));
     const localManager = new PiSessionManager();
@@ -3328,6 +3418,15 @@ async function testSessionManager() {
       assert.strictEqual(byCommandIdData.returned, 1);
       assert.strictEqual(byCommandIdData.entries[0]?.commandId, "history-cmd-b");
       assert.strictEqual(byCommandIdData.truncated, false);
+      assert.ok(
+        String(filteredData.entries[0]?.fingerprint || "").startsWith("v2:sha256:"),
+        "History should export hashed fingerprints"
+      );
+      assert.strictEqual(
+        JSON.stringify(filteredData.entries).includes('"message":"hi"'),
+        false,
+        "History fingerprints must not leak raw command payloads"
+      );
 
       localManager.disposeAllSessions();
     } finally {
@@ -4468,6 +4567,51 @@ async function testSessionManager() {
       true,
       "Expected uptime metric to be included in flushed metrics"
     );
+  });
+
+  await test("server: shutdown disposes logger and metrics sink", async () => {
+    let metricsDisposed = false;
+    let loggerDisposed = false;
+
+    const server = new PiServer({
+      metricsSink: {
+        record() {},
+        async flush() {},
+        async dispose() {
+          metricsDisposed = true;
+        },
+      },
+      logger: {
+        trace() {},
+        debug() {},
+        info() {},
+        warn() {},
+        error() {},
+        fatal() {},
+        logError() {},
+        child() {
+          return this;
+        },
+        getLevel() {
+          return "info" as const;
+        },
+        setLevel() {},
+        isLevelEnabled() {
+          return false;
+        },
+        async dispose() {
+          loggerDisposed = true;
+        },
+      },
+      includeMemoryMetrics: false,
+      startupRecoverySummaryEvent: { enabled: false },
+    });
+
+    await server.start(0);
+    await server.stop(1000);
+
+    assert.strictEqual(metricsDisposed, true, "Expected metrics sink dispose to run");
+    assert.strictEqual(loggerDisposed, true, "Expected logger dispose to run");
   });
 
   await test("server: starts in degraded mode when durable init fails", async () => {

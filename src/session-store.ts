@@ -920,7 +920,7 @@ export class SessionStore {
       try {
         const result = await this.cleanup();
         if (result.removed > 0) {
-          console.log(`[SessionStore] Periodic cleanup removed ${result.removed} orphaned entries`);
+          console.error(`[SessionStore] Periodic cleanup removed ${result.removed} orphaned entries`);
         }
       } catch (error) {
         console.error("[SessionStore] Periodic cleanup failed:", error);

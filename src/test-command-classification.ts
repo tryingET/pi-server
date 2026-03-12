@@ -21,8 +21,11 @@ describe("command-classification", () => {
   // ==========================================================================
 
   describe("getCommandTimeoutPolicy", () => {
-    it("returns null for no-timeout commands", () => {
+    it("returns null for non-timeout-wrapped mutation commands", () => {
       assert.strictEqual(getCommandTimeoutPolicy("create_session"), null);
+      assert.strictEqual(getCommandTimeoutPolicy("delete_session"), null);
+      assert.strictEqual(getCommandTimeoutPolicy("load_session"), null);
+      assert.strictEqual(getCommandTimeoutPolicy("set_session_name"), null);
     });
 
     it("returns short timeout for short-timeout commands", () => {
@@ -107,8 +110,8 @@ describe("command-classification", () => {
       assert.strictEqual(isShortTimeoutCommand("get_context_usage"), true);
     });
 
-    it("returns true for set_session_name", () => {
-      assert.strictEqual(isShortTimeoutCommand("set_session_name"), true);
+    it("returns false for set_session_name", () => {
+      assert.strictEqual(isShortTimeoutCommand("set_session_name"), false);
     });
 
     it("returns true for get_startup_recovery", () => {
@@ -133,8 +136,11 @@ describe("command-classification", () => {
   });
 
   describe("isNoTimeoutCommand", () => {
-    it("returns true for create_session", () => {
+    it("returns true for mutation commands that must not commit after timeout", () => {
       assert.strictEqual(isNoTimeoutCommand("create_session"), true);
+      assert.strictEqual(isNoTimeoutCommand("delete_session"), true);
+      assert.strictEqual(isNoTimeoutCommand("load_session"), true);
+      assert.strictEqual(isNoTimeoutCommand("set_session_name"), true);
     });
 
     it("returns false for prompt", () => {
@@ -291,8 +297,18 @@ describe("command-classification", () => {
       assert.strictEqual(classification.timeoutMs, null);
       assert.strictEqual(classification.isShortTimeout, false);
       assert.strictEqual(classification.isCancellable, false);
+      assert.strictEqual(classification.abortability, "non_abortable");
       assert.strictEqual(classification.isMutation, true); // creates state
       assert.strictEqual(classification.isReadOnly, false);
+      assert.strictEqual(classification.executionPlane, "control");
+    });
+
+    it("classifies delete_session as non-timeout-wrapped control mutation", () => {
+      const classification = classifyCommand("delete_session");
+      assert.strictEqual(classification.timeoutMs, null);
+      assert.strictEqual(classification.isCancellable, false);
+      assert.strictEqual(classification.abortability, "non_abortable");
+      assert.strictEqual(classification.isMutation, true);
       assert.strictEqual(classification.executionPlane, "control");
     });
 

@@ -13,7 +13,10 @@ import fs from "fs/promises";
 import * as path from "path";
 import * as readline from "readline";
 import type { CommandOutcomeRecord } from "./command-replay-store.js";
-import { SYNTHETIC_ID_PREFIX } from "./command-replay-store.js";
+import {
+  SYNTHETIC_ID_PREFIX,
+  normalizeReplayFingerprintValue,
+} from "./command-replay-store.js";
 import type { RpcResponse } from "./types.js";
 
 const CURRENT_JOURNAL_SCHEMA_VERSION = 1;
@@ -781,7 +784,7 @@ export class DurableCommandJournal {
       commandId: entry.commandId,
       commandType: entry.commandType,
       laneKey: entry.laneKey,
-      fingerprint: entry.fingerprint,
+      fingerprint: normalizeReplayFingerprintValue(entry.fingerprint),
       success: entry.success ?? entry.response.success,
       error: entry.error,
       response: entry.response,
@@ -839,7 +842,7 @@ export class DurableCommandJournal {
       commandType: entry.commandType,
       laneKey: entry.laneKey,
       laneSequence: entry.laneSequence,
-      fingerprint: entry.fingerprint,
+      fingerprint: normalizeReplayFingerprintValue(entry.fingerprint),
       explicitId: entry.explicitId,
       sessionId: entry.sessionId,
       dependsOn: entry.dependsOn,
@@ -1388,7 +1391,7 @@ export class DurableCommandJournal {
               commandId: entry.commandId,
               commandType: entry.commandType,
               laneKey: entry.laneKey,
-              fingerprint: entry.fingerprint,
+              fingerprint: normalizeReplayFingerprintValue(entry.fingerprint),
               explicitId: entry.explicitId,
               sessionId: entry.sessionId,
               dependsOn: entry.dependsOn,
@@ -1408,7 +1411,7 @@ export class DurableCommandJournal {
                 commandId: entry.commandId,
                 commandType: entry.commandType,
                 laneKey: entry.laneKey,
-                fingerprint: entry.fingerprint,
+                fingerprint: normalizeReplayFingerprintValue(entry.fingerprint),
                 explicitId: entry.explicitId,
                 sessionId: entry.sessionId,
                 dependsOn: entry.dependsOn,

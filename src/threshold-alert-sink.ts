@@ -311,15 +311,14 @@ export class ThresholdAlertSink implements MetricsSink {
 // =============================================================================
 
 /**
- * Console alert handler - logs alerts to console.
- * Useful for development and testing.
+ * Console alert handler - logs alerts to stderr.
+ * Useful for development and testing without polluting stdio protocol stdout.
  */
 export function consoleAlertHandler(alert: Alert): void {
   const levelStr = alert.level.toUpperCase().padEnd(8);
-  const log = alert.level === "critical" ? console.error : console.log;
-  log(`[${levelStr}] ${alert.message}`);
+  console.error(`[${levelStr}] ${alert.message}`);
   if (alert.tags && Object.keys(alert.tags).length > 0) {
-    log(`           Tags: ${JSON.stringify(alert.tags)}`);
+    console.error(`           Tags: ${JSON.stringify(alert.tags)}`);
   }
 }
 

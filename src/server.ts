@@ -420,11 +420,8 @@ export class PiServer {
       options.onAlert ??
       ((alert: Alert) => {
         const levelStr = `[${alert.level.toUpperCase()}]`;
-        if (alert.level === "critical") {
-          console.error(`${levelStr} ${alert.message}`);
-        } else {
-          console.log(`${levelStr} ${alert.message}`);
-        }
+        // Protocol purity rule: built-in alerts must never write to stdout.
+        console.error(`${levelStr} ${alert.message}`);
       });
 
     const alertSink = new ThresholdAlertSink({
@@ -658,10 +655,15 @@ export class PiServer {
     const uptimeMs = Date.now() - this.serverStartTime;
     this.metrics.gauge(MetricNames.SESSION_LIFETIME_SECONDS, Math.floor(uptimeMs / 1000));
 
-    // Flush metrics before shutdown
-    await this.metrics.flush();
+    // Fully dispose metrics so buffered/custom sinks can release resources.
+    await this.metrics.dispose();
 
     this.logger.info("Shutdown complete", { uptimeMs });
+    try {
+      await Promise.resolve(this.logger.dispose?.());
+    } catch (error) {
+      console.error("[pi-server] Logger dispose failed:", error);
+    }
   }
 
   private async authenticateTransport(authContext: AuthContext): Promise<AuthResult> {

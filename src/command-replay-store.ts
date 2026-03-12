@@ -8,6 +8,7 @@
  * - Bounded outcome retention (LRU-style trimming)
  */
 
+import crypto from "node:crypto";
 import type { RpcCommand, RpcResponse } from "./types.js";
 import { getCommandId, getCommandIdempotencyKey, getSessionId } from "./types.js";
 
@@ -22,6 +23,9 @@ const DEFAULT_MAX_IN_FLIGHT_COMMANDS = 10000;
 
 /** Reserved prefix for server-generated command IDs. Client IDs matching this are rejected. */
 export const SYNTHETIC_ID_PREFIX = "anon:";
+
+/** Versioned hashed fingerprint prefix for replay-safe semantic equality. */
+export const HASHED_FINGERPRINT_PREFIX = "v2:sha256:";
 
 function stableJsonStringify(value: unknown, seen = new WeakSet<object>()): string | undefined {
   if (value === null) return "null";
@@ -65,6 +69,30 @@ function stableJsonStringify(value: unknown, seen = new WeakSet<object>()): stri
       return serialized;
     }
   }
+}
+
+function hashFingerprintSource(source: string): string {
+  return `${HASHED_FINGERPRINT_PREFIX}${crypto.createHash("sha256").update(source).digest("hex")}`;
+}
+
+/**
+ * Legacy fingerprints were raw stable JSON command payloads.
+ * We detect them conservatively so replay compatibility survives upgrades
+ * without treating arbitrary opaque test tokens like "fp1" as legacy payloads.
+ */
+export function isLegacyRawCommandFingerprint(fingerprint: string): boolean {
+  return fingerprint.startsWith("{");
+}
+
+/** Normalize replay fingerprints to the current hashed representation. */
+export function normalizeReplayFingerprintValue(fingerprint: string): string {
+  if (fingerprint.startsWith(HASHED_FINGERPRINT_PREFIX)) {
+    return fingerprint;
+  }
+  if (isLegacyRawCommandFingerprint(fingerprint)) {
+    return hashFingerprintSource(fingerprint);
+  }
+  return fingerprint;
 }
 
 /**
@@ -257,14 +285,39 @@ export class CommandReplayStore {
   // FINGERPRINTING
   // ==========================================================================
 
-  /**
-   * Compute a fingerprint for conflict detection.
-   * Excludes retry identity fields (id, idempotencyKey) since those
-   * don't affect semantic equivalence - only determine replay mechanics.
-   */
-  getCommandFingerprint(command: RpcCommand): string {
+  private getLegacyCommandFingerprint(command: RpcCommand): string {
     const { id: _id, idempotencyKey: _key, ...rest } = command;
     return stableJsonStringify(rest) ?? "null";
+  }
+
+  /**
+   * Compute a replay fingerprint for conflict detection.
+   * Excludes retry identity fields (id, idempotencyKey) since those
+   * don't affect semantic equivalence - only determine replay mechanics.
+   *
+   * The returned value is a versioned hash rather than raw command payload,
+   * so durable history and diagnostics do not leak plaintext command bodies.
+   */
+  getCommandFingerprint(command: RpcCommand): string {
+    return hashFingerprintSource(this.getLegacyCommandFingerprint(command));
+  }
+
+  private fingerprintsMatch(
+    storedFingerprint: string,
+    currentFingerprint: string,
+    command: RpcCommand
+  ): boolean {
+    if (storedFingerprint === currentFingerprint) {
+      return true;
+    }
+
+    const normalizedStored = normalizeReplayFingerprintValue(storedFingerprint);
+    if (normalizedStored === currentFingerprint) {
+      return true;
+    }
+
+    const legacyFingerprint = this.getLegacyCommandFingerprint(command);
+    return storedFingerprint === legacyFingerprint;
   }
 
   // ==========================================================================
@@ -481,7 +534,7 @@ export class CommandReplayStore {
       const cached = this.idempotencyCache.get(cacheKey);
       if (cached) {
         // Fingerprint conflict?
-        if (cached.fingerprint !== fingerprint) {
+        if (!this.fingerprintsMatch(cached.fingerprint, fingerprint, command)) {
           return {
             kind: "conflict",
             response: this.createConflictResponse(
@@ -503,7 +556,7 @@ export class CommandReplayStore {
 
       const inFlightByKey = this.idempotencyInFlightByKey.get(cacheKey);
       if (inFlightByKey) {
-        if (inFlightByKey.fingerprint !== fingerprint) {
+        if (!this.fingerprintsMatch(inFlightByKey.fingerprint, fingerprint, command)) {
           return {
             kind: "conflict",
             response: this.createConflictResponse(
@@ -531,7 +584,7 @@ export class CommandReplayStore {
       const completed = this.commandOutcomes.get(id);
       if (completed) {
         // Fingerprint conflict?
-        if (completed.fingerprint !== fingerprint) {
+        if (!this.fingerprintsMatch(completed.fingerprint, fingerprint, command)) {
           return {
             kind: "conflict",
             response: this.createConflictResponse(id, commandType, "id", id, completed.commandType),
@@ -549,7 +602,7 @@ export class CommandReplayStore {
       const inFlight = this.commandInFlightById.get(id);
       if (inFlight) {
         // Fingerprint conflict?
-        if (inFlight.fingerprint !== fingerprint) {
+        if (!this.fingerprintsMatch(inFlight.fingerprint, fingerprint, command)) {
           return {
             kind: "conflict",
             response: this.createConflictResponse(id, commandType, "id", id, inFlight.commandType),
