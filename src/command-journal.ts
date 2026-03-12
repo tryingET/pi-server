@@ -13,10 +13,7 @@ import fs from "fs/promises";
 import * as path from "path";
 import * as readline from "readline";
 import type { CommandOutcomeRecord } from "./command-replay-store.js";
-import {
-  SYNTHETIC_ID_PREFIX,
-  normalizeReplayFingerprintValue,
-} from "./command-replay-store.js";
+import { SYNTHETIC_ID_PREFIX, normalizeReplayFingerprintValue } from "./command-replay-store.js";
 import type { RpcResponse } from "./types.js";
 
 const CURRENT_JOURNAL_SCHEMA_VERSION = 1;
