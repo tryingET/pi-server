@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0/).
 
+## [2.2.0](https://github.com/tryingET/pi-server/compare/v2.1.0...v2.2.0) (2026-03-12)
+
+
+### Features
+
+* **router:** add get_tree command with bounded traversal ([1fd12ee](https://github.com/tryingET/pi-server/commit/1fd12ee0ed4c189dabdd6a2fd3b23db3fb49b732))
+
+
+### Bug Fixes
+
+* **server:** harden transport and lifecycle boundaries ([efcceb9](https://github.com/tryingET/pi-server/commit/efcceb970adb944b8d86b65f93780adcf0f945cd))
+* **session-store:** harden cross-instance metadata locking ([f2bba0b](https://github.com/tryingET/pi-server/commit/f2bba0b2eb11aa0d33962cac779c8e038dec11e4))
+
 ## [2.1.0](https://github.com/tryingET/pi-server/compare/v2.0.1...v2.1.0) (2026-03-03)
 
 
