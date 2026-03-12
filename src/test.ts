@@ -2715,27 +2715,48 @@ async function testSessionManager() {
       },
     };
 
+    let enteredUpdateName!: () => void;
+    const updateNameEntered = new Promise<void>((resolve) => {
+      enteredUpdateName = resolve;
+    });
+    let releaseUpdateName!: () => void;
+    const updateNameBlocked = new Promise<void>((resolve) => {
+      releaseUpdateName = resolve;
+    });
+
     managerAny.sessions.set("rename-safe", fakeSession);
     managerAny.sessionCreatedAt.set("rename-safe", new Date());
     managerAny.versionStore.initialize("rename-safe");
     managerAny.governor.tryReserveSessionSlot();
     managerAny.governor.recordHeartbeat("rename-safe");
     managerAny.sessionStore.updateName = async () => {
-      await new Promise((resolve) => setTimeout(resolve, 120));
+      enteredUpdateName();
+      await updateNameBlocked;
       return true;
     };
 
-    const startedAt = Date.now();
-    const response = await localManager.executeCommand({
-      id: "rename-safe-1",
-      type: "set_session_name",
-      sessionId: "rename-safe",
-      name: "after",
-    } as any);
+    let settled = false;
+    const responsePromise = localManager
+      .executeCommand({
+        id: "rename-safe-1",
+        type: "set_session_name",
+        sessionId: "rename-safe",
+        name: "after",
+      } as any)
+      .then((response) => {
+        settled = true;
+        return response;
+      });
+
+    await updateNameEntered;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.strictEqual(settled, false, "Response must not settle before durable rename finishes");
+
+    releaseUpdateName();
+    const response = await responsePromise;
 
     assert.strictEqual(response.success, true);
     assert.strictEqual(response.timedOut, undefined);
-    assert.ok(Date.now() - startedAt >= 100, "Expected command to wait for durable mutation");
     assert.strictEqual(fakeSession.sessionName, "after");
     localManager.disposeAllSessions();
   });
@@ -2759,26 +2780,47 @@ async function testSessionManager() {
       sessionName: "delete-me",
     };
 
+    let enteredDelete!: () => void;
+    const deleteEntered = new Promise<void>((resolve) => {
+      enteredDelete = resolve;
+    });
+    let releaseDelete!: () => void;
+    const deleteBlocked = new Promise<void>((resolve) => {
+      releaseDelete = resolve;
+    });
+
     managerAny.sessions.set("delete-safe", fakeSession);
     managerAny.sessionCreatedAt.set("delete-safe", new Date());
     managerAny.versionStore.initialize("delete-safe");
     managerAny.governor.tryReserveSessionSlot();
     managerAny.governor.recordHeartbeat("delete-safe");
     managerAny.sessionStore.delete = async () => {
-      await new Promise((resolve) => setTimeout(resolve, 120));
+      enteredDelete();
+      await deleteBlocked;
       return true;
     };
 
-    const startedAt = Date.now();
-    const response = await localManager.executeCommand({
-      id: "delete-safe-1",
-      type: "delete_session",
-      sessionId: "delete-safe",
-    } as any);
+    let settled = false;
+    const responsePromise = localManager
+      .executeCommand({
+        id: "delete-safe-1",
+        type: "delete_session",
+        sessionId: "delete-safe",
+      } as any)
+      .then((response) => {
+        settled = true;
+        return response;
+      });
+
+    await deleteEntered;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.strictEqual(settled, false, "Response must not settle before durable delete finishes");
+
+    releaseDelete();
+    const response = await responsePromise;
 
     assert.strictEqual(response.success, true);
     assert.strictEqual(response.timedOut, undefined);
-    assert.ok(Date.now() - startedAt >= 100, "Expected delete to wait for durable mutation");
     assert.strictEqual(localManager.getSession("delete-safe"), undefined);
     assert.strictEqual((fakeSession as any).disposed, true);
     assert.strictEqual(localManager.getGovernor().getSessionCount(), 0);
