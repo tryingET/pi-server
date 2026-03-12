@@ -1,193 +1,297 @@
 # pi-server: Next Session Prompt
 
-**Operating mode:** Reliability-first, adversarially reviewed  
-**Current phase:** Hardening pass verified; SessionStore race fixed  
-**Version:** 2.1.0  
-**Formalization level:** 2 (Bounded Run)
+**Operating mode:** Reliability-first, architecture-follow-through  
+**Current phase:** ADR-0021 landed in code + docs; follow-through backlog created  
+**Version:** 2.2.0  
+**Formalization level:** 3 (ADR + implementation plan + tracked backlog)
 
 ---
 
 ## START HERE
 
-The repo should now be in a **clean working-tree state** after the latest fixes land.
+Do **not** assume a clean working tree.
 
-Most recent commits:
-- `f2bba0b` — `fix(session-store): harden cross-instance metadata locking`
-- `726b87e` — `style(replay): apply biome formatting`
-- `5993557` — `docs(prompt): refresh next session handoff`
-- `efcceb9` — `fix(server): harden transport and lifecycle boundaries`
+This session produced a substantial uncommitted hardening/design change-set.
+At handoff time, the working tree includes code, tests, protocol/docs, and new ADR/plan docs.
 
-The large hardening pass and the SessionStore follow-up are now **landed and verified**.
+### Current working tree state
+Modified:
+- `PROTOCOL.md`
+- `README.md`
+- `docs/README.md`
+- `src/command-classification.ts`
+- `src/command-journal.ts`
+- `src/command-replay-store.ts`
+- `src/logger-types.ts`
+- `src/metrics-types.ts`
+- `src/server.ts`
+- `src/session-manager.ts`
+- `src/session-store.ts`
+- `src/test-command-classification.ts`
+- `src/test-command-replay-store.ts`
+- `src/test-integration.ts`
+- `src/test.ts`
+- `src/threshold-alert-sink.ts`
 
-The immediate next session is **not** “reproduce the SessionStore race” anymore.
-The right current framing is:
+Untracked:
+- `docs/adr/0021-command-contract-registry-and-protocol-purity.md`
+- `docs/implementation-plan-adr-0021-follow-through.md`
 
-> **Start from a clean tree, assume the known SessionStore regression is fixed, and choose the next reliability/design task deliberately.**
+### Immediate framing
+The right next-session framing is:
+
+> **Start by reviewing the uncommitted ADR-0021 change-set, preserve the verified invariants, and either commit it cleanly or continue with the new backlog in priority order.**
 
 ---
 
 ## CURRENT AUTHORITATIVE STATUS
 
 ### Verified now
-Latest verification snapshot:
-- `npm run check` → **PASSED**
+This exact change-set was validated successfully with:
+- `npm run build` → **PASSED**
 - `npm test` → **PASSED**
-- `npm run ci` → **PASSED**
+- `npm run test:integration` → **PASSED**
+- `npm run test:fuzz` → **PASSED**
+- `npm run check` → **PASSED**
 
-### SessionStore regression root cause
-The flaky cross-instance metadata-mutation failure was traced to **metadata lock handling**, not just cache freshness.
+### What landed in code (uncommitted, but implemented + verified)
 
-Observed failure mode:
-- one `SessionStore` instance could observe a newly created metadata lock file
-- before that lock file's JSON payload was fully readable
-- treat it as stale/orphaned
-- remove it
-- and enter the critical section concurrently with the real writer
+#### 1. Command contract registry
+`src/command-classification.ts` now acts as a more explicit cross-cutting command contract surface for:
+- timeout mode
+- abortability
+- mutation/read-only semantics
+- control vs data plane classification
+- history sensitivity
 
-That could collapse persisted metadata from `['a', 'b']` to only one session entry.
+#### 2. Non-abortable mutation timeout hardening
+Commands that can durably commit after a timeout are now classified as **no-timeout** instead of being transport-timeout-wrapped.
+Notably:
+- `create_session`
+- `delete_session`
+- `load_session`
+- `set_session_name`
+- `export_html`
 
-### What fixed it
-The stabilization patch now:
-- tracks same-process live metadata locks in runtime state
-- treats the lock file's freshness (`mtime`) as authoritative during stale-lock decisions
-- only reaps stale locks conservatively
-- strengthens the regression test by running the cross-instance mutation scenario repeatedly
+This closes the reproduced bug where:
+- client sees timeout failure
+- command commits later anyway
 
-### What is solidly landed
-The recent hardening work includes:
-- control-plane vs data-plane rate-limit policy
-- truthful `command_accepted` semantics
-- source-cwd-aligned `load_session`
-- correct governor cleanup on `disposeAllSessions()`
-- durable journal init lock release on failure
-- reverse-scan command history
-- auth principal propagation into command execution context
-- per-connection pending-command caps
-- fail-stop handling for critical transport-send failures
-- stronger `validateCwd()`
-- surfaced runtime cleanup failure for `delete_session`
-- deterministic fail-closed terminal replay across restart
-- shutdown escalation + late-mutation guard
-- SessionStore cache freshness using `mtimeMs + ctimeMs + size`
-- SessionStore cross-instance lock-race stabilization
+#### 3. Replay identity hardening
+Replay fingerprints are now:
+- **versioned opaque digests**
+- current shape: `v2:sha256:...`
+
+Legacy raw JSON fingerprints remain replay-compatible through normalization.
+History export no longer leaks raw payload content through fingerprint values.
+
+#### 4. Protocol-pure stdio for built-ins
+Built-in diagnostics were moved off stdout.
+Implemented changes include:
+- built-in logger writes to `stderr`
+- built-in alert handler writes to `stderr`
+- built-in console metrics sink defaults to `stderr`
+- periodic SessionStore cleanup logging no longer uses `stdout`
+
+Also strengthened stdio integration tests so **non-JSON stdout pollution now fails tests**.
+
+#### 5. Global env sanitization mutex
+`createAgentSessionWithSanitizedNpmEnv()` now serializes the temporary `process.env` sanitization critical section.
+This closes the race where concurrent session creation could reintroduce `npm_config_prefix` leakage mid-flight.
+
+#### 6. Shutdown disposal correctness
+`PiServer.stop()` now disposes:
+- metrics emitter/sinks
+- logger
+
+This closes the gap where flush happened but resource disposal did not.
 
 ---
 
-## NEXT SESSION OBJECTIVE
+## NEW ARCHITECTURE DOCS CREATED
 
-### Primary objective
-There is no known failing gate right now.
+### ADR
+- `docs/adr/0021-command-contract-registry-and-protocol-purity.md`
 
-Choose the next highest-leverage task **intentionally**, with preference for reliability/design debt that already has a clear trigger or ADR-sized shape.
+This ADR captures the architectural rationale for:
+- command contract registry
+- protocol-pure stdio
+- opaque replay identity
+- global env mutation serialization
+- dispose-not-just-flush shutdown semantics
 
-### Recommended starting options
-1. **Exact guaranteed terminal response delivery over broken transports**
-   - requires protocol-level ack/resume or a durable outbound delivery design
-2. **Two-phase durable lifecycle intents**
-   - requires a persisted lifecycle-intent state machine and recovery semantics
-3. **Narrower session-ID lock scope**
-   - only if there is a concrete perf/scalability reason to pay the complexity cost
-4. **Hard cancellation after shutdown timeout**
-   - depends on stronger upstream `AgentSession` guarantees
+### Follow-through implementation plan
+- `docs/implementation-plan-adr-0021-follow-through.md`
 
-### Do not start with
-- speculative new feature work without an explicit priority signal
-- cosmetic refactors
-- broad architectural rewrites without tests or an ADR trail
+This plan breaks the next hardening wave into workstreams:
+- WS1 — output channel abstraction + enforcement
+- WS2 — exhaustive command contract coverage
+- WS3 — explicit replay fingerprint schema/export contract
+- WS4 — observability and drift detection
+- WS5 — architecture regression suite
 
-If a new externally reported bug arrives, override this list with that concrete defect.
+---
+
+## SOCIETY / AK BACKLOG STATUS
+
+Tasks were created in:
+- DB: `~/ai-society/society.v2.db`
+- Repo: `/home/tryinget/ai-society/softwareco/owned/pi-server`
+
+### Created tasks
+- **#46** P1 — `ADR-0021: output channel abstraction + enforcement`
+- **#47** P0 — `ADR-0021: make command contract registry exhaustive + CI-enforced`
+- **#48** P1 — `ADR-0021: define explicit replay fingerprint schema + export contract`
+- **#49** P2 — `ADR-0021: add observability for contract drift + legacy fingerprint normalization`
+- **#50** P1 — `ADR-0021: build architecture regression suite for protocol purity and late-commit safety`
+- **#51** P2 — `ADR-0021: publish operator/custom-integration guidance for stdout purity and replay schema`
+
+### Dependencies
+- **#49** depends on `46,47,48`
+- **#50** depends on `46,47,48`
+- **#51** depends on `46,48`
+
+### Ready queue at handoff
+Ready first:
+1. **#47** — make command contract registry exhaustive + CI-enforced
+2. **#46** — output channel abstraction + enforcement
+3. **#48** — explicit replay fingerprint schema + export contract
+
+Evidence was recorded for tasks `46-51` linking them to the implementation plan.
+
+---
+
+## PRIMARY NEXT SESSION OBJECTIVE
+
+### First priority
+Decide whether to:
+1. **commit/split the current verified ADR-0021 change-set**, or
+2. continue directly into **task #47** from the new backlog
+
+### Recommended order if continuing implementation
+1. **#47** — exhaustive command contract coverage
+   - make it mechanically impossible to add a command without contract metadata
+2. **#46** — output channel abstraction + enforcement
+   - move from “built-ins behave correctly” to “safe output paths are structural”
+3. **#48** — explicit replay fingerprint schema/export contract
+   - make fingerprint versioning explicit in history/export semantics
+4. **#49** — observability/drift counters
+5. **#50** — architecture regression suite
+6. **#51** — operator/custom integration guidance
 
 ---
 
 ## FILES TO READ FIRST
 
-### If continuing SessionStore / persistence work
-- `src/session-store.ts`
-- `src/test.ts`
-- `AGENTS.md`
-- `README.md`
-
-### If picking up larger reliability/design work
-- `AGENTS.md`
-- `README.md`
-- `docs/adr/0019-durable-command-journal-foundation.md`
-- `src/session-manager.ts`
+### If reviewing / committing the current hardening pass
+- `docs/adr/0021-command-contract-registry-and-protocol-purity.md`
+- `docs/implementation-plan-adr-0021-follow-through.md`
+- `src/command-classification.ts`
+- `src/command-replay-store.ts`
+- `src/command-journal.ts`
 - `src/server.ts`
+- `src/session-manager.ts`
+- `src/test.ts`
+- `src/test-integration.ts`
+
+### If starting task #47 next
+- `src/types.ts`
+- `src/command-classification.ts`
+- `src/test-command-classification.ts`
+- `docs/adr/0021-command-contract-registry-and-protocol-purity.md`
+- `docs/implementation-plan-adr-0021-follow-through.md`
+
+### If starting task #46 next
+- `src/server.ts`
+- `src/logger-types.ts`
+- `src/metrics-types.ts`
+- `src/threshold-alert-sink.ts`
+- `src/test-integration.ts`
+- `PROTOCOL.md`
 
 ---
 
 ## VALIDATION COMMANDS
 
-### Fast gate
+### Standard gate
 ```bash
+npm run build
+npm test
+npm run test:integration
+npm run test:fuzz
 npm run check
 ```
 
-### Full gate
+### Useful AK checks
 ```bash
-npm run ci
-```
-
-Optional extra confidence when touching concurrency/replay behavior:
-```bash
-npm test
-npm run test:fuzz
+ak task ready -d ~/ai-society/society.v2.db
+ak evidence show -d ~/ai-society/society.v2.db 47
 ```
 
 ---
 
-## KNOWN DEFERRED ITEMS
+## KNOWN DEFERRED ITEMS (UPDATED)
 
 | Finding | Rationale | Owner | Trigger | Deadline | Blast Radius |
 |---|---|---|---|---|---|
-| Exact guaranteed terminal response delivery over broken transports | Needs protocol-level ack/resume or durable outbound queue | pi-server maintainer + protocol owner | delivery ADR approval | before any release claiming reliable terminal delivery | clients can still miss a terminal response on transport break |
-| Two-phase durable lifecycle intents | Needs persisted lifecycle-intent state machine and recovery design | pi-server maintainer | lifecycle-intent ADR | before clustering / multi-process orchestration | crash windows can still transiently diverge durable/runtime state |
-| Narrower session-ID lock scope | Needs reserved-session model to preserve correctness | pi-server maintainer | perf/scalability workstream | before next perf-focused release | same-session ops can still time out under slow upstream work |
-| Hard cancellation after shutdown timeout | Needs upstream AgentSession guarantees | upstream `@mariozechner/pi-coding-agent` owner + pi-server maintainer | upstream cancellation contract | before advertising strict bounded shutdown | upstream work may continue after timeout, though server-side state is protected |
+| Custom integrations can still violate stdout purity | Built-ins are fixed, but custom logger/sink code can still write to stdout directly | pi-server maintainer | task #46 | before claiming universal stdio protocol purity | stdio clients can still break under custom integrations |
+| Command contracts are not yet mechanically exhaustive | Current registry is stronger but still needs CI/drift-proof exhaustiveness | pi-server maintainer | task #47 | before next new command addition | classification drift can reintroduce unsafe semantics |
+| Fingerprint versioning is implicit, not export-explicit | Prefix exists, but exported history/schema contract should say more | pi-server maintainer | task #48 | before broader durable-history/operator rollout | replay/history migration ambiguity |
+| Observability for drift/legacy normalization is incomplete | Need counters/metrics for architecture-level migration state | pi-server maintainer | task #49 | before calling the migration operationally mature | silent drift / partial rollout risk |
+| Architecture regression suite is not yet named and explicit | Coverage exists but should map cleanly to ADR-0021 invariants | pi-server maintainer | task #50 | before next hardening milestone closeout | future regressions become harder to localize |
 
 ---
 
 ## GUARDRAILS FOR THE NEXT SESSION
 
-- Prefer **small, test-backed changes** over broad rewrites.
-- Preserve the current hardening invariants:
-  - explicit-ID replay determinism
-  - truthful admission semantics
-  - control-plane isolation
-  - fail-stop critical transport behavior
-  - shutdown late-mutation protection
-- If touching SessionStore locking again, do **not** weaken stale-lock handling without proving the replacement interleaving is safe.
-- If touching protocol/lifecycle semantics, add or update ADR/documentation intentionally.
+- Do **not** weaken the current no-timeout classification for non-abortable durable mutations without proving a safe abort/compensation path.
+- Do **not** reintroduce any built-in stdout diagnostics in stdio mode.
+- Preserve legacy replay compatibility while evolving fingerprint/export semantics.
+- If you split commits, keep them reviewable:
+  - core code + tests
+  - docs/ADR/plan
+  - handoff prompt refresh if needed
+- If you continue implementation, anchor work to the AK task IDs rather than starting a fresh ad-hoc branch of ideas.
 
 ---
 
 ## SUCCESS CONDITION
 
 You are done with the next session only when all are true:
-- the selected task is resolved or deliberately advanced with clear evidence
+- the current working-tree state is either committed cleanly or advanced deliberately
+- the selected backlog task is resolved or materially advanced with evidence
 - relevant tests are added or updated
-- `npm run check` passes
-- `npm run ci` passes before handoff if behavior changed materially
-- the next handoff prompt matches reality
+- `npm run build`, `npm test`, `npm run test:integration`, `npm run test:fuzz`, and `npm run check` pass for behavioral changes
+- `next_session_prompt.md` matches reality again
 
 ---
 
 ## ROLLBACK
 
-If the next session goes sideways while investigating a new issue:
+If the next session goes sideways:
 
 ```bash
 git restore --source=HEAD -- <touched-files>
-npm run check
+npm run build
 npm test
+npm run test:integration
+npm run test:fuzz
+npm run check
+```
+
+If you need to discard the full current uncommitted change-set:
+
+```bash
+git restore --source=HEAD -- .
+git clean -fd
 ```
 
 ---
 
 ## NOTE
 
-The previous handoff prompt that said “one cross-instance SessionStore race remains” is now obsolete.
+The previous handoff that assumed “clean tree, pick the next issue later” is no longer accurate.
 
 The right current framing is:
 
-> **The hardening pass and the SessionStore follow-up are verified; start from a clean tree and pick the next deliberate reliability target.**
+> **ADR-0021 has been implemented and verified in an uncommitted change-set, an implementation plan now exists, AK backlog items 46-51 are created, and the next deliberate move is to review/commit this state or start task #47.**
