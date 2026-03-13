@@ -10,6 +10,13 @@ Policy:
 
 See `docs/release-policy.md` for the canonical commit, changelog, and release-note policy.
 
+## [2.2.1](https://github.com/tryingET/pi-server/compare/v2.2.0...v2.2.1) (2026-03-13)
+
+
+### Bug Fixes
+
+* **server:** enforce command contracts and protocol purity ([579aa1c](https://github.com/tryingET/pi-server/commit/579aa1cd494077843f213da6c9400f560d6593ca))
+
 ## [2.2.0](https://github.com/tryingET/pi-server/compare/v2.1.0...v2.2.0) (2026-03-12)
 
 
@@ -101,4 +108,3 @@ See `docs/release-policy.md` for the canonical commit, changelog, and release-no
 * **review:** address deep review findings from prompt-snippets.md ([8059076](https://github.com/tryingET/pi-server/commit/80590768e14283f3a3406b57bf8da98336c3b6dd))
 * **server:** harden causal command execution and replay safety ([f1f4ed3](https://github.com/tryingET/pi-server/commit/f1f4ed383a67335b243397eba1638705f8b9832a))
 * **test:** update timeout replay test for ADR-0001 invariant ([85c2693](https://github.com/tryingET/pi-server/commit/85c269370cb8ecc8c64a8120d087d2d0df15ff90))
-
