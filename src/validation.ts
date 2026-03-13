@@ -15,6 +15,7 @@ export interface ValidationError {
 import fs from "fs";
 import path from "path";
 import { SYNTHETIC_ID_PREFIX } from "./command-replay-store.js";
+import { getExtensionUIResponseValidationError } from "./extension-ui.js";
 
 const MAX_PROMPT_MESSAGE_LENGTH = 200_000;
 const MAX_BASH_COMMAND_LENGTH = 20_000;
@@ -54,6 +55,10 @@ function hasControlCharacters(value: string): boolean {
     if (code <= 31 || code === 127) return true;
   }
   return false;
+}
+
+export function normalizeSessionNameInput(value: string): string {
+  return value.trim();
 }
 
 /**
@@ -671,6 +676,11 @@ function validateCommandByType(type: string, cmd: Record<string, unknown>): Vali
             field: "response.method",
             message: "Must be one of: select, confirm, input, editor, interview, cancelled",
           });
+        } else {
+          const responseError = getExtensionUIResponseValidationError(response);
+          if (responseError) {
+            errors.push({ field: "response", message: responseError });
+          }
         }
       }
       break;
@@ -733,6 +743,11 @@ function validateCommandByType(type: string, cmd: Record<string, unknown>): Vali
         errors.push({ field: "name", message: `Too long (max ${MAX_SESSION_NAME_LENGTH} chars)` });
       } else if (hasControlCharacters(cmd.name)) {
         errors.push({ field: "name", message: "Must not contain control characters" });
+      } else if (normalizeSessionNameInput(cmd.name).length === 0) {
+        errors.push({
+          field: "name",
+          message: "Must contain at least one non-whitespace character",
+        });
       }
       break;
 

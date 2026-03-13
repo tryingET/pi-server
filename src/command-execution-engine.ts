@@ -62,21 +62,17 @@ export function withTimeout<T>(
       if (settled) return;
       settled = true;
 
-      // Wrap onTimeout in try-catch to handle both sync and async errors
-      let onTimeoutPromise: Promise<void>;
+      // Timeout must surface even if cancellation hangs.
+      // Fire cancellation as best-effort side effect, but reject immediately.
       try {
-        onTimeoutPromise = Promise.resolve(onTimeout?.());
+        Promise.resolve(onTimeout?.()).catch(() => {
+          // Ignore cancellation hook errors; timeout response still returned.
+        });
       } catch {
-        onTimeoutPromise = Promise.resolve();
+        // Ignore sync hook errors; timeout response still returned.
       }
 
-      onTimeoutPromise
-        .catch(() => {
-          // Ignore cancellation hook errors; timeout response still returned.
-        })
-        .finally(() => {
-          reject(new Error(`Command '${commandType}' timed out after ${timeoutMs}ms`));
-        });
+      reject(new Error(`Command '${commandType}' timed out after ${timeoutMs}ms`));
     }, timeoutMs);
 
     promise

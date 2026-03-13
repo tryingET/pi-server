@@ -49,6 +49,7 @@ import { createServerUIContext } from "./server-ui-context.js";
 import {
   validateCommand,
   formatValidationErrors,
+  normalizeSessionNameInput,
   validateSessionFileAccess,
 } from "./validation.js";
 import { ResourceGovernor, DEFAULT_CONFIG } from "./resource-governor.js";
@@ -142,6 +143,7 @@ let sanitizedAgentSessionCreationTail: Promise<void> = Promise.resolve();
  * package manager may install "global" packages into the project directory.
  */
 const SANITIZED_NPM_ENV_KEYS = ["npm_config_prefix", "NPM_CONFIG_PREFIX"] as const;
+const SESSION_NAME_PERSISTENCE_BRIDGE = Symbol("sessionNamePersistenceBridge");
 
 export interface SessionManagerRuntimeOptions {
   defaultCommandTimeoutMs?: number;
@@ -187,6 +189,8 @@ export class PiSessionManager implements SessionResolver {
   private startupRecoverySnapshot: StartupRecoverySnapshot | null = null;
   /** One-time initialization promise for durable journal startup rehydration. */
   private durableInitPromise: Promise<void> | null = null;
+  /** Best-effort durable metadata syncs triggered by out-of-band session renames. */
+  private pendingSessionNameMetadataSyncs = new Map<string, Promise<void>>();
   /** Durable init lifecycle state (for get_startup_recovery observability). */
   private durableInitState: DurableInitState = "pending";
   /** Last durable initialization error, if any. */
@@ -721,6 +725,7 @@ export class PiSessionManager implements SessionResolver {
     this.executionEngine.clear();
     this.replayStore.clear();
     this.lockManager.clear();
+    this.pendingSessionNameMetadataSyncs.clear();
 
     // Clear governor state
     this.governor.cleanupStaleData(new Set());
@@ -760,6 +765,78 @@ export class PiSessionManager implements SessionResolver {
       data,
     };
     this.broadcast(JSON.stringify(event));
+  }
+
+  private enqueueSessionNameMetadataSync(
+    sessionId: string,
+    sessionName: string | undefined
+  ): Promise<void> {
+    const previous = this.pendingSessionNameMetadataSyncs.get(sessionId) ?? Promise.resolve();
+
+    const next = previous
+      .catch(() => {
+        // Preserve queue progress even if an earlier sync failed.
+      })
+      .then(async () => {
+        await this.sessionStore.updateName(sessionId, sessionName);
+      });
+
+    this.pendingSessionNameMetadataSyncs.set(sessionId, next);
+    void next.finally(() => {
+      if (this.pendingSessionNameMetadataSyncs.get(sessionId) === next) {
+        this.pendingSessionNameMetadataSyncs.delete(sessionId);
+      }
+    });
+
+    return next;
+  }
+
+  private async awaitPendingSessionNameMetadataSyncs(sessionId?: string): Promise<void> {
+    if (sessionId) {
+      const pending = this.pendingSessionNameMetadataSyncs.get(sessionId);
+      if (pending) {
+        await pending.catch(() => {
+          // Best-effort bridge errors are logged at the source.
+        });
+      }
+      return;
+    }
+
+    const pending = [...this.pendingSessionNameMetadataSyncs.values()];
+    if (pending.length === 0) {
+      return;
+    }
+
+    await Promise.allSettled(pending);
+  }
+
+  private installSessionNamePersistenceBridge(sessionId: string, session: AgentSession): void {
+    const sessionWithBridge = session as AgentSession & {
+      [SESSION_NAME_PERSISTENCE_BRIDGE]?: boolean;
+      setSessionName?: (name: string) => void;
+      sessionName?: string;
+    };
+
+    if (typeof sessionWithBridge.setSessionName !== "function") {
+      return;
+    }
+
+    if (sessionWithBridge[SESSION_NAME_PERSISTENCE_BRIDGE]) {
+      return;
+    }
+    sessionWithBridge[SESSION_NAME_PERSISTENCE_BRIDGE] = true;
+
+    const originalSetSessionName = sessionWithBridge.setSessionName.bind(session);
+    sessionWithBridge.setSessionName = (name: string): void => {
+      originalSetSessionName(name);
+      const effectiveName = sessionWithBridge.sessionName;
+      void this.enqueueSessionNameMetadataSync(sessionId, effectiveName).catch((error) => {
+        console.error(
+          `[set_session_name] Failed to persist out-of-band session name for ${sessionId}:`,
+          error
+        );
+      });
+    };
   }
 
   // ==========================================================================
@@ -866,8 +943,10 @@ export class PiSessionManager implements SessionResolver {
         cwd: cwd ?? process.cwd(),
         createdAt: sessionInfo.createdAt,
         modelId: session.model?.id,
+        sessionName: session.sessionName,
       });
       metadataSaved = true;
+      this.installSessionNamePersistenceBridge(sessionId, session);
 
       // Subscribe and then commit the session into runtime state.
       unsubscribe = session.subscribe((event: AgentSessionEvent) => {
@@ -934,6 +1013,8 @@ export class PiSessionManager implements SessionResolver {
       if (!session) {
         throw new Error(`Session ${sessionId} not found`);
       }
+
+      await this.awaitPendingSessionNameMetadataSyncs(sessionId);
 
       // Remove persisted metadata first so a reported delete failure does not
       // leave runtime and durable state disagreeing about whether the session
@@ -1040,6 +1121,7 @@ export class PiSessionManager implements SessionResolver {
    * These are sessions that existed in previous server runs OR discovered on disk.
    */
   async listStoredSessions(): Promise<StoredSessionInfo[]> {
+    await this.awaitPendingSessionNameMetadataSyncs();
     return this.sessionStore.listAllSessions();
   }
 
@@ -1130,6 +1212,7 @@ export class PiSessionManager implements SessionResolver {
         sessionName: session.sessionName,
       });
       metadataSaved = true;
+      this.installSessionNamePersistenceBridge(sessionId, session);
 
       unsubscribe = session.subscribe((event: AgentSessionEvent) => {
         this.broadcastEvent(sessionId, event);
@@ -1724,6 +1807,21 @@ export class PiSessionManager implements SessionResolver {
 
     this.replayStore.cleanupIdempotencyCache();
 
+    const broadcastTerminalLifecycle = (response: RpcResponse): void => {
+      this.broadcastCommandLifecycle("command_finished", {
+        commandId,
+        commandType,
+        sessionId,
+        dependsOn,
+        ifSessionVersion,
+        idempotencyKey,
+        success: response.success,
+        error: response.success ? undefined : response.error,
+        sessionVersion: response.sessionVersion,
+        replayed: response.replayed,
+      });
+    };
+
     const finalizeResponse = (response: RpcResponse): RpcResponse => {
       const finishedAppend = this.appendCommandLifecycleToJournal({
         phase: "command_finished",
@@ -1780,37 +1878,33 @@ export class PiSessionManager implements SessionResolver {
         }
       }
 
-      this.broadcastCommandLifecycle("command_finished", {
-        commandId,
-        commandType,
-        sessionId,
-        dependsOn,
-        ifSessionVersion,
-        idempotencyKey,
-        success: finalizedResponse.success,
-        error: finalizedResponse.success ? undefined : finalizedResponse.error,
-        sessionVersion: finalizedResponse.sessionVersion,
-        replayed: finalizedResponse.replayed,
-      });
-
+      broadcastTerminalLifecycle(finalizedResponse);
       return finalizedResponse;
     };
 
+    const finalizeEphemeralTerminalResponse = async (
+      responseOrPromise: RpcResponse | Promise<RpcResponse>
+    ): Promise<RpcResponse> => {
+      const response = await responseOrPromise;
+      broadcastTerminalLifecycle(response);
+      return response;
+    };
+
     // Check for replay opportunities or conflicts (ADR-0001: Free replay)
-    // Replay is O(1) lookup - no execution cost, should not consume rate limit
+    // Replay/conflict paths must remain free of durable side effects, but they
+    // still emit terminal lifecycle events so subscribers observe completion.
     const replayCheck = this.replayStore.checkReplay(command, fingerprint);
 
     if (replayCheck.kind === "conflict") {
-      return finalizeResponse(replayCheck.response);
+      return finalizeEphemeralTerminalResponse(replayCheck.response);
     }
 
     if (replayCheck.kind === "replay_cached") {
-      return finalizeResponse(replayCheck.response);
+      return finalizeEphemeralTerminalResponse(replayCheck.response);
     }
 
     if (replayCheck.kind === "replay_inflight") {
-      const replayed = await replayCheck.promise;
-      return finalizeResponse(replayed);
+      return finalizeEphemeralTerminalResponse(replayCheck.promise);
     }
 
     // ADR-0001: Rate limiting only for NEW executions (replay is free)
@@ -2115,6 +2209,59 @@ export class PiSessionManager implements SessionResolver {
   }
 
   /**
+   * Persist and apply a session name change as a single logical mutation.
+   * Durable metadata is updated before the live session so failure cannot leave
+   * the stored session list ahead of runtime state.
+   */
+  private async executeSetSessionNameCommand(
+    sessionId: string,
+    session: AgentSession,
+    command: { name: string },
+    id: string | undefined
+  ): Promise<RpcResponse> {
+    const previousName = session.sessionName;
+    const normalizedName = normalizeSessionNameInput(command.name);
+
+    const updated = await this.sessionStore.updateName(sessionId, normalizedName);
+    if (!updated) {
+      return {
+        id,
+        type: "response",
+        command: "set_session_name",
+        success: false,
+        error: `Session ${sessionId} metadata not found for rename`,
+      };
+    }
+
+    try {
+      session.setSessionName(normalizedName);
+      return {
+        id,
+        type: "response",
+        command: "set_session_name",
+        success: true,
+      };
+    } catch (error) {
+      try {
+        await this.sessionStore.updateName(sessionId, previousName);
+      } catch (rollbackError) {
+        console.error(
+          `[set_session_name] Failed to roll back persisted session name for ${sessionId}:`,
+          rollbackError
+        );
+      }
+
+      return {
+        id,
+        type: "response",
+        command: "set_session_name",
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  /**
    * Internal command execution (called after tracking and rate limiting).
    * Routes to server command handlers or session command handlers.
    */
@@ -2153,6 +2300,16 @@ export class PiSessionManager implements SessionResolver {
 
       // Record heartbeat for valid session activity
       this.governor.recordHeartbeat(cmdSessionId!);
+
+      // Session name changes need coordinated runtime + durable mutation.
+      if (commandType === "set_session_name") {
+        return this.executeSetSessionNameCommand(
+          cmdSessionId!,
+          session,
+          command as { name: string },
+          id
+        );
+      }
 
       // ADR-0010: Circuit breaker for LLM commands
       const llmResponse = await executeLLMCommand(command, session, context);

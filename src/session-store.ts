@@ -107,6 +107,8 @@ const METADATA_LOCK_STALE_MS = 30000;
 /** Bound recursive discovery of session roots. */
 const MAX_DISCOVERY_DEPTH = 4;
 const MAX_DISCOVERY_NODES = 10000;
+/** Chunk size for reverse scanning session files for latest session_info entries. */
+const SESSION_METADATA_REVERSE_SCAN_CHUNK_BYTES = 16 * 1024;
 
 /**
  * Tracks lock paths currently held by this process.
@@ -498,10 +500,19 @@ export class SessionStore {
 
   /**
    * Load session metadata by ID.
+   *
+   * Session-file-derived fields are treated as canonical when the file is still
+   * accessible, and the stored metadata row is opportunistically healed.
    */
   async load(sessionId: string): Promise<StoredSessionMetadata | null> {
     const metadata = await this.loadMetadata();
-    return metadata.get(sessionId) ?? null;
+    const existing = metadata.get(sessionId) ?? null;
+    if (!existing) {
+      return null;
+    }
+
+    const refreshed = await this.refreshStoredMetadataEntryFromSessionFile(existing);
+    return refreshed ?? existing;
   }
 
   /**
@@ -666,8 +677,11 @@ export class SessionStore {
   }
 
   /**
-   * Read the first line of a session file to get metadata.
-   * Uses readline to properly handle UTF-8 and avoid truncation issues.
+   * Read session metadata from disk.
+   *
+   * - `cwd` comes from the header line near the top of the file.
+   * - `sessionName` comes from the latest persisted `session_info` entry when present,
+   *   falling back to header metadata for older file formats.
    */
   async readSessionFileMetadata(filePath: string): Promise<{ cwd: string; sessionName?: string }> {
     const readline = await import("readline");
@@ -683,26 +697,15 @@ export class SessionStore {
       let firstLine: string | undefined;
       for await (const line of rl) {
         firstLine = line;
-        break; // Only need the first line
+        break; // Header only
       }
 
-      if (!firstLine) {
-        return { cwd: "/unknown" };
-      }
+      const header = this.parseSessionHeaderMetadata(firstLine);
+      const latestSessionName = await this.readLatestSessionNameFromSessionFile(filePath);
 
-      const meta = JSON.parse(firstLine) as {
-        cwd?: unknown;
-        sessionName?: unknown;
-        name?: unknown;
-      };
       return {
-        cwd: typeof meta.cwd === "string" && meta.cwd.length > 0 ? meta.cwd : "/unknown",
-        sessionName:
-          typeof meta.sessionName === "string"
-            ? meta.sessionName
-            : typeof meta.name === "string"
-              ? meta.name
-              : undefined,
+        cwd: header.cwd,
+        sessionName: latestSessionName ?? header.sessionName,
       };
     } catch {
       return { cwd: "/unknown" };
@@ -723,6 +726,114 @@ export class SessionStore {
     }
   }
 
+  private parseSessionHeaderMetadata(firstLine: string | undefined): {
+    cwd: string;
+    sessionName?: string;
+  } {
+    if (!firstLine) {
+      return { cwd: "/unknown" };
+    }
+
+    try {
+      const meta = JSON.parse(firstLine) as {
+        cwd?: unknown;
+        sessionName?: unknown;
+        name?: unknown;
+      };
+      return {
+        cwd: typeof meta.cwd === "string" && meta.cwd.length > 0 ? meta.cwd : "/unknown",
+        sessionName: this.normalizePersistedSessionName(meta.sessionName ?? meta.name),
+      };
+    } catch {
+      return { cwd: "/unknown" };
+    }
+  }
+
+  private normalizePersistedSessionName(value: unknown): string | undefined {
+    if (typeof value !== "string") {
+      return undefined;
+    }
+
+    const normalized = value.trim();
+    return normalized.length > 0 ? normalized : undefined;
+  }
+
+  private extractSessionNameFromSessionLine(line: string): string | undefined {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+
+    try {
+      const parsed = JSON.parse(trimmed) as {
+        type?: unknown;
+        sessionName?: unknown;
+        name?: unknown;
+      };
+
+      if (parsed.type === "session_info") {
+        return this.normalizePersistedSessionName(parsed.name);
+      }
+
+      return this.normalizePersistedSessionName(parsed.sessionName ?? parsed.name);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async readLatestSessionNameFromSessionFile(
+    filePath: string
+  ): Promise<string | undefined> {
+    let handle: fs.FileHandle | null = null;
+
+    try {
+      handle = await fs.open(filePath, "r");
+      const stats = await handle.stat();
+      let position = stats.size;
+      let leftover = Buffer.alloc(0);
+
+      while (position > 0) {
+        const readSize = Math.min(SESSION_METADATA_REVERSE_SCAN_CHUNK_BYTES, position);
+        position -= readSize;
+
+        const buffer = Buffer.alloc(readSize);
+        const { bytesRead } = await handle.read(buffer, 0, readSize, position);
+        if (bytesRead <= 0) {
+          break;
+        }
+
+        const chunk = Buffer.concat([buffer.subarray(0, bytesRead), leftover]);
+        let segmentEnd = chunk.length;
+
+        for (let i = chunk.length - 1; i >= 0; i--) {
+          if (chunk[i] !== 0x0a) {
+            continue;
+          }
+
+          const lineBuffer = chunk.subarray(i + 1, segmentEnd);
+          segmentEnd = i;
+          if (lineBuffer.length === 0) {
+            continue;
+          }
+
+          const sessionName = this.extractSessionNameFromSessionLine(lineBuffer.toString("utf-8"));
+          if (sessionName !== undefined) {
+            return sessionName;
+          }
+        }
+
+        leftover = chunk.subarray(0, segmentEnd);
+      }
+
+      const trailingLine = leftover.toString("utf-8").trim();
+      return trailingLine ? this.extractSessionNameFromSessionLine(trailingLine) : undefined;
+    } catch {
+      return undefined;
+    } finally {
+      await handle?.close();
+    }
+  }
+
   /**
    * Extract timestamp from session filename.
    * 2026-02-22T16-09-11-130Z_6f572984.jsonl → 2026-02-22T16:09:11.130Z
@@ -735,12 +846,113 @@ export class SessionStore {
     return `${year}-${month}-${day}T${hour}:${min}:${sec}.${ms}Z`;
   }
 
+  private async refreshStoredMetadataEntryFromSessionFile(
+    meta: StoredSessionMetadata
+  ): Promise<StoredSessionMetadata | null> {
+    try {
+      await fs.access(meta.sessionFile);
+    } catch {
+      return null;
+    }
+
+    const fileMetadata = await this.readSessionFileMetadata(meta.sessionFile);
+    const nextCwd = fileMetadata.cwd !== "/unknown" ? fileMetadata.cwd : meta.cwd;
+    const nextSessionName = fileMetadata.sessionName ?? meta.sessionName;
+
+    if (nextCwd === meta.cwd && nextSessionName === meta.sessionName) {
+      return meta;
+    }
+
+    const refreshed: StoredSessionMetadata = {
+      ...meta,
+      cwd: nextCwd,
+      sessionName: nextSessionName,
+    };
+
+    await this.runMetadataMutation(async () => {
+      const currentMetadata = await this.loadMetadata();
+      const current = currentMetadata.get(meta.sessionId);
+      if (!current) {
+        return;
+      }
+      if (current.sessionFile !== meta.sessionFile) {
+        return;
+      }
+
+      const latestFileMetadata = await this.readSessionFileMetadata(current.sessionFile);
+      const currentNextCwd =
+        latestFileMetadata.cwd !== "/unknown" ? latestFileMetadata.cwd : current.cwd;
+      const currentNextSessionName = latestFileMetadata.sessionName ?? current.sessionName;
+
+      if (currentNextCwd === current.cwd && currentNextSessionName === current.sessionName) {
+        return;
+      }
+
+      const nextMetadata = this.cloneMetadataMap(currentMetadata);
+      nextMetadata.set(meta.sessionId, {
+        ...current,
+        cwd: currentNextCwd,
+        sessionName: currentNextSessionName,
+      });
+      await this.saveMetadata(nextMetadata);
+    });
+
+    return refreshed;
+  }
+
+  private async syncStoredMetadataFromDiscoveredSessions(
+    discovered: StoredSessionInfo[]
+  ): Promise<void> {
+    const discoveredByPath = new Map(discovered.map((session) => [session.sessionFile, session]));
+    if (discoveredByPath.size === 0) {
+      return;
+    }
+
+    await this.runMetadataMutation(async () => {
+      const currentMetadata = await this.loadMetadata();
+      let nextMetadata: Map<string, StoredSessionMetadata> | null = null;
+
+      for (const [sessionId, current] of currentMetadata) {
+        const discoveredSession = discoveredByPath.get(current.sessionFile);
+        if (!discoveredSession) {
+          continue;
+        }
+
+        const nextCwd = discoveredSession.cwd !== "/unknown" ? discoveredSession.cwd : current.cwd;
+        const nextSessionName = discoveredSession.sessionName ?? current.sessionName;
+
+        if (nextCwd === current.cwd && nextSessionName === current.sessionName) {
+          continue;
+        }
+
+        if (!nextMetadata) {
+          nextMetadata = this.cloneMetadataMap(currentMetadata);
+        }
+
+        nextMetadata.set(sessionId, {
+          ...current,
+          cwd: nextCwd,
+          sessionName: nextSessionName,
+        });
+      }
+
+      if (nextMetadata) {
+        await this.saveMetadata(nextMetadata);
+      }
+    });
+  }
+
   /**
    * List all sessions (stored + discovered), merged.
-   * Stored sessions take precedence (they have more metadata).
+   *
+   * Session-file metadata is canonical for fields that can drift at runtime
+   * (notably `sessionName`). Stored metadata remains authoritative for the
+   * stable server-side mapping from runtime sessionId -> session file.
    */
   async listAllSessions(): Promise<StoredSessionInfo[]> {
     const [stored, discovered] = await Promise.all([this.listWithInfo(), this.discoverSessions()]);
+
+    await this.syncStoredMetadataFromDiscoveredSessions(discovered);
 
     // Create map keyed by sessionFile for deduplication
     const byPath = new Map<string, StoredSessionInfo>();
@@ -750,9 +962,21 @@ export class SessionStore {
       byPath.set(session.sessionFile, session);
     }
 
-    // Stored sessions override (they have more metadata)
+    // Stored entries preserve runtime sessionId mapping, but session-file derived
+    // metadata wins for fields that may change after the metadata row was written.
     for (const session of stored) {
-      byPath.set(session.sessionFile, session);
+      const discoveredSession = byPath.get(session.sessionFile);
+      if (!discoveredSession) {
+        byPath.set(session.sessionFile, session);
+        continue;
+      }
+
+      byPath.set(session.sessionFile, {
+        ...discoveredSession,
+        ...session,
+        cwd: discoveredSession.cwd !== "/unknown" ? discoveredSession.cwd : session.cwd,
+        sessionName: discoveredSession.sessionName ?? session.sessionName,
+      });
     }
 
     // Sort by creation date (newest first)
@@ -824,9 +1048,9 @@ export class SessionStore {
   }
 
   /**
-   * Update session name in metadata.
+   * Update or clear the persisted session name in metadata.
    */
-  async updateName(sessionId: string, name: string): Promise<boolean> {
+  async updateName(sessionId: string, name?: string): Promise<boolean> {
     return this.runMetadataMutation(async () => {
       const currentMetadata = await this.loadMetadata();
       const existing = currentMetadata.get(sessionId);
@@ -836,7 +1060,7 @@ export class SessionStore {
       const nextMetadata = this.cloneMetadataMap(currentMetadata);
       nextMetadata.set(sessionId, {
         ...existing,
-        sessionName: name,
+        sessionName: typeof name === "string" ? name : undefined,
       });
       await this.saveMetadata(nextMetadata);
       return true;

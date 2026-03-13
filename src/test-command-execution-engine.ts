@@ -95,6 +95,22 @@ describe("command-execution-engine", () => {
       );
     });
 
+    it("rejects even when onTimeout hangs", async () => {
+      const promise = new Promise((resolve) => setTimeout(resolve, 1000));
+      const timed = withTimeout(promise, 10, "test", () => new Promise(() => {}));
+
+      const result = await Promise.race([
+        timed.then(
+          () => "resolved",
+          (error) => `rejected:${(error as Error).message}`
+        ),
+        new Promise<string>((resolve) => setTimeout(() => resolve("still-pending"), 100)),
+      ]);
+
+      assert.notStrictEqual(result, "still-pending", "Timeout must not wait for abort hook");
+      assert.match(result, /^rejected:Command 'test' timed out after 10ms$/);
+    });
+
     it("propagates promise rejection", async () => {
       const promise = Promise.reject(new Error("promise error"));
       await assert.rejects(withTimeout(promise, 1000, "test"), /promise error/);

@@ -373,6 +373,31 @@ async function testValidation() {
     );
   });
 
+  await test("validation: rejects whitespace-only session names", () => {
+    const errors = validateCommand({
+      type: "set_session_name",
+      sessionId: "test",
+      name: "   ",
+    });
+    assert(
+      errors.some((e) => e.field === "name" && e.message.includes("non-whitespace")),
+      "Should reject whitespace-only session names"
+    );
+  });
+
+  await test("validation: rejects malformed extension_ui_response payloads", () => {
+    const errors = validateCommand({
+      type: "extension_ui_response",
+      sessionId: "test",
+      requestId: "req-1",
+      response: { method: "confirm", confirmed: "yes" },
+    });
+    assert(
+      errors.some((e) => e.field === "response"),
+      "Should reject malformed extension UI payload shape"
+    );
+  });
+
   // Test: Reserved ID prefix
   await test("validation: rejects reserved ID prefix", () => {
     const errors = validateCommand({
@@ -1446,6 +1471,80 @@ async function testExtensionUI() {
     assert.strictEqual(ui.getPendingCount(), 0, "Aborted request must not remain pending");
     assert.strictEqual(events.length, 0, "Aborted request must not broadcast UI events");
   });
+
+  await test("extension-ui: rejects mismatched response methods without settling request", async () => {
+    const ui = new ExtensionUIManager(() => {});
+    const request = ui.createPendingRequest("s1", "confirm", {});
+    assert(request !== null, "Expected pending confirm request");
+
+    const invalid = ui.handleUIResponse({
+      sessionId: "s1",
+      type: "extension_ui_response",
+      requestId: request.requestId,
+      response: { method: "select", value: "oops" },
+    });
+
+    assert.strictEqual(invalid.success, false, "Mismatched method should be rejected");
+    assert.ok(invalid.error?.includes("mismatch"));
+    assert.strictEqual(ui.getPendingCount(), 1, "Invalid response must not settle request");
+
+    const valid = ui.handleUIResponse({
+      sessionId: "s1",
+      type: "extension_ui_response",
+      requestId: request.requestId,
+      response: { method: "confirm", confirmed: true },
+    });
+
+    assert.strictEqual(valid.success, true, "Valid response should succeed after invalid attempt");
+    assert.deepStrictEqual(await request.promise, { method: "confirm", confirmed: true });
+  });
+
+  await test("extension-ui: rejects malformed response payloads", async () => {
+    const ui = new ExtensionUIManager(() => {});
+    const request = ui.createPendingRequest("s1", "confirm", {});
+    assert(request !== null, "Expected pending confirm request");
+
+    const invalid = ui.handleUIResponse({
+      sessionId: "s1",
+      type: "extension_ui_response",
+      requestId: request.requestId,
+      response: { method: "confirm", confirmed: "yes" } as any,
+    });
+
+    assert.strictEqual(invalid.success, false, "Malformed payload should be rejected");
+    assert.ok(invalid.error?.includes("response.confirmed"));
+    assert.strictEqual(ui.getPendingCount(), 1, "Malformed response must not settle request");
+
+    ui.cancelSessionRequests("s1");
+    await request.promise.catch(() => {});
+  });
+
+  await test("extension-ui: rejects select responses outside offered options", async () => {
+    const ui = new ExtensionUIManager(() => {});
+    const request = ui.createPendingRequest("s1", "select", { options: ["a", "b"] });
+    assert(request !== null, "Expected pending select request");
+
+    const invalid = ui.handleUIResponse({
+      sessionId: "s1",
+      type: "extension_ui_response",
+      requestId: request.requestId,
+      response: { method: "select", value: "c" },
+    });
+
+    assert.strictEqual(invalid.success, false, "Unexpected option should be rejected");
+    assert.ok(invalid.error?.includes("offered options"));
+    assert.strictEqual(ui.getPendingCount(), 1, "Invalid option must not settle request");
+
+    const valid = ui.handleUIResponse({
+      sessionId: "s1",
+      type: "extension_ui_response",
+      requestId: request.requestId,
+      response: { method: "select", value: "b" },
+    });
+
+    assert.strictEqual(valid.success, true, "Offered option should be accepted");
+    assert.deepStrictEqual(await request.promise, { method: "select", value: "b" });
+  });
 }
 
 // =============================================================================
@@ -1547,9 +1646,99 @@ async function testSessionManager() {
     assert.strictEqual(second.replayed, true, "Second response should come from replay cache");
   });
 
+  await test("session-manager: replayed responses emit terminal lifecycle events", async () => {
+    const localManager = new PiSessionManager();
+    const events: any[] = [];
+    const subscriber = {
+      send: (data: string) => {
+        events.push(JSON.parse(data));
+      },
+      subscribedSessions: new Set<string>(),
+    };
+    localManager.addSubscriber(subscriber);
+
+    try {
+      const first = await localManager.executeCommand({
+        id: "replay-life-1",
+        type: "list_sessions",
+      } as any);
+      const second = await localManager.executeCommand({
+        id: "replay-life-1",
+        type: "list_sessions",
+      } as any);
+
+      assert.strictEqual(first.success, true);
+      assert.strictEqual(second.success, true);
+      assert.strictEqual(second.replayed, true);
+
+      const replayFinished = events.filter(
+        (event) =>
+          event.type === "command_finished" &&
+          event.data?.commandId === "replay-life-1" &&
+          event.data?.replayed === true
+      );
+      assert.strictEqual(
+        replayFinished.length,
+        1,
+        "Replay request should emit exactly one replayed command_finished event"
+      );
+    } finally {
+      localManager.removeSubscriber(subscriber);
+    }
+  });
+
+  await test("session-manager: conflicting duplicate IDs emit terminal lifecycle events", async () => {
+    const localManager = new PiSessionManager();
+    const events: any[] = [];
+    const subscriber = {
+      send: (data: string) => {
+        events.push(JSON.parse(data));
+      },
+      subscribedSessions: new Set<string>(),
+    };
+    localManager.addSubscriber(subscriber);
+
+    try {
+      const first = await localManager.executeCommand({
+        id: "dup-life-1",
+        type: "list_sessions",
+      } as any);
+      const second = await localManager.executeCommand({
+        id: "dup-life-1",
+        type: "health_check",
+      } as any);
+
+      assert.strictEqual(first.success, true);
+      assert.strictEqual(second.success, false);
+
+      const conflictFinished = events.filter(
+        (event) =>
+          event.type === "command_finished" &&
+          event.data?.commandId === "dup-life-1" &&
+          event.data?.success === false
+      );
+      assert.strictEqual(
+        conflictFinished.length,
+        1,
+        "Conflict request should emit one terminal command_finished event"
+      );
+      assert.ok(conflictFinished[0]?.data?.error?.includes("Conflicting id 'dup-life-1'"));
+    } finally {
+      localManager.removeSubscriber(subscriber);
+    }
+  });
+
   await test("session-manager: concurrent idempotency retries collapse to one execution", async () => {
     const localManager = new PiSessionManager();
     const managerAny = localManager as any;
+    const events: any[] = [];
+    const subscriber = {
+      send: (data: string) => {
+        events.push(JSON.parse(data));
+      },
+      subscribedSessions: new Set<string>(),
+    };
+    localManager.addSubscriber(subscriber);
     let executions = 0;
 
     managerAny.executeCommandInternal = async (
@@ -1567,23 +1756,39 @@ async function testSessionManager() {
       };
     };
 
-    const [first, second] = await Promise.all([
-      localManager.executeCommand({
-        id: "idem-inflight-1",
-        type: "list_sessions",
-        idempotencyKey: "shared-inflight-key",
-      } as any),
-      localManager.executeCommand({
-        id: "idem-inflight-2",
-        type: "list_sessions",
-        idempotencyKey: "shared-inflight-key",
-      } as any),
-    ]);
+    try {
+      const [first, second] = await Promise.all([
+        localManager.executeCommand({
+          id: "idem-inflight-1",
+          type: "list_sessions",
+          idempotencyKey: "shared-inflight-key",
+        } as any),
+        localManager.executeCommand({
+          id: "idem-inflight-2",
+          type: "list_sessions",
+          idempotencyKey: "shared-inflight-key",
+        } as any),
+      ]);
 
-    assert.strictEqual(executions, 1, "Expected only one underlying execution");
-    assert.strictEqual(first.success, true);
-    assert.strictEqual(second.success, true);
-    assert.strictEqual(second.replayed, true, "Concurrent retry should replay in-flight result");
+      assert.strictEqual(executions, 1, "Expected only one underlying execution");
+      assert.strictEqual(first.success, true);
+      assert.strictEqual(second.success, true);
+      assert.strictEqual(second.replayed, true, "Concurrent retry should replay in-flight result");
+
+      const replayFinished = events.filter(
+        (event) =>
+          event.type === "command_finished" &&
+          event.data?.commandId === "idem-inflight-2" &&
+          event.data?.replayed === true
+      );
+      assert.strictEqual(
+        replayFinished.length,
+        1,
+        "In-flight replay should emit a replayed command_finished event"
+      );
+    } finally {
+      localManager.removeSubscriber(subscriber);
+    }
   });
 
   await test("session-manager: rejects conflicting duplicate command IDs", async () => {
@@ -2695,6 +2900,93 @@ async function testSessionManager() {
     }
   });
 
+  await test("session-manager: set_session_name persists durable metadata", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "pi-session-name-persist-"));
+    const sessionFile = join(dataDir, "named-session.jsonl");
+    const localManager = new PiSessionManager();
+    (localManager as any).sessionStore = new SessionStore({
+      dataDir,
+      sessionsDir: dataDir,
+      serverVersion: "test",
+    });
+
+    writeFileSync(
+      sessionFile,
+      JSON.stringify({ type: "session", version: 3, cwd: process.cwd() }) + "\n"
+    );
+
+    const fakeSession = {
+      bindExtensions: async () => {},
+      subscribe: () => () => {},
+      dispose: () => {},
+      sessionFile,
+      model: { id: "fake-model" },
+      thinkingLevel: "medium",
+      isStreaming: false,
+      messages: [],
+      sessionName: undefined as string | undefined,
+      setSessionName(name: string) {
+        fakeSession.sessionName = name;
+      },
+    };
+    (localManager as any).createAgentSessionWithSanitizedNpmEnv = async () => ({
+      session: fakeSession,
+    });
+
+    try {
+      await localManager.createSession("persisted-name");
+
+      const response = await localManager.executeCommand({
+        type: "set_session_name",
+        sessionId: "persisted-name",
+        name: "  Renamed Session  ",
+      } as any);
+      assert.strictEqual(response.success, true);
+
+      const metadata = await (localManager as any).sessionStore.load("persisted-name");
+      assert.strictEqual(metadata?.sessionName, "Renamed Session");
+      assert.strictEqual(fakeSession.sessionName, "Renamed Session");
+    } finally {
+      localManager.disposeAllSessions();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-manager: list_stored_sessions heals metadata after out-of-band session rename", async () => {
+    const localManager = new PiSessionManager();
+    const sessionId = `heal-session-name-${Date.now()}`;
+
+    try {
+      const created = await localManager.executeCommand({
+        type: "create_session",
+        sessionId,
+      } as any);
+      assert.strictEqual(created.success, true);
+
+      const session = localManager.getSession(sessionId);
+      assert(session, "Expected live session");
+      session.setSessionName("  extension-set name  ");
+
+      const listed = await localManager.executeCommand({ type: "list_stored_sessions" } as any);
+      assert.strictEqual(listed.success, true);
+
+      const stored = (listed as any).data.sessions.find(
+        (entry: any) => entry.sessionId === sessionId
+      );
+      assert.ok(stored, "Expected stored session entry");
+      assert.strictEqual(stored.sessionName, "extension-set name");
+
+      const metadata = await (localManager as any).sessionStore.load(sessionId);
+      assert.strictEqual(metadata?.sessionName, "extension-set name");
+    } finally {
+      try {
+        await localManager.executeCommand({ type: "delete_session", sessionId } as any);
+      } catch {
+        localManager.disposeAllSessions();
+      }
+    }
+  });
+
   await test("session-manager: set_session_name waits for durable mutation instead of timing out", async () => {
     const localManager = new PiSessionManager(undefined, {
       shortCommandTimeoutMs: 50,
@@ -3729,6 +4021,61 @@ async function testSessionManager() {
     }
   });
 
+  await test("session-manager: replay path does not append durable lifecycle state", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-replay-side-effect-"));
+    const originalConsoleError = console.error;
+
+    try {
+      console.error = () => {};
+
+      const localManager = new PiSessionManager(undefined, {
+        durableJournal: {
+          enabled: true,
+          dataDir: journalDir,
+          appendFailurePolicy: "fail_closed",
+          redaction: {
+            beforePersist: (entry) => {
+              if (entry.phase === "command_finished" && entry.replayed === true) {
+                throw new Error("replay-path-must-not-persist");
+              }
+              return entry;
+            },
+          },
+        },
+      });
+      await localManager.initialize();
+
+      const first = await localManager.executeCommand({
+        id: "replay-side-effect-1",
+        type: "list_sessions",
+      } as any);
+      const second = await localManager.executeCommand({
+        id: "replay-side-effect-1",
+        type: "list_sessions",
+      } as any);
+
+      assert.strictEqual(first.success, true);
+      assert.strictEqual(second.success, true, "Replay should not hit durable append path");
+      assert.strictEqual(second.replayed, true);
+
+      const journalPath = join(journalDir, "command-journal.jsonl");
+      const lines = readFileSync(journalPath, "utf-8")
+        .trim()
+        .split(/\r?\n/)
+        .filter((line) => line.includes('"commandId":"replay-side-effect-1"'));
+      assert.strictEqual(
+        lines.length,
+        3,
+        "Expected accepted/started/finished for initial execution only"
+      );
+
+      localManager.disposeAllSessions();
+    } finally {
+      console.error = originalConsoleError;
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
   await test("session-manager: fail_closed append failures remain deterministic across restart", async () => {
     const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-fail-closed-restart-"));
     const originalConsoleError = console.error;
@@ -4277,6 +4624,52 @@ async function testSessionManager() {
       } else {
         process.env.HOME = previousHome;
       }
+      rmSync(baseDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-store: listAllSessions prefers latest session_info over stale metadata", async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), "pi-session-store-session-info-"));
+    const dataDir = join(baseDir, "data");
+    const sessionsDir = join(baseDir, "global-sessions");
+    const sessionPath = join(sessionsDir, `named-${Date.now()}.jsonl`);
+    const store = new SessionStore({ dataDir, sessionsDir, serverVersion: "test" });
+
+    try {
+      mkdirSync(sessionsDir, { recursive: true });
+      writeFileSync(
+        sessionPath,
+        [
+          JSON.stringify({ type: "session", version: 3, cwd: "/from-file" }),
+          JSON.stringify({
+            type: "session_info",
+            id: "a",
+            parentId: null,
+            timestamp: new Date().toISOString(),
+            name: "  Fresh Name  ",
+          }),
+        ].join("\n") + "\n"
+      );
+
+      await store.save({
+        sessionId: "stored-session-id",
+        sessionFile: sessionPath,
+        cwd: "/from-metadata",
+        createdAt: new Date().toISOString(),
+        sessionName: "stale-name",
+        modelId: "fake-model",
+      });
+
+      const sessions = await store.listAllSessions();
+      const found = sessions.find((session) => session.sessionId === "stored-session-id");
+      assert.ok(found, "Expected stored session mapping to remain visible");
+      assert.strictEqual(found?.sessionName, "Fresh Name");
+      assert.strictEqual(found?.cwd, "/from-file");
+
+      const healed = await store.load("stored-session-id");
+      assert.strictEqual(healed?.sessionName, "Fresh Name");
+      assert.strictEqual(healed?.cwd, "/from-file");
+    } finally {
       rmSync(baseDir, { recursive: true, force: true });
     }
   });

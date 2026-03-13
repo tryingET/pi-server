@@ -14,7 +14,7 @@ Session multiplexer for [pi-coding-agent](https://www.npmjs.com/package/@marioze
 - **Command execution**: Deterministic lane serialization per session
 - **Idempotent replay**: Atomic outcome storage with free replay lookups
 - **Optimistic concurrency**: Session versioning for conflict detection
-- **Extension UI**: Full round-trip support for `select`, `confirm`, `input`, `editor`, `interview`
+- **Extension UI**: Remote dialog support for `select`, `confirm`, `input`, `editor` plus one-way UI updates (`notify`, `setStatus`, `setWorkingMessage`, `setWidget`, `setTitle`)
 - **Resource governance**: Rate limiting, session limits, message size limits
 - **Pluggable authentication**: `AuthProvider` abstraction (allow-all, token, IP allowlist, composite)
 - **Graceful shutdown**: Drain in-flight commands, notify clients

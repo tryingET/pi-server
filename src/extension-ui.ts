@@ -15,10 +15,21 @@
 // TYPES
 // =============================================================================
 
+export type InteractiveExtensionUIMethod = "select" | "confirm" | "input" | "editor" | "interview";
+
+export type ExtensionUIBroadcastMethod =
+  | InteractiveExtensionUIMethod
+  | "notify"
+  | "setStatus"
+  | "setWorkingMessage"
+  | "setWidget"
+  | "setTitle";
+
 export interface PendingUIRequest {
   sessionId: string;
   requestId: string;
-  method: ExtensionUIMethod;
+  method: InteractiveExtensionUIMethod;
+  requestData: Record<string, unknown>;
   resolve: (response: ExtensionUIResponseValue) => void;
   reject: (error: Error) => void;
   timeout: NodeJS.Timeout;
@@ -26,17 +37,6 @@ export interface PendingUIRequest {
   /** Guard flag to prevent double-resolve on race between timeout and cancel */
   settled: boolean;
 }
-
-export type ExtensionUIMethod =
-  | "select"
-  | "confirm"
-  | "input"
-  | "editor"
-  | "interview"
-  | "notify"
-  | "setStatus"
-  | "setWidget"
-  | "setTitle";
 
 export type ExtensionUIResponseValue =
   | { method: "select"; value: string }
@@ -46,29 +46,88 @@ export type ExtensionUIResponseValue =
   | { method: "interview"; responses: Record<string, any> }
   | { method: "cancelled" };
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 // Type guards for response types
 export function isSelectResponse(
   r: ExtensionUIResponseValue
 ): r is { method: "select"; value: string } {
-  return r.method === "select";
+  return r.method === "select" && typeof (r as { value?: unknown }).value === "string";
 }
 
 export function isConfirmResponse(
   r: ExtensionUIResponseValue
 ): r is { method: "confirm"; confirmed: boolean } {
-  return r.method === "confirm";
+  return r.method === "confirm" && typeof (r as { confirmed?: unknown }).confirmed === "boolean";
 }
 
 export function isInputResponse(
   r: ExtensionUIResponseValue
 ): r is { method: "input"; value: string } {
-  return r.method === "input";
+  return r.method === "input" && typeof (r as { value?: unknown }).value === "string";
 }
 
 export function isEditorResponse(
   r: ExtensionUIResponseValue
 ): r is { method: "editor"; value: string } {
-  return r.method === "editor";
+  return r.method === "editor" && typeof (r as { value?: unknown }).value === "string";
+}
+
+/**
+ * Validate a UI response payload at the transport boundary.
+ * Optionally constrains the payload to the currently pending UI method.
+ */
+export function getExtensionUIResponseValidationError(
+  response: unknown,
+  expectedMethod?: InteractiveExtensionUIMethod,
+  context?: { requestData?: Record<string, unknown> }
+): string | null {
+  if (!isRecord(response)) {
+    return "response must be an object";
+  }
+
+  const method = response.method;
+  if (typeof method !== "string") {
+    return "response.method must be a string";
+  }
+
+  if (method === "cancelled") {
+    return null;
+  }
+
+  if (expectedMethod && method !== expectedMethod) {
+    return `response.method mismatch: expected '${expectedMethod}' or 'cancelled', got '${method}'`;
+  }
+
+  switch (method) {
+    case "select": {
+      if (typeof response.value !== "string") {
+        return "response.value must be a string";
+      }
+
+      const options = context?.requestData?.options;
+      if (Array.isArray(options) && options.every((option) => typeof option === "string")) {
+        return options.includes(response.value)
+          ? null
+          : "response.value must be one of the offered options";
+      }
+
+      return null;
+    }
+    case "input":
+    case "editor":
+      return typeof response.value === "string" ? null : "response.value must be a string";
+    case "confirm":
+      return typeof response.confirmed === "boolean"
+        ? null
+        : "response.confirmed must be a boolean";
+    case "interview":
+      return isRecord(response.responses) ? null : "response.responses must be an object";
+    default:
+      return `response.method must be one of: select, confirm, input, editor, interview, cancelled`;
+  }
 }
 
 // Command from client to respond to UI request
@@ -135,8 +194,8 @@ export class ExtensionUIManager {
    */
   createPendingRequest(
     sessionId: string,
-    method: ExtensionUIMethod,
-    requestData: Record<string, any>
+    method: InteractiveExtensionUIMethod,
+    requestData: Record<string, unknown>
   ): { requestId: string; promise: Promise<ExtensionUIResponseValue> } | null {
     // Check pending request limit to prevent memory exhaustion
     if (this.pendingRequests.size >= this.maxPendingRequests) {
@@ -173,6 +232,7 @@ export class ExtensionUIManager {
         sessionId,
         requestId,
         method,
+        requestData,
         resolve,
         reject,
         timeout,
@@ -190,8 +250,8 @@ export class ExtensionUIManager {
   broadcastUIRequest(
     sessionId: string,
     requestId: string,
-    method: ExtensionUIMethod,
-    data: Record<string, any>
+    method: ExtensionUIBroadcastMethod,
+    data: Record<string, unknown>
   ): void {
     this.broadcast(sessionId, {
       type: "extension_ui_request",
@@ -228,6 +288,16 @@ export class ExtensionUIManager {
       return {
         success: false,
         error: `Session ID mismatch for request ${command.requestId}`,
+      };
+    }
+
+    const responseError = getExtensionUIResponseValidationError(command.response, pending.method, {
+      requestData: pending.requestData,
+    });
+    if (responseError) {
+      return {
+        success: false,
+        error: responseError,
       };
     }
 

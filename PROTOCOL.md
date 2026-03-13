@@ -648,12 +648,21 @@ Server broadcasts to all subscribed clients:
 }
 ```
 
-Methods:
+Interactive methods requiring a client response:
 - `select` — Choose from options
 - `confirm` — Yes/no confirmation
 - `input` — Free-form text input
 - `editor` — Multi-line text editor
-- `interview` — Structured form with questions
+
+One-way UI update methods emitted by the built-in server UI context:
+- `notify` — Show a notification toast/message
+- `setStatus` — Update a keyed status-bar/footer slot
+- `setWorkingMessage` — Update the transient working/loading message
+- `setWidget` — Render a string-array widget above/below the editor
+- `setTitle` — Update the terminal/window title
+
+`interview` is reserved for forward compatibility but is not emitted by the stock
+`createServerUIContext()` implementation in this server release.
 
 ### 18.2 Response command (`extension_ui_response`)
 
@@ -671,13 +680,15 @@ Client sends response to resolve the pending request:
 }
 ```
 
-Response payloads by method:
+Response payloads by interactive method:
 - `select`: `{ method: "select", value: string }`
 - `confirm`: `{ method: "confirm", confirmed: boolean }`
 - `input`: `{ method: "input", value: string }`
 - `editor`: `{ method: "editor", value: string }`
-- `interview`: `{ method: "interview", responses: Record<string, any> }`
+- `interview`: `{ method: "interview", responses: Record<string, any> }` (reserved / forward-compatible)
 - `cancelled`: `{ method: "cancelled" }` — User dismissed the request
+
+For `select`, clients MUST return one of the offered option strings.
 
 ### 18.3 Timeout behavior
 
