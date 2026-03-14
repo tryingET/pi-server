@@ -61,6 +61,7 @@ Built-in diagnostics use `stderr` so `stdout` stays reserved for newline-delimit
 src/
 ├── server.ts               # transports, connection lifecycle, routing glue
 ├── session-manager.ts      # orchestration: coordinates stores, engines, sessions
+├── session-control-plane.ts # session epochs + authoritative stored-session index
 ├── command-router.ts       # session command handlers, routing
 ├── command-classification.ts  # pure command classification (timeout, mutation)
 ├── command-replay-store.ts    # idempotency, duplicate detection, outcome history
@@ -77,6 +78,7 @@ src/
 
 - For each admitted command, there is exactly one terminal response.
 - For each session ID, there is at most one live `AgentSession`.
+- Session lifecycle identity is `(sessionId, epoch)` for ABA-safe durable mutations.
 - Subscriber session sets are always a subset of active sessions.
 - Session version is monotonic and mutation-sensitive.
 - Fingerprint excludes retry identity (`id`, `idempotencyKey`) for semantic equivalence.
@@ -84,6 +86,7 @@ src/
 ### Key abstractions
 
 - **`SessionResolver`** — Interface for session access (enables test doubles, future clustering)
+- **`SessionControlPlane`** — Monotonic session epochs + authoritative stored-session inventory
 - **`CommandReplayStore`** — Idempotency and duplicate detection
 - **`SessionVersionStore`** — Optimistic concurrency via version counters
 - **`CommandExecutionEngine`** — Deterministic lane serialization and timeout management

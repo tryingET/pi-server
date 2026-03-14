@@ -781,6 +781,8 @@ Sessions can be persisted to disk and loaded later.
 ```
 
 > **Note:** `sessionPath` is an alias for `sessionFile` for consistency with the `load_session` command's `sessionPath` parameter. Either field can be passed to `load_session`.
+>
+> `list_stored_sessions` is served from the server's session control plane rather than a full synchronous filesystem scan. Discovered-on-disk sessions may therefore appear after a background refresh on cold start, but listing remains fast and does not wait on slow discovery work.
 
 ### 20.2 Loading a session
 
