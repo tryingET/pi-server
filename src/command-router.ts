@@ -257,7 +257,10 @@ function measureSerializedBytes(value: unknown): number | null {
   }
 }
 
-function selectTrailingItemsWithinByteBudget<T>(items: T[], maxBytes: number): {
+function selectTrailingItemsWithinByteBudget<T>(
+  items: T[],
+  maxBytes: number
+): {
   items: T[];
   truncated: boolean;
   returned: number;
@@ -300,7 +303,10 @@ function selectTrailingItemsWithinByteBudget<T>(items: T[], maxBytes: number): {
   };
 }
 
-function selectLeadingItemsWithinByteBudget<T>(items: T[], maxBytes: number): {
+function selectLeadingItemsWithinByteBudget<T>(
+  items: T[],
+  maxBytes: number
+): {
   items: T[];
   truncated: boolean;
   returned: number;
@@ -380,7 +386,10 @@ const handleGetState: CommandHandler = (_session, command, getSessionInfo) => {
 };
 
 const handleGetMessages: CommandHandler = (session, command) => {
-  const bounded = selectTrailingItemsWithinByteBudget(session.messages, MAX_MESSAGES_RESPONSE_BYTES);
+  const bounded = selectTrailingItemsWithinByteBudget(
+    session.messages,
+    MAX_MESSAGES_RESPONSE_BYTES
+  );
 
   return {
     id: command.id,
@@ -586,10 +595,7 @@ const handleGetTree: CommandHandler = (session, command) => {
   try {
     const tree = session.sessionManager.getTree() as unknown as SessionTreeNodeLike[];
     const serialized = serializeSessionTreeNodes(tree);
-    const bounded = selectLeadingItemsWithinByteBudget(
-      serialized.nodes,
-      MAX_TREE_RESPONSE_BYTES
-    );
+    const bounded = selectLeadingItemsWithinByteBudget(serialized.nodes, MAX_TREE_RESPONSE_BYTES);
     const currentLeafId = session.sessionManager.getLeafId();
     return {
       id: command.id,

@@ -228,7 +228,10 @@ export class CommandExecutionEngine {
         // Previous command failure should not break lane sequencing.
         // Log for observability but continue.
         if (error !== undefined) {
-          console.error(`[CommandExecutionEngine] Previous lane task failed for ${laneKey}:`, error);
+          console.error(
+            `[CommandExecutionEngine] Previous lane task failed for ${laneKey}:`,
+            error
+          );
         }
       });
 

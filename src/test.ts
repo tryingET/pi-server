@@ -944,7 +944,11 @@ async function testCommandRouter() {
     assert.strictEqual(data.truncated, true, "Large trees should be truncated");
     assert.ok(data.returned < tree.length, "Should return bounded prefix");
     assert.strictEqual(data.nodes.length, data.returned);
-    assert.strictEqual(data.nodes[0]?.entryId, "node-0", "Returned nodes should preserve root-first order");
+    assert.strictEqual(
+      data.nodes[0]?.entryId,
+      "node-0",
+      "Returned nodes should preserve root-first order"
+    );
     const lastNodeId = data.nodes[data.nodes.length - 1]?.entryId as string;
     assert.ok(lastNodeId.startsWith("node-"), "Should return valid node IDs");
     assert.strictEqual(data.maxBytes, 512 * 1024);
@@ -2127,10 +2131,18 @@ async function testSessionManager() {
       type: "abort",
       sessionId: "lane-session",
     } as any);
-    assert.strictEqual(abortResponse.success, true, `Abort should bypass data lane: ${abortResponse.error}`);
+    assert.strictEqual(
+      abortResponse.success,
+      true,
+      `Abort should bypass data lane: ${abortResponse.error}`
+    );
 
     const promptResponse = await promptPromise;
-    assert.strictEqual(promptResponse.success, true, `Prompt should finish after abort released it: ${promptResponse.error}`);
+    assert.strictEqual(
+      promptResponse.success,
+      true,
+      `Prompt should finish after abort released it: ${promptResponse.error}`
+    );
   });
 
   await test("session-manager: extension_ui_response bypasses queued data-lane work", async () => {
@@ -2191,14 +2203,26 @@ async function testSessionManager() {
       response: { method: "confirm", confirmed: true },
     } as any);
 
-    assert.strictEqual(uiResponse.success, true, `UI response should bypass data lane: ${uiResponse.error}`);
-    assert.strictEqual(managerAny.extensionUI.getPendingCount(), 0, "Pending UI request should be resolved");
+    assert.strictEqual(
+      uiResponse.success,
+      true,
+      `UI response should bypass data lane: ${uiResponse.error}`
+    );
+    assert.strictEqual(
+      managerAny.extensionUI.getPendingCount(),
+      0,
+      "Pending UI request should be resolved"
+    );
     const pendingResult = await pending.promise;
     assert.deepStrictEqual(pendingResult, { method: "confirm", confirmed: true });
 
     releasePrompt?.();
     const promptResponse = await promptPromise;
-    assert.strictEqual(promptResponse.success, true, `Prompt should complete after UI reply: ${promptResponse.error}`);
+    assert.strictEqual(
+      promptResponse.success,
+      true,
+      `Prompt should complete after UI reply: ${promptResponse.error}`
+    );
   });
 
   await test("session-manager: health_check bypasses untargeted server mutations", async () => {
@@ -2236,7 +2260,11 @@ async function testSessionManager() {
     );
 
     const createResponse = await createPromise;
-    assert.strictEqual(createResponse.success, true, `create_session should still succeed: ${createResponse.error}`);
+    assert.strictEqual(
+      createResponse.success,
+      true,
+      `create_session should still succeed: ${createResponse.error}`
+    );
   });
 
   await test("session-manager: late completions after runtime disposal do not repopulate replay state", async () => {
@@ -2272,7 +2300,11 @@ async function testSessionManager() {
     localManager.disposeAllSessions();
 
     const response = await responsePromise;
-    assert.strictEqual(response.success, false, "Late completion should be converted into shutdown cancellation");
+    assert.strictEqual(
+      response.success,
+      false,
+      "Late completion should be converted into shutdown cancellation"
+    );
     assert.strictEqual(
       managerAny.replayStore.getCommandOutcome("late-store"),
       undefined,

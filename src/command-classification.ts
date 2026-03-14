@@ -45,9 +45,7 @@ export interface RateLimitTarget {
 // CONTRACT REGISTRY
 // =============================================================================
 
-function defineContract(
-  contract: Omit<CommandContract, "historySensitivity">
-): CommandContract {
+function defineContract(contract: Omit<CommandContract, "historySensitivity">): CommandContract {
   return {
     ...contract,
     historySensitivity: "hash",
