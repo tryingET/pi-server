@@ -22,6 +22,8 @@ import { getDefaultAllowedSessionDirectories } from "./validation.js";
 export interface StoredSessionMetadata {
   /** Unique session identifier */
   sessionId: string;
+  /** Monotonic lifecycle epoch for ABA-safe async mutations */
+  epoch: number;
   /** Path to the session file managed by pi-coding-agent */
   sessionFile: string;
   /** Working directory when session was created */
@@ -37,7 +39,9 @@ export interface StoredSessionMetadata {
 }
 
 /** Input for saving session metadata (serverVersion added automatically). */
-export type SaveSessionInput = Omit<StoredSessionMetadata, "serverVersion">;
+export type SaveSessionInput = Omit<StoredSessionMetadata, "serverVersion" | "epoch"> & {
+  epoch?: number;
+};
 
 /** Session with resolved metadata (combines stored + file system info). */
 export interface StoredSessionInfo extends SessionInfo {
@@ -144,6 +148,15 @@ export class SessionStore {
   private readonly cacheTtl = 5000;
   /** Count of metadata resets due to oversized/corrupt files */
   private metadataResetCount = 0;
+  /** Cached session-file metadata keyed by file path + stat snapshot. */
+  private sessionFileMetadataCache = new Map<
+    string,
+    {
+      mtimeMs: number;
+      size: number;
+      metadata: { cwd: string; sessionName?: string };
+    }
+  >();
   /** Serializes metadata mutations to prevent lost updates under concurrency. */
   private mutationChain: Promise<void> = Promise.resolve();
 
@@ -244,11 +257,11 @@ export class SessionStore {
           // [key, value] format
           const [key, value] = entry;
           if (typeof key === "string" && this.isValidMetadata(value)) {
-            map.set(key, value);
+            map.set(key, this.normalizeStoredMetadata(value));
           }
         } else if (this.isValidMetadata(entry)) {
           // { sessionId, ... } format
-          map.set(entry.sessionId, entry);
+          map.set(entry.sessionId, this.normalizeStoredMetadata(entry));
         }
       }
 
@@ -293,8 +306,20 @@ export class SessionStore {
       typeof v.sessionId === "string" &&
       typeof v.sessionFile === "string" &&
       typeof v.cwd === "string" &&
-      typeof v.createdAt === "string"
+      typeof v.createdAt === "string" &&
+      (v.epoch === undefined ||
+        (typeof v.epoch === "number" && Number.isInteger(v.epoch) && v.epoch > 0))
     );
+  }
+
+  private normalizeStoredMetadata(value: StoredSessionMetadata): StoredSessionMetadata {
+    return {
+      ...value,
+      epoch:
+        typeof value.epoch === "number" && Number.isInteger(value.epoch) && value.epoch > 0
+          ? value.epoch
+          : 1,
+    };
   }
 
   /**
@@ -492,6 +517,10 @@ export class SessionStore {
       const nextMetadata = this.cloneMetadataMap(currentMetadata);
       nextMetadata.set(meta.sessionId, {
         ...meta,
+        epoch:
+          typeof meta.epoch === "number" && Number.isInteger(meta.epoch) && meta.epoch > 0
+            ? meta.epoch
+            : 1,
         serverVersion: this.serverVersion,
       });
       await this.saveMetadata(nextMetadata);
@@ -502,7 +531,7 @@ export class SessionStore {
    * Load session metadata by ID.
    *
    * Session-file-derived fields are treated as canonical when the file is still
-   * accessible, and the stored metadata row is opportunistically healed.
+   * accessible, but read paths remain fail-open and never persist healing writes.
    */
   async load(sessionId: string): Promise<StoredSessionMetadata | null> {
     const metadata = await this.loadMetadata();
@@ -511,17 +540,20 @@ export class SessionStore {
       return null;
     }
 
-    const refreshed = await this.refreshStoredMetadataEntryFromSessionFile(existing);
-    return refreshed ?? existing;
+    return this.resolveStoredMetadataEntryFromSessionFile(existing);
   }
 
   /**
    * Delete session metadata.
    */
-  async delete(sessionId: string): Promise<boolean> {
+  async delete(sessionId: string, options: { expectedEpoch?: number } = {}): Promise<boolean> {
     return this.runMetadataMutation(async () => {
       const currentMetadata = await this.loadMetadata();
-      if (!currentMetadata.has(sessionId)) {
+      const existing = currentMetadata.get(sessionId);
+      if (!existing) {
+        return false;
+      }
+      if (typeof options.expectedEpoch === "number" && existing.epoch !== options.expectedEpoch) {
         return false;
       }
       const nextMetadata = this.cloneMetadataMap(currentMetadata);
@@ -555,13 +587,17 @@ export class SessionStore {
         fileExists = false;
       }
 
+      const resolvedMeta = fileExists
+        ? await this.resolveStoredMetadataEntryFromSessionFile(meta)
+        : meta;
+
       results.push({
-        sessionId: meta.sessionId,
-        sessionName: meta.sessionName,
-        sessionFile: meta.sessionFile,
-        sessionPath: meta.sessionFile, // Alias for consistency with load_session
-        cwd: meta.cwd,
-        createdAt: meta.createdAt,
+        sessionId: resolvedMeta.sessionId,
+        sessionName: resolvedMeta.sessionName,
+        sessionFile: resolvedMeta.sessionFile,
+        sessionPath: resolvedMeta.sessionFile, // Alias for consistency with load_session
+        cwd: resolvedMeta.cwd,
+        createdAt: resolvedMeta.createdAt,
         // These may be stale/undefined - will be refreshed when session is loaded
         thinkingLevel: "medium",
         isStreaming: false,
@@ -684,6 +720,18 @@ export class SessionStore {
    *   falling back to header metadata for older file formats.
    */
   async readSessionFileMetadata(filePath: string): Promise<{ cwd: string; sessionName?: string }> {
+    let stat: Awaited<ReturnType<typeof fs.stat>>;
+    try {
+      stat = await fs.stat(filePath);
+    } catch {
+      return { cwd: "/unknown" };
+    }
+
+    const cached = this.sessionFileMetadataCache.get(filePath);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      return cached.metadata;
+    }
+
     const readline = await import("readline");
     const fileStream = fsRegular.createReadStream(filePath, { encoding: "utf-8" });
     let rl: ReturnType<typeof readline.createInterface> | undefined;
@@ -702,13 +750,26 @@ export class SessionStore {
 
       const header = this.parseSessionHeaderMetadata(firstLine);
       const latestSessionName = await this.readLatestSessionNameFromSessionFile(filePath);
-
-      return {
+      const metadata = {
         cwd: header.cwd,
         sessionName: latestSessionName ?? header.sessionName,
       };
+
+      this.sessionFileMetadataCache.set(filePath, {
+        mtimeMs: stat.mtimeMs,
+        size: stat.size,
+        metadata,
+      });
+
+      return metadata;
     } catch {
-      return { cwd: "/unknown" };
+      const metadata = { cwd: "/unknown" };
+      this.sessionFileMetadataCache.set(filePath, {
+        mtimeMs: stat.mtimeMs,
+        size: stat.size,
+        metadata,
+      });
+      return metadata;
     } finally {
       // Always close readline interface first, then destroy the stream
       // This prevents resource leaks if the for-await loop throws
@@ -846,100 +907,21 @@ export class SessionStore {
     return `${year}-${month}-${day}T${hour}:${min}:${sec}.${ms}Z`;
   }
 
-  private async refreshStoredMetadataEntryFromSessionFile(
+  private async resolveStoredMetadataEntryFromSessionFile(
     meta: StoredSessionMetadata
-  ): Promise<StoredSessionMetadata | null> {
+  ): Promise<StoredSessionMetadata> {
     try {
       await fs.access(meta.sessionFile);
     } catch {
-      return null;
-    }
-
-    const fileMetadata = await this.readSessionFileMetadata(meta.sessionFile);
-    const nextCwd = fileMetadata.cwd !== "/unknown" ? fileMetadata.cwd : meta.cwd;
-    const nextSessionName = fileMetadata.sessionName ?? meta.sessionName;
-
-    if (nextCwd === meta.cwd && nextSessionName === meta.sessionName) {
       return meta;
     }
 
-    const refreshed: StoredSessionMetadata = {
+    const fileMetadata = await this.readSessionFileMetadata(meta.sessionFile);
+    return {
       ...meta,
-      cwd: nextCwd,
-      sessionName: nextSessionName,
+      cwd: fileMetadata.cwd !== "/unknown" ? fileMetadata.cwd : meta.cwd,
+      sessionName: fileMetadata.sessionName ?? meta.sessionName,
     };
-
-    await this.runMetadataMutation(async () => {
-      const currentMetadata = await this.loadMetadata();
-      const current = currentMetadata.get(meta.sessionId);
-      if (!current) {
-        return;
-      }
-      if (current.sessionFile !== meta.sessionFile) {
-        return;
-      }
-
-      const latestFileMetadata = await this.readSessionFileMetadata(current.sessionFile);
-      const currentNextCwd =
-        latestFileMetadata.cwd !== "/unknown" ? latestFileMetadata.cwd : current.cwd;
-      const currentNextSessionName = latestFileMetadata.sessionName ?? current.sessionName;
-
-      if (currentNextCwd === current.cwd && currentNextSessionName === current.sessionName) {
-        return;
-      }
-
-      const nextMetadata = this.cloneMetadataMap(currentMetadata);
-      nextMetadata.set(meta.sessionId, {
-        ...current,
-        cwd: currentNextCwd,
-        sessionName: currentNextSessionName,
-      });
-      await this.saveMetadata(nextMetadata);
-    });
-
-    return refreshed;
-  }
-
-  private async syncStoredMetadataFromDiscoveredSessions(
-    discovered: StoredSessionInfo[]
-  ): Promise<void> {
-    const discoveredByPath = new Map(discovered.map((session) => [session.sessionFile, session]));
-    if (discoveredByPath.size === 0) {
-      return;
-    }
-
-    await this.runMetadataMutation(async () => {
-      const currentMetadata = await this.loadMetadata();
-      let nextMetadata: Map<string, StoredSessionMetadata> | null = null;
-
-      for (const [sessionId, current] of currentMetadata) {
-        const discoveredSession = discoveredByPath.get(current.sessionFile);
-        if (!discoveredSession) {
-          continue;
-        }
-
-        const nextCwd = discoveredSession.cwd !== "/unknown" ? discoveredSession.cwd : current.cwd;
-        const nextSessionName = discoveredSession.sessionName ?? current.sessionName;
-
-        if (nextCwd === current.cwd && nextSessionName === current.sessionName) {
-          continue;
-        }
-
-        if (!nextMetadata) {
-          nextMetadata = this.cloneMetadataMap(currentMetadata);
-        }
-
-        nextMetadata.set(sessionId, {
-          ...current,
-          cwd: nextCwd,
-          sessionName: nextSessionName,
-        });
-      }
-
-      if (nextMetadata) {
-        await this.saveMetadata(nextMetadata);
-      }
-    });
   }
 
   /**
@@ -948,11 +930,10 @@ export class SessionStore {
    * Session-file metadata is canonical for fields that can drift at runtime
    * (notably `sessionName`). Stored metadata remains authoritative for the
    * stable server-side mapping from runtime sessionId -> session file.
+   * Read paths fail open and do not persist healing writes.
    */
   async listAllSessions(): Promise<StoredSessionInfo[]> {
     const [stored, discovered] = await Promise.all([this.listWithInfo(), this.discoverSessions()]);
-
-    await this.syncStoredMetadataFromDiscoveredSessions(discovered);
 
     // Create map keyed by sessionFile for deduplication
     const byPath = new Map<string, StoredSessionInfo>();
@@ -1050,11 +1031,18 @@ export class SessionStore {
   /**
    * Update or clear the persisted session name in metadata.
    */
-  async updateName(sessionId: string, name?: string): Promise<boolean> {
+  async updateName(
+    sessionId: string,
+    name?: string,
+    options: { expectedEpoch?: number } = {}
+  ): Promise<boolean> {
     return this.runMetadataMutation(async () => {
       const currentMetadata = await this.loadMetadata();
       const existing = currentMetadata.get(sessionId);
       if (!existing) {
+        return false;
+      }
+      if (typeof options.expectedEpoch === "number" && existing.epoch !== options.expectedEpoch) {
         return false;
       }
       const nextMetadata = this.cloneMetadataMap(currentMetadata);
@@ -1123,6 +1111,22 @@ export class SessionStore {
    */
   getMetadataResetCount(): number {
     return this.metadataResetCount;
+  }
+
+  /**
+   * Get a stable snapshot key for metadata visibility invalidation.
+   * SessionControlPlane uses this to detect cross-process/session-store drift.
+   */
+  async getMetadataSnapshotKey(): Promise<string> {
+    try {
+      const stat = await fs.stat(this.metadataPath);
+      return `present:${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}`;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return "missing";
+      }
+      throw error;
+    }
   }
 
   // ==========================================================================

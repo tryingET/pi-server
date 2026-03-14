@@ -59,10 +59,15 @@ import {
   SYNTHETIC_ID_PREFIX,
 } from "./command-replay-store.js";
 import { SessionVersionStore } from "./session-version-store.js";
-import { CommandExecutionEngine } from "./command-execution-engine.js";
+import { CommandExecutionEngine, withTimeout } from "./command-execution-engine.js";
 import { getRateLimitTarget } from "./command-classification.js";
 import { SessionLockManager } from "./session-lock-manager.js";
-import { SessionStore, type StoredSessionInfo } from "./session-store.js";
+import {
+  SessionStore,
+  type StoredSessionInfo,
+  type StoredSessionMetadata,
+} from "./session-store.js";
+import { SessionControlPlane } from "./session-control-plane.js";
 import { CircuitBreakerManager, type CircuitBreakerConfig } from "./circuit-breaker.js";
 import { BashCircuitBreaker, type BashCircuitBreakerConfig } from "./bash-circuit-breaker.js";
 import {
@@ -87,6 +92,10 @@ const DEPENDENCY_WAIT_TIMEOUT_MS = 30 * 1000;
 
 /** Max time to wait for durable journal startup initialization. */
 const DEFAULT_DURABLE_INIT_TIMEOUT_MS = 5 * 1000;
+/** Max time to wait for best-effort session-name metadata sync writes. */
+const DEFAULT_SESSION_NAME_SYNC_TIMEOUT_MS = 2 * 1000;
+/** How long discovered-session snapshots stay fresh before background refresh. */
+const SESSION_DISCOVERY_REFRESH_TTL_MS = 60 * 1000;
 
 /** Max entries returned per list field in get_startup_recovery. */
 const STARTUP_RECOVERY_MAX_ITEMS = 100;
@@ -120,6 +129,12 @@ interface Deferred<T> {
   resolve: (value: T) => void;
 }
 
+interface SessionNameMetadataSyncState {
+  epoch: number;
+  latestName: string | undefined;
+  running: Promise<void> | null;
+}
+
 function createDeferred<T>(): Deferred<T> {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((res) => {
@@ -144,6 +159,7 @@ let sanitizedAgentSessionCreationTail: Promise<void> = Promise.resolve();
  */
 const SANITIZED_NPM_ENV_KEYS = ["npm_config_prefix", "NPM_CONFIG_PREFIX"] as const;
 const SESSION_NAME_PERSISTENCE_BRIDGE = Symbol("sessionNamePersistenceBridge");
+const SESSION_NAME_PERSISTENCE_SUPPRESS = Symbol("sessionNamePersistenceSuppress");
 
 export interface SessionManagerRuntimeOptions {
   defaultCommandTimeoutMs?: number;
@@ -160,6 +176,8 @@ export interface SessionManagerRuntimeOptions {
   durableJournal?: DurableCommandJournalOptions;
   /** Timeout for durable journal startup initialization attempts. */
   durableInitTimeoutMs?: number;
+  /** Timeout for best-effort session-name metadata sync writes. */
+  sessionNameSyncTimeoutMs?: number;
 }
 
 export class PiSessionManager implements SessionResolver {
@@ -179,6 +197,18 @@ export class PiSessionManager implements SessionResolver {
   private lockManager: SessionLockManager;
   /** Session metadata store for persistence across restarts (ADR-0007). */
   private sessionStore: SessionStore;
+  /** Authoritative session lifecycle control plane (epochs + stored inventory). */
+  private sessionControlPlane = new SessionControlPlane();
+  /** One-time bootstrap promise for control-plane inventory from durable metadata. */
+  private sessionControlPlaneBootstrapPromise: Promise<void> | null = null;
+  /** Last durable metadata snapshot key seen by the control plane bootstrap. */
+  private sessionControlPlaneMetadataSnapshotKey: string | null = null;
+  /** Background discovered-session refresh promise. */
+  private sessionDiscoveryRefreshPromise: Promise<void> | null = null;
+  /** Pending low-priority discovery refresh timer. */
+  private sessionDiscoveryRefreshTimer: NodeJS.Timeout | null = null;
+  /** Last successful discovered-session refresh timestamp. */
+  private lastSessionDiscoveryRefreshAt = 0;
   /** Circuit breaker for LLM providers (ADR-0010). */
   private circuitBreakers: CircuitBreakerManager;
   /** Circuit breaker for bash commands. */
@@ -189,8 +219,8 @@ export class PiSessionManager implements SessionResolver {
   private startupRecoverySnapshot: StartupRecoverySnapshot | null = null;
   /** One-time initialization promise for durable journal startup rehydration. */
   private durableInitPromise: Promise<void> | null = null;
-  /** Best-effort durable metadata syncs triggered by out-of-band session renames. */
-  private pendingSessionNameMetadataSyncs = new Map<string, Promise<void>>();
+  /** Best-effort durable metadata sync state triggered by out-of-band session renames. */
+  private pendingSessionNameMetadataSyncs = new Map<string, SessionNameMetadataSyncState>();
   /** Durable init lifecycle state (for get_startup_recovery observability). */
   private durableInitState: DurableInitState = "pending";
   /** Last durable initialization error, if any. */
@@ -209,6 +239,7 @@ export class PiSessionManager implements SessionResolver {
   private readonly shortCommandTimeoutMs: number;
   private readonly dependencyWaitTimeoutMs: number;
   private readonly durableInitTimeoutMs: number;
+  private readonly sessionNameSyncTimeoutMs: number;
 
   // Extension UI request tracking
   private extensionUI = new ExtensionUIManager((sessionId: string, event: AgentSessionEvent) =>
@@ -240,6 +271,10 @@ export class PiSessionManager implements SessionResolver {
       typeof options.durableInitTimeoutMs === "number" && options.durableInitTimeoutMs > 0
         ? options.durableInitTimeoutMs
         : DEFAULT_DURABLE_INIT_TIMEOUT_MS;
+    this.sessionNameSyncTimeoutMs =
+      typeof options.sessionNameSyncTimeoutMs === "number" && options.sessionNameSyncTimeoutMs > 0
+        ? options.sessionNameSyncTimeoutMs
+        : DEFAULT_SESSION_NAME_SYNC_TIMEOUT_MS;
 
     this.replayStore = new CommandReplayStore({
       idempotencyTtlMs: options.idempotencyTtlMs,
@@ -294,7 +329,10 @@ export class PiSessionManager implements SessionResolver {
    * Rehydrates durable command outcomes when the journal feature flag is enabled.
    */
   async initialize(): Promise<void> {
-    await this.ensureDurableJournalInitialized();
+    await Promise.all([
+      this.ensureDurableJournalInitialized(),
+      this.ensureSessionControlPlaneBootstrapped({ scheduleDiscovery: true }),
+    ]);
   }
 
   private async waitForDurableInitWithTimeout(promise: Promise<void>): Promise<void> {
@@ -538,6 +576,124 @@ export class PiSessionManager implements SessionResolver {
     }
   }
 
+  private buildStoredSessionInfoFromMetadata(meta: StoredSessionMetadata): StoredSessionInfo {
+    return {
+      sessionId: meta.sessionId,
+      sessionName: meta.sessionName,
+      sessionFile: meta.sessionFile,
+      sessionPath: meta.sessionFile,
+      cwd: meta.cwd,
+      createdAt: meta.createdAt,
+      thinkingLevel: "medium",
+      isStreaming: false,
+      messageCount: 0,
+      fileExists: true,
+    };
+  }
+
+  private buildStoredSessionInfoFromSessionInfo(
+    sessionInfo: SessionInfo,
+    cwd: string,
+    fileExists: boolean
+  ): StoredSessionInfo {
+    const sessionFile = sessionInfo.sessionFile ?? "";
+    return {
+      sessionId: sessionInfo.sessionId,
+      sessionName: sessionInfo.sessionName,
+      sessionFile,
+      sessionPath: sessionFile,
+      cwd,
+      createdAt: sessionInfo.createdAt,
+      thinkingLevel: sessionInfo.thinkingLevel,
+      isStreaming: sessionInfo.isStreaming,
+      messageCount: sessionInfo.messageCount,
+      fileExists,
+      model: sessionInfo.model,
+    };
+  }
+
+  private async ensureSessionControlPlaneBootstrapped(options?: {
+    scheduleDiscovery?: boolean;
+  }): Promise<void> {
+    const snapshotKey = await this.sessionStore.getMetadataSnapshotKey();
+
+    if (
+      !this.sessionControlPlaneBootstrapPromise ||
+      this.sessionControlPlaneMetadataSnapshotKey !== snapshotKey
+    ) {
+      this.sessionControlPlaneMetadataSnapshotKey = snapshotKey;
+      this.sessionControlPlaneBootstrapPromise = (async () => {
+        const [metadata, storedInfo] = await Promise.all([
+          this.sessionStore.list(),
+          this.sessionStore.listWithInfo(),
+        ]);
+        const infoBySessionId = new Map(storedInfo.map((info) => [info.sessionId, info]));
+
+        this.sessionControlPlane.seedStoredSessions(
+          metadata.map((meta) => ({
+            sessionId: meta.sessionId,
+            epoch: meta.epoch,
+            info:
+              infoBySessionId.get(meta.sessionId) ?? this.buildStoredSessionInfoFromMetadata(meta),
+          }))
+        );
+      })();
+    }
+
+    await this.sessionControlPlaneBootstrapPromise;
+    if (options?.scheduleDiscovery) {
+      this.scheduleDiscoveredSessionRefresh();
+    }
+  }
+
+  private scheduleDiscoveredSessionRefresh(force = false): void {
+    if (this.runtimeDisposed || this.isShuttingDown) {
+      return;
+    }
+    if (this.sessionDiscoveryRefreshPromise || this.sessionDiscoveryRefreshTimer) {
+      return;
+    }
+    if (
+      !force &&
+      Date.now() - this.lastSessionDiscoveryRefreshAt < SESSION_DISCOVERY_REFRESH_TTL_MS
+    ) {
+      return;
+    }
+
+    const refresh = new Promise<void>((resolve) => {
+      this.sessionDiscoveryRefreshTimer = setTimeout(() => {
+        this.sessionDiscoveryRefreshTimer = null;
+        if (this.runtimeDisposed || this.isShuttingDown) {
+          resolve();
+          return;
+        }
+        void (async () => {
+          try {
+            const discovered = await this.sessionStore.discoverSessions();
+            this.sessionControlPlane.replaceDiscoveredSessions(discovered);
+            this.lastSessionDiscoveryRefreshAt = Date.now();
+          } catch (error) {
+            console.error("[SessionManager] Discovered session refresh failed:", error);
+          } finally {
+            resolve();
+          }
+        })();
+      }, 0);
+
+      if (this.sessionDiscoveryRefreshTimer?.unref) {
+        this.sessionDiscoveryRefreshTimer.unref();
+      }
+    });
+
+    this.sessionDiscoveryRefreshPromise = refresh;
+    refresh.finally(() => {
+      if (this.sessionDiscoveryRefreshPromise === refresh) {
+        this.sessionDiscoveryRefreshPromise = null;
+      }
+    });
+    this.registerInFlightCommand(refresh);
+  }
+
   // ==========================================================================
   // SHUTDOWN MANAGEMENT
   // ==========================================================================
@@ -610,8 +766,9 @@ export class PiSessionManager implements SessionResolver {
 
     const drainPromise = Promise.allSettled(snapshot);
 
+    let timeoutHandle: NodeJS.Timeout | null = null;
     const timeoutPromise = new Promise<{ drained: number; timedOut: boolean }>((resolve) => {
-      setTimeout(() => {
+      timeoutHandle = setTimeout(() => {
         this.abortAllSessions();
         // Count how many from the original snapshot are still pending
         const stillPending = snapshot.filter((p) => this.inFlightCommands.has(p)).length;
@@ -626,7 +783,13 @@ export class PiSessionManager implements SessionResolver {
       });
     });
 
-    return Promise.race([drainResult, timeoutPromise]);
+    try {
+      return await Promise.race([drainResult, timeoutPromise]);
+    } finally {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+    }
   }
 
   /**
@@ -767,52 +930,91 @@ export class PiSessionManager implements SessionResolver {
     this.broadcast(JSON.stringify(event));
   }
 
+  private async flushSessionNameMetadataSync(
+    sessionId: string,
+    state: SessionNameMetadataSyncState
+  ): Promise<void> {
+    while (this.pendingSessionNameMetadataSyncs.get(sessionId) === state) {
+      if (!this.sessionControlPlane.isCurrentEpoch(sessionId, state.epoch)) {
+        this.pendingSessionNameMetadataSyncs.delete(sessionId);
+        state.running = null;
+        return;
+      }
+
+      const targetName = state.latestName;
+
+      try {
+        const updated = await withTimeout(
+          Promise.resolve(
+            this.sessionStore.updateName(sessionId, targetName, {
+              expectedEpoch: state.epoch,
+            })
+          ),
+          this.sessionNameSyncTimeoutMs,
+          `session_name_metadata_sync:${sessionId}`
+        );
+
+        if (!updated) {
+          this.pendingSessionNameMetadataSyncs.delete(sessionId);
+          state.running = null;
+          return;
+        }
+
+        this.sessionControlPlane.updateStoredSession(sessionId, state.epoch, {
+          sessionName: targetName,
+        });
+      } catch (error) {
+        console.error(
+          `[set_session_name] Best-effort session name metadata sync failed for ${sessionId}:`,
+          error
+        );
+      }
+
+      if (state.latestName === targetName) {
+        state.running = null;
+        this.pendingSessionNameMetadataSyncs.delete(sessionId);
+        return;
+      }
+    }
+  }
+
   private enqueueSessionNameMetadataSync(
     sessionId: string,
+    epoch: number,
     sessionName: string | undefined
   ): Promise<void> {
-    const previous = this.pendingSessionNameMetadataSyncs.get(sessionId) ?? Promise.resolve();
-
-    const next = previous
-      .catch(() => {
-        // Preserve queue progress even if an earlier sync failed.
-      })
-      .then(async () => {
-        await this.sessionStore.updateName(sessionId, sessionName);
-      });
-
-    this.pendingSessionNameMetadataSyncs.set(sessionId, next);
-    void next.finally(() => {
-      if (this.pendingSessionNameMetadataSyncs.get(sessionId) === next) {
-        this.pendingSessionNameMetadataSyncs.delete(sessionId);
-      }
-    });
-
-    return next;
-  }
-
-  private async awaitPendingSessionNameMetadataSyncs(sessionId?: string): Promise<void> {
-    if (sessionId) {
-      const pending = this.pendingSessionNameMetadataSyncs.get(sessionId);
-      if (pending) {
-        await pending.catch(() => {
-          // Best-effort bridge errors are logged at the source.
-        });
-      }
-      return;
+    if (!this.sessionControlPlane.isCurrentEpoch(sessionId, epoch)) {
+      return Promise.resolve();
     }
 
-    const pending = [...this.pendingSessionNameMetadataSyncs.values()];
-    if (pending.length === 0) {
-      return;
+    let state = this.pendingSessionNameMetadataSyncs.get(sessionId);
+    if (!state || state.epoch !== epoch) {
+      state = {
+        epoch,
+        latestName: sessionName,
+        running: null,
+      };
+      this.pendingSessionNameMetadataSyncs.set(sessionId, state);
+    } else {
+      state.latestName = sessionName;
     }
 
-    await Promise.allSettled(pending);
+    if (!state.running) {
+      state.running = this.flushSessionNameMetadataSync(sessionId, state);
+      this.registerInFlightCommand(state.running);
+    }
+
+    return state.running;
   }
 
-  private installSessionNamePersistenceBridge(sessionId: string, session: AgentSession): void {
+  private installSessionNamePersistenceBridge(
+    sessionId: string,
+    epoch: number,
+    session: AgentSession
+  ): void {
     const sessionWithBridge = session as AgentSession & {
       [SESSION_NAME_PERSISTENCE_BRIDGE]?: boolean;
+      [SESSION_NAME_PERSISTENCE_SUPPRESS]?: boolean;
       setSessionName?: (name: string) => void;
       sessionName?: string;
     };
@@ -829,8 +1031,14 @@ export class PiSessionManager implements SessionResolver {
     const originalSetSessionName = sessionWithBridge.setSessionName.bind(session);
     sessionWithBridge.setSessionName = (name: string): void => {
       originalSetSessionName(name);
+
+      if (sessionWithBridge[SESSION_NAME_PERSISTENCE_SUPPRESS]) {
+        sessionWithBridge[SESSION_NAME_PERSISTENCE_SUPPRESS] = false;
+        return;
+      }
+
       const effectiveName = sessionWithBridge.sessionName;
-      void this.enqueueSessionNameMetadataSync(sessionId, effectiveName).catch((error) => {
+      void this.enqueueSessionNameMetadataSync(sessionId, epoch, effectiveName).catch((error) => {
         console.error(
           `[set_session_name] Failed to persist out-of-band session name for ${sessionId}:`,
           error
@@ -877,6 +1085,8 @@ export class PiSessionManager implements SessionResolver {
   }
 
   async createSession(sessionId: string, cwd?: string): Promise<SessionInfo> {
+    await this.ensureSessionControlPlaneBootstrapped();
+
     // Validate session ID (validation doesn't need lock)
     const sessionIdError = this.governor.validateSessionId(sessionId);
     if (sessionIdError) {
@@ -898,6 +1108,7 @@ export class PiSessionManager implements SessionResolver {
     let unsubscribe: (() => void) | undefined;
     let releaseSessionSlotOnFailure = false;
     let metadataSaved = false;
+    let epoch: number | undefined;
 
     try {
       // Check for duplicate UNDER LOCK - prevents race condition
@@ -912,6 +1123,8 @@ export class PiSessionManager implements SessionResolver {
         );
       }
       releaseSessionSlotOnFailure = true;
+
+      epoch = this.sessionControlPlane.beginSessionEpoch(sessionId);
 
       ({ session } = await this.createAgentSessionWithSanitizedNpmEnv({
         cwd: cwd ?? process.cwd(),
@@ -939,6 +1152,7 @@ export class PiSessionManager implements SessionResolver {
       // Persist metadata BEFORE publishing the live session into runtime maps.
       await this.sessionStore.save({
         sessionId,
+        epoch,
         sessionFile: session.sessionFile,
         cwd: cwd ?? process.cwd(),
         createdAt: sessionInfo.createdAt,
@@ -946,7 +1160,12 @@ export class PiSessionManager implements SessionResolver {
         sessionName: session.sessionName,
       });
       metadataSaved = true;
-      this.installSessionNamePersistenceBridge(sessionId, session);
+      this.sessionControlPlane.upsertStoredSession(
+        sessionId,
+        epoch,
+        this.buildStoredSessionInfoFromSessionInfo(sessionInfo, cwd ?? process.cwd(), true)
+      );
+      this.installSessionNamePersistenceBridge(sessionId, epoch, session);
 
       // Subscribe and then commit the session into runtime state.
       unsubscribe = session.subscribe((event: AgentSessionEvent) => {
@@ -976,7 +1195,12 @@ export class PiSessionManager implements SessionResolver {
 
       if (metadataSaved) {
         try {
-          await this.sessionStore.delete(sessionId);
+          await this.sessionStore.delete(sessionId, {
+            expectedEpoch: epoch,
+          });
+          if (typeof epoch === "number") {
+            this.sessionControlPlane.removeStoredSession(sessionId, epoch);
+          }
         } catch (rollbackError) {
           console.error(
             `[createSession] Failed to roll back persisted metadata for ${sessionId}:`,
@@ -1005,6 +1229,8 @@ export class PiSessionManager implements SessionResolver {
   }
 
   async deleteSession(sessionId: string): Promise<void> {
+    await this.ensureSessionControlPlaneBootstrapped();
+
     // Acquire lock for this session ID to prevent concurrent create/delete races
     const lock = await this.lockManager.acquire(sessionId, "deleteSession");
 
@@ -1014,12 +1240,26 @@ export class PiSessionManager implements SessionResolver {
         throw new Error(`Session ${sessionId} not found`);
       }
 
-      await this.awaitPendingSessionNameMetadataSyncs(sessionId);
+      const epoch = this.sessionControlPlane.getCurrentEpoch(sessionId);
+      if (typeof epoch !== "number") {
+        throw new Error(`Session ${sessionId} lifecycle epoch not found`);
+      }
 
       // Remove persisted metadata first so a reported delete failure does not
       // leave runtime and durable state disagreeing about whether the session
       // still exists.
-      await this.sessionStore.delete(sessionId);
+      const deleted = await this.sessionStore.delete(sessionId, {
+        expectedEpoch: epoch,
+      });
+      if (!deleted) {
+        throw new Error(`Session ${sessionId} metadata not found for epoch ${epoch}`);
+      }
+
+      const pendingRenameSync = this.pendingSessionNameMetadataSyncs.get(sessionId);
+      if (pendingRenameSync?.epoch === epoch) {
+        this.pendingSessionNameMetadataSyncs.delete(sessionId);
+      }
+      this.sessionControlPlane.retireSessionEpoch(sessionId, epoch);
 
       // Cancel any pending extension UI requests for this session
       this.extensionUI.cancelSessionRequests(sessionId);
@@ -1121,8 +1361,28 @@ export class PiSessionManager implements SessionResolver {
    * These are sessions that existed in previous server runs OR discovered on disk.
    */
   async listStoredSessions(): Promise<StoredSessionInfo[]> {
-    await this.awaitPendingSessionNameMetadataSyncs();
-    return this.sessionStore.listAllSessions();
+    await this.ensureSessionControlPlaneBootstrapped({ scheduleDiscovery: true });
+
+    return this.sessionControlPlane.listStoredSessions().map((stored) => {
+      const session = this.sessions.get(stored.sessionId);
+      const createdAt = this.sessionCreatedAt.get(stored.sessionId);
+      if (!session || !createdAt) {
+        return stored;
+      }
+
+      return {
+        ...stored,
+        sessionName: session.sessionName,
+        sessionFile: session.sessionFile ?? stored.sessionFile,
+        sessionPath: session.sessionFile ?? stored.sessionPath,
+        model: session.model,
+        thinkingLevel: session.thinkingLevel,
+        isStreaming: session.isStreaming,
+        messageCount: session.messages.length,
+        createdAt: createdAt.toISOString(),
+        fileExists: typeof session.sessionFile === "string" ? true : stored.fileExists,
+      };
+    });
   }
 
   /**
@@ -1132,6 +1392,8 @@ export class PiSessionManager implements SessionResolver {
    * Security: sessionPath must be under an allowed directory to prevent path traversal.
    */
   async loadSession(sessionId: string, sessionPath: string): Promise<SessionInfo> {
+    await this.ensureSessionControlPlaneBootstrapped();
+
     // Validate session ID
     const sessionIdError = this.governor.validateSessionId(sessionId);
     if (sessionIdError) {
@@ -1157,6 +1419,7 @@ export class PiSessionManager implements SessionResolver {
     let unsubscribe: (() => void) | undefined;
     let releaseSessionSlotOnFailure = false;
     let metadataSaved = false;
+    let epoch: number | undefined;
 
     try {
       // Check for duplicate UNDER LOCK
@@ -1171,6 +1434,8 @@ export class PiSessionManager implements SessionResolver {
         );
       }
       releaseSessionSlotOnFailure = true;
+
+      epoch = this.sessionControlPlane.beginSessionEpoch(sessionId);
 
       // Create session using the source session's cwd when available.
       ({ session } = await this.createAgentSessionWithSanitizedNpmEnv({
@@ -1205,6 +1470,7 @@ export class PiSessionManager implements SessionResolver {
       // Persist metadata BEFORE publishing runtime visibility.
       await this.sessionStore.save({
         sessionId,
+        epoch,
         sessionFile: session.sessionFile,
         cwd: persistedFileMetadata.cwd,
         createdAt: sessionInfo.createdAt,
@@ -1212,7 +1478,12 @@ export class PiSessionManager implements SessionResolver {
         sessionName: session.sessionName,
       });
       metadataSaved = true;
-      this.installSessionNamePersistenceBridge(sessionId, session);
+      this.sessionControlPlane.upsertStoredSession(
+        sessionId,
+        epoch,
+        this.buildStoredSessionInfoFromSessionInfo(sessionInfo, persistedFileMetadata.cwd, true)
+      );
+      this.installSessionNamePersistenceBridge(sessionId, epoch, session);
 
       unsubscribe = session.subscribe((event: AgentSessionEvent) => {
         this.broadcastEvent(sessionId, event);
@@ -1241,7 +1512,12 @@ export class PiSessionManager implements SessionResolver {
 
       if (metadataSaved) {
         try {
-          await this.sessionStore.delete(sessionId);
+          await this.sessionStore.delete(sessionId, {
+            expectedEpoch: epoch,
+          });
+          if (typeof epoch === "number") {
+            this.sessionControlPlane.removeStoredSession(sessionId, epoch);
+          }
         } catch (rollbackError) {
           console.error(
             `[loadSession] Failed to roll back persisted metadata for ${sessionId}:`,
@@ -1281,7 +1557,7 @@ export class PiSessionManager implements SessionResolver {
    * @param intervalMs Cleanup interval in milliseconds (default: 1 hour)
    */
   startSessionCleanup(intervalMs?: number): void {
-    this.sessionStore.startPeriodicCleanup(intervalMs);
+    this.sessionStore.stopPeriodicCleanup();
     this.startSessionExpirationCheck(intervalMs);
   }
 
@@ -1300,7 +1576,10 @@ export class PiSessionManager implements SessionResolver {
     // Clean up expired sessions first
     await this.cleanupExpiredSessions();
     // Then clean up orphaned metadata
-    return this.sessionStore.cleanup();
+    const result = await this.sessionStore.cleanup();
+    this.sessionControlPlaneBootstrapPromise = null;
+    await this.ensureSessionControlPlaneBootstrapped();
+    return result;
   }
 
   /**
@@ -1312,8 +1591,8 @@ export class PiSessionManager implements SessionResolver {
     }
 
     this.sessionExpirationTimer = setInterval(() => {
-      this.cleanupExpiredSessions().catch((error) => {
-        console.error("[SessionManager] Session expiration cleanup failed:", error);
+      this.cleanupSessions().catch((error) => {
+        console.error("[SessionManager] Session cleanup failed:", error);
       });
     }, intervalMs);
 
@@ -2221,8 +2500,21 @@ export class PiSessionManager implements SessionResolver {
   ): Promise<RpcResponse> {
     const previousName = session.sessionName;
     const normalizedName = normalizeSessionNameInput(command.name);
+    const epoch = this.sessionControlPlane.getCurrentEpoch(sessionId);
 
-    const updated = await this.sessionStore.updateName(sessionId, normalizedName);
+    if (typeof epoch !== "number") {
+      return {
+        id,
+        type: "response",
+        command: "set_session_name",
+        success: false,
+        error: `Session ${sessionId} lifecycle epoch not found for rename`,
+      };
+    }
+
+    const updated = await this.sessionStore.updateName(sessionId, normalizedName, {
+      expectedEpoch: epoch,
+    });
     if (!updated) {
       return {
         id,
@@ -2232,9 +2524,20 @@ export class PiSessionManager implements SessionResolver {
         error: `Session ${sessionId} metadata not found for rename`,
       };
     }
+    this.sessionControlPlane.updateStoredSession(sessionId, epoch, {
+      sessionName: normalizedName,
+    });
 
     try {
-      session.setSessionName(normalizedName);
+      const sessionWithBridge = session as AgentSession & {
+        [SESSION_NAME_PERSISTENCE_SUPPRESS]?: boolean;
+      };
+      sessionWithBridge[SESSION_NAME_PERSISTENCE_SUPPRESS] = true;
+      try {
+        session.setSessionName(normalizedName);
+      } finally {
+        sessionWithBridge[SESSION_NAME_PERSISTENCE_SUPPRESS] = false;
+      }
       return {
         id,
         type: "response",
@@ -2243,7 +2546,12 @@ export class PiSessionManager implements SessionResolver {
       };
     } catch (error) {
       try {
-        await this.sessionStore.updateName(sessionId, previousName);
+        await this.sessionStore.updateName(sessionId, previousName, {
+          expectedEpoch: epoch,
+        });
+        this.sessionControlPlane.updateStoredSession(sessionId, epoch, {
+          sessionName: previousName,
+        });
       } catch (rollbackError) {
         console.error(
           `[set_session_name] Failed to roll back persisted session name for ${sessionId}:`,

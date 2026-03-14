@@ -2952,9 +2952,26 @@ async function testSessionManager() {
     }
   });
 
-  await test("session-manager: list_stored_sessions heals metadata after out-of-band session rename", async () => {
+  await test("session-manager: list_stored_sessions does not block on pending out-of-band rename sync", async () => {
     const localManager = new PiSessionManager();
+    const managerAny = localManager as any;
     const sessionId = `heal-session-name-${Date.now()}`;
+    const originalUpdateName = managerAny.sessionStore.updateName.bind(managerAny.sessionStore);
+
+    let releaseUpdateName!: () => void;
+    const blockedUpdate = new Promise<void>((resolve) => {
+      releaseUpdateName = resolve;
+    });
+    let enteredUpdateName!: () => void;
+    const updateNameEntered = new Promise<void>((resolve) => {
+      enteredUpdateName = resolve;
+    });
+
+    managerAny.sessionStore.updateName = async (id: string, name?: string) => {
+      enteredUpdateName();
+      await blockedUpdate;
+      return originalUpdateName(id, name);
+    };
 
     try {
       const created = await localManager.executeCommand({
@@ -2966,9 +2983,15 @@ async function testSessionManager() {
       const session = localManager.getSession(sessionId);
       assert(session, "Expected live session");
       session.setSessionName("  extension-set name  ");
+      await updateNameEntered;
 
-      const listed = await localManager.executeCommand({ type: "list_stored_sessions" } as any);
-      assert.strictEqual(listed.success, true);
+      const listed = await Promise.race([
+        localManager.executeCommand({ type: "list_stored_sessions" } as any),
+        new Promise<string>((resolve) => setTimeout(() => resolve("still-pending"), 100)),
+      ]);
+
+      assert.notStrictEqual(listed, "still-pending", "Listing should not wait for rename sync");
+      assert.strictEqual((listed as any).success, true);
 
       const stored = (listed as any).data.sessions.find(
         (entry: any) => entry.sessionId === sessionId
@@ -2976,7 +2999,11 @@ async function testSessionManager() {
       assert.ok(stored, "Expected stored session entry");
       assert.strictEqual(stored.sessionName, "extension-set name");
 
-      const metadata = await (localManager as any).sessionStore.load(sessionId);
+      releaseUpdateName();
+      const syncState = managerAny.pendingSessionNameMetadataSyncs.get(sessionId);
+      await syncState?.running;
+
+      const metadata = await managerAny.sessionStore.load(sessionId);
       assert.strictEqual(metadata?.sessionName, "extension-set name");
     } finally {
       try {
@@ -2984,6 +3011,242 @@ async function testSessionManager() {
       } catch {
         localManager.disposeAllSessions();
       }
+    }
+  });
+
+  await test("session-manager: list_stored_sessions does not wait for discovery refresh", async () => {
+    const localManager = new PiSessionManager();
+    const managerAny = localManager as any;
+    const sessionId = `control-plane-discovery-${Date.now()}`;
+    const originalDiscoverSessions = managerAny.sessionStore.discoverSessions.bind(
+      managerAny.sessionStore
+    );
+
+    let releaseDiscovery!: () => void;
+    const blockedDiscovery = new Promise<void>((resolve) => {
+      releaseDiscovery = resolve;
+    });
+    let discoveryEntered!: () => void;
+    const discoveryStarted = new Promise<void>((resolve) => {
+      discoveryEntered = resolve;
+    });
+
+    managerAny.sessionStore.discoverSessions = async () => {
+      discoveryEntered();
+      await blockedDiscovery;
+      return originalDiscoverSessions();
+    };
+
+    try {
+      const created = await localManager.executeCommand({
+        type: "create_session",
+        sessionId,
+      } as any);
+      assert.strictEqual(created.success, true);
+
+      const listed = await Promise.race([
+        localManager.executeCommand({ type: "list_stored_sessions" } as any),
+        new Promise<string>((resolve) => setTimeout(() => resolve("still-pending"), 100)),
+      ]);
+
+      assert.notStrictEqual(
+        listed,
+        "still-pending",
+        "Listing should use the control-plane snapshot while discovery refresh runs"
+      );
+      assert.strictEqual((listed as any).success, true);
+      await discoveryStarted;
+    } finally {
+      releaseDiscovery();
+      await managerAny.sessionDiscoveryRefreshPromise;
+      try {
+        await localManager.executeCommand({ type: "delete_session", sessionId } as any);
+      } catch {
+        localManager.disposeAllSessions();
+      }
+    }
+  });
+
+  await test("session-manager: out-of-band rename sync collapses to the latest value", async () => {
+    const localManager = new PiSessionManager();
+    const managerAny = localManager as any;
+    const sessionId = `collapse-session-name-${Date.now()}`;
+    const originalUpdateName = managerAny.sessionStore.updateName.bind(managerAny.sessionStore);
+    const calls: Array<string | undefined> = [];
+
+    let releaseFirstWrite!: () => void;
+    const firstWriteBlocked = new Promise<void>((resolve) => {
+      releaseFirstWrite = resolve;
+    });
+    let firstWriteEntered!: () => void;
+    const firstWriteStarted = new Promise<void>((resolve) => {
+      firstWriteEntered = resolve;
+    });
+
+    managerAny.sessionStore.updateName = async (id: string, name?: string) => {
+      calls.push(name);
+      if (calls.length === 1) {
+        firstWriteEntered();
+        await firstWriteBlocked;
+      }
+      return originalUpdateName(id, name);
+    };
+
+    try {
+      const created = await localManager.executeCommand({
+        type: "create_session",
+        sessionId,
+      } as any);
+      assert.strictEqual(created.success, true);
+
+      const session = localManager.getSession(sessionId);
+      assert(session, "Expected live session");
+      session.setSessionName("first");
+      await firstWriteStarted;
+      session.setSessionName("second");
+      session.setSessionName("third");
+
+      releaseFirstWrite();
+      const syncState = managerAny.pendingSessionNameMetadataSyncs.get(sessionId);
+      await syncState?.running;
+
+      assert.deepStrictEqual(calls, ["first", "third"]);
+      const metadata = await managerAny.sessionStore.load(sessionId);
+      assert.strictEqual(metadata?.sessionName, "third");
+    } finally {
+      try {
+        await localManager.executeCommand({ type: "delete_session", sessionId } as any);
+      } catch {
+        localManager.disposeAllSessions();
+      }
+    }
+  });
+
+  await test("session-manager: stale out-of-band rename cannot cross session epoch", async () => {
+    const localManager = new PiSessionManager();
+    const managerAny = localManager as any;
+    const sessionId = `epoch-rename-${Date.now()}`;
+    const originalUpdateName = managerAny.sessionStore.updateName.bind(managerAny.sessionStore);
+
+    let releaseFirstWrite!: () => void;
+    const firstWriteBlocked = new Promise<void>((resolve) => {
+      releaseFirstWrite = resolve;
+    });
+    let firstWriteEntered!: () => void;
+    const firstWriteStarted = new Promise<void>((resolve) => {
+      firstWriteEntered = resolve;
+    });
+    let firstWriteSettled!: () => void;
+    const firstWriteDone = new Promise<void>((resolve) => {
+      firstWriteSettled = resolve;
+    });
+    let callCount = 0;
+
+    managerAny.sessionStore.updateName = async (
+      id: string,
+      name?: string,
+      options?: { expectedEpoch?: number }
+    ) => {
+      callCount++;
+      const shouldBlock = callCount === 1;
+      try {
+        if (shouldBlock) {
+          firstWriteEntered();
+          await firstWriteBlocked;
+        }
+        return originalUpdateName(id, name, options);
+      } finally {
+        if (shouldBlock) {
+          firstWriteSettled();
+        }
+      }
+    };
+
+    try {
+      const created = await localManager.executeCommand({
+        type: "create_session",
+        sessionId,
+      } as any);
+      assert.strictEqual(created.success, true);
+
+      const session = localManager.getSession(sessionId);
+      assert(session, "Expected live session");
+      session.setSessionName("stale-name");
+      await firstWriteStarted;
+
+      const deleted = await localManager.executeCommand({
+        type: "delete_session",
+        sessionId,
+      } as any);
+      assert.strictEqual(deleted.success, true);
+
+      const recreated = await localManager.executeCommand({
+        type: "create_session",
+        sessionId,
+      } as any);
+      assert.strictEqual(recreated.success, true);
+
+      releaseFirstWrite();
+      await firstWriteDone;
+
+      const metadata = await managerAny.sessionStore.load(sessionId);
+      assert.strictEqual(metadata?.sessionName, undefined);
+      assert.ok((metadata?.epoch ?? 0) >= 3, "Expected recreated session to advance epoch");
+    } finally {
+      try {
+        await localManager.executeCommand({ type: "delete_session", sessionId } as any);
+      } catch {
+        localManager.disposeAllSessions();
+      }
+    }
+  });
+
+  await test("session-manager: create_session advances stored epoch without explicit initialize", async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), "pi-session-manager-epoch-bootstrap-"));
+    const homeDir = join(baseDir, "home");
+    const sessionsDir = join(homeDir, ".pi", "agent", "sessions");
+    const legacySessionFile = join(sessionsDir, `legacy-${Date.now()}.jsonl`);
+    const previousHome = process.env.HOME;
+
+    try {
+      mkdirSync(sessionsDir, { recursive: true });
+      writeFileSync(
+        legacySessionFile,
+        JSON.stringify({ type: "session", version: 3, cwd: process.cwd() }) + "\n"
+      );
+      process.env.HOME = homeDir;
+
+      const localManager = new PiSessionManager();
+      const managerAny = localManager as any;
+      await managerAny.sessionStore.save({
+        sessionId: "epoch-existing",
+        epoch: 7,
+        sessionFile: legacySessionFile,
+        cwd: process.cwd(),
+        createdAt: new Date().toISOString(),
+        sessionName: "old",
+      });
+
+      const created = await localManager.executeCommand({
+        type: "create_session",
+        sessionId: "epoch-existing",
+      } as any);
+      assert.strictEqual(created.success, true);
+
+      const metadata = await managerAny.sessionStore.load("epoch-existing");
+      assert.strictEqual(metadata?.epoch, 8);
+
+      await localManager.executeCommand({
+        type: "delete_session",
+        sessionId: "epoch-existing",
+      } as any);
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = previousHome;
+      }
+      rmSync(baseDir, { recursive: true, force: true });
     }
   });
 
@@ -3016,8 +3279,23 @@ async function testSessionManager() {
       releaseUpdateName = resolve;
     });
 
+    const renameCreatedAt = new Date();
+    const renameEpoch = managerAny.sessionControlPlane.beginSessionEpoch("rename-safe");
+    managerAny.sessionControlPlane.upsertStoredSession("rename-safe", renameEpoch, {
+      sessionId: "rename-safe",
+      sessionName: fakeSession.sessionName,
+      sessionFile: fakeSession.sessionFile,
+      sessionPath: fakeSession.sessionFile,
+      cwd: process.cwd(),
+      createdAt: renameCreatedAt.toISOString(),
+      thinkingLevel: fakeSession.thinkingLevel,
+      isStreaming: fakeSession.isStreaming,
+      messageCount: fakeSession.messages.length,
+      fileExists: true,
+      model: fakeSession.model,
+    });
     managerAny.sessions.set("rename-safe", fakeSession);
-    managerAny.sessionCreatedAt.set("rename-safe", new Date());
+    managerAny.sessionCreatedAt.set("rename-safe", renameCreatedAt);
     managerAny.versionStore.initialize("rename-safe");
     managerAny.governor.tryReserveSessionSlot();
     managerAny.governor.recordHeartbeat("rename-safe");
@@ -3081,8 +3359,23 @@ async function testSessionManager() {
       releaseDelete = resolve;
     });
 
+    const deleteCreatedAt = new Date();
+    const deleteEpoch = managerAny.sessionControlPlane.beginSessionEpoch("delete-safe");
+    managerAny.sessionControlPlane.upsertStoredSession("delete-safe", deleteEpoch, {
+      sessionId: "delete-safe",
+      sessionName: fakeSession.sessionName,
+      sessionFile: fakeSession.sessionFile,
+      sessionPath: fakeSession.sessionFile,
+      cwd: process.cwd(),
+      createdAt: deleteCreatedAt.toISOString(),
+      thinkingLevel: fakeSession.thinkingLevel,
+      isStreaming: fakeSession.isStreaming,
+      messageCount: fakeSession.messages.length,
+      fileExists: true,
+      model: fakeSession.model,
+    });
     managerAny.sessions.set("delete-safe", fakeSession);
-    managerAny.sessionCreatedAt.set("delete-safe", new Date());
+    managerAny.sessionCreatedAt.set("delete-safe", deleteCreatedAt);
     managerAny.versionStore.initialize("delete-safe");
     managerAny.governor.tryReserveSessionSlot();
     managerAny.governor.recordHeartbeat("delete-safe");
@@ -3459,6 +3752,94 @@ async function testSessionManager() {
     const result = await manager.initiateShutdown(1000);
     assert.strictEqual(result.drained, 0, "Should drain 0 commands");
     assert.strictEqual(result.timedOut, false, "Should not timeout");
+  });
+
+  await test("session-manager: shutdown clears timeout timer when drain wins", async () => {
+    const manager = new PiSessionManager();
+    const originalSetTimeout = globalThis.setTimeout;
+    const originalClearTimeout = globalThis.clearTimeout;
+    const timeoutHandles: unknown[] = [];
+    const clearedHandles: unknown[] = [];
+
+    (globalThis as any).setTimeout = ((_: () => void, __?: number) => {
+      const handle = { token: timeoutHandles.length + 1 };
+      timeoutHandles.push(handle);
+      return handle;
+    }) as unknown as typeof setTimeout;
+    (globalThis as any).clearTimeout = ((handle: unknown) => {
+      clearedHandles.push(handle);
+    }) as unknown as typeof clearTimeout;
+
+    try {
+      const inFlight = new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+      (manager as any).registerInFlightCommand(inFlight);
+
+      const result = await manager.initiateShutdown(1000);
+      assert.strictEqual(result.timedOut, false);
+      assert.strictEqual(timeoutHandles.length, 1, "Expected one shutdown timeout to be armed");
+      assert.deepStrictEqual(clearedHandles, timeoutHandles, "Expected timeout to be cleared");
+    } finally {
+      (globalThis as any).setTimeout = originalSetTimeout;
+      (globalThis as any).clearTimeout = originalClearTimeout;
+    }
+  });
+
+  await test("session-manager: shutdown drains pending out-of-band rename syncs", async () => {
+    const localManager = new PiSessionManager(undefined, {
+      sessionNameSyncTimeoutMs: 1000,
+    });
+    const managerAny = localManager as any;
+    const sessionId = `shutdown-sync-${Date.now()}`;
+    const originalUpdateName = managerAny.sessionStore.updateName.bind(managerAny.sessionStore);
+
+    let releaseUpdateName!: () => void;
+    const blockedUpdate = new Promise<void>((resolve) => {
+      releaseUpdateName = resolve;
+    });
+    let enteredUpdateName!: () => void;
+    const updateNameEntered = new Promise<void>((resolve) => {
+      enteredUpdateName = resolve;
+    });
+
+    managerAny.sessionStore.updateName = async (id: string, name?: string) => {
+      enteredUpdateName();
+      await blockedUpdate;
+      return originalUpdateName(id, name);
+    };
+
+    try {
+      const created = await localManager.executeCommand({
+        type: "create_session",
+        sessionId,
+      } as any);
+      assert.strictEqual(created.success, true);
+
+      const session = localManager.getSession(sessionId);
+      assert(session, "Expected live session");
+      session.setSessionName("shutdown name");
+      await updateNameEntered;
+
+      let settled = false;
+      const shutdownPromise = localManager.initiateShutdown(2000).then((result) => {
+        settled = true;
+        return result;
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.strictEqual(settled, false, "Shutdown should wait for pending rename sync");
+
+      releaseUpdateName();
+      const result = await shutdownPromise;
+      assert.strictEqual(result.timedOut, false);
+      assert.strictEqual(result.drained, 1);
+
+      const metadata = await managerAny.sessionStore.load(sessionId);
+      assert.strictEqual(metadata?.sessionName, "shutdown name");
+    } finally {
+      localManager.disposeAllSessions();
+    }
   });
 
   await test("session-manager: sanitizes invalid shutdown timeout", async () => {
@@ -4552,6 +4933,108 @@ async function testSessionManager() {
     assert.ok(Array.isArray((response as any).data.sessions), "Should have sessions array");
   });
 
+  await test("session-manager: list_stored_sessions bootstraps fresh stored metadata without discovery", async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), "pi-session-manager-stored-bootstrap-"));
+    const homeDir = join(baseDir, "home");
+    const sessionsDir = join(homeDir, ".pi", "agent", "sessions");
+    const sessionPath = join(sessionsDir, `stored-${Date.now()}.jsonl`);
+    const previousHome = process.env.HOME;
+
+    try {
+      mkdirSync(sessionsDir, { recursive: true });
+      writeFileSync(
+        sessionPath,
+        [
+          JSON.stringify({ type: "session", version: 3, cwd: "/from-file" }),
+          JSON.stringify({
+            type: "session_info",
+            id: "a",
+            parentId: null,
+            timestamp: new Date().toISOString(),
+            name: "Fresh Name",
+          }),
+        ].join("\n") + "\n"
+      );
+      process.env.HOME = homeDir;
+
+      const manager = new PiSessionManager();
+      const managerAny = manager as any;
+      await managerAny.sessionStore.save({
+        sessionId: "stored-session-id",
+        epoch: 4,
+        sessionFile: sessionPath,
+        cwd: "/from-metadata",
+        createdAt: new Date().toISOString(),
+        sessionName: "stale-name",
+        modelId: "fake-model",
+      });
+      managerAny.sessionStore.discoverSessions = async () => [];
+
+      const response = await manager.executeCommand({ type: "list_stored_sessions" } as any);
+      assert.strictEqual(response.success, true);
+      const found = (response as any).data.sessions.find(
+        (session: any) => session.sessionId === "stored-session-id"
+      );
+      assert.ok(found, "Expected stored session mapping to remain visible");
+      assert.strictEqual(found?.sessionName, "Fresh Name");
+      assert.strictEqual(found?.cwd, "/from-file");
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = previousHome;
+      }
+      rmSync(baseDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-manager: list_stored_sessions observes metadata changes after bootstrap", async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), "pi-session-manager-bootstrap-drift-"));
+    const homeDir = join(baseDir, "home");
+    const sessionsDir = join(homeDir, ".pi", "agent", "sessions");
+    const sessionPath = join(sessionsDir, `late-${Date.now()}.jsonl`);
+    const previousHome = process.env.HOME;
+
+    try {
+      mkdirSync(sessionsDir, { recursive: true });
+      writeFileSync(
+        sessionPath,
+        JSON.stringify({ type: "session", version: 3, cwd: "/late" }) + "\n"
+      );
+      process.env.HOME = homeDir;
+
+      const manager = new PiSessionManager();
+      const managerAny = manager as any;
+
+      const initial = await manager.executeCommand({ type: "list_stored_sessions" } as any);
+      assert.strictEqual(initial.success, true);
+      assert.strictEqual((initial as any).data.sessions.length, 0);
+
+      await managerAny.sessionStore.save({
+        sessionId: "late-session",
+        epoch: 2,
+        sessionFile: sessionPath,
+        cwd: "/late",
+        createdAt: new Date().toISOString(),
+      });
+
+      const refreshed = await manager.executeCommand({ type: "list_stored_sessions" } as any);
+      assert.strictEqual(refreshed.success, true);
+      assert.ok(
+        (refreshed as any).data.sessions.some(
+          (session: any) => session.sessionId === "late-session"
+        )
+      );
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = previousHome;
+      }
+      rmSync(baseDir, { recursive: true, force: true });
+    }
+  });
+
   await test("session-store: discovers project-local session files", async () => {
     const dataDir = mkdtempSync(join(tmpdir(), "pi-session-store-discover-"));
     const sessionsDir = mkdtempSync(join(tmpdir(), "pi-session-store-global-"));
@@ -4674,6 +5157,106 @@ async function testSessionManager() {
     }
   });
 
+  await test("session-store: read paths fail open when metadata persistence is unavailable", async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), "pi-session-store-read-fail-open-"));
+    const dataDir = join(baseDir, "data");
+    const sessionsDir = join(baseDir, "global-sessions");
+    const sessionPath = join(sessionsDir, `readonly-${Date.now()}.jsonl`);
+    const store = new SessionStore({ dataDir, sessionsDir, serverVersion: "test" });
+
+    try {
+      mkdirSync(sessionsDir, { recursive: true });
+      writeFileSync(
+        sessionPath,
+        [
+          JSON.stringify({ type: "session", version: 3, cwd: "/from-file" }),
+          JSON.stringify({
+            type: "session_info",
+            id: "a",
+            parentId: null,
+            timestamp: new Date().toISOString(),
+            name: "Fresh Name",
+          }),
+        ].join("\n") + "\n"
+      );
+
+      await store.save({
+        sessionId: "stored-session-id",
+        sessionFile: sessionPath,
+        cwd: "/from-metadata",
+        createdAt: new Date().toISOString(),
+        sessionName: "stale-name",
+        modelId: "fake-model",
+      });
+
+      (store as any).saveMetadata = async () => {
+        throw new Error("save boom");
+      };
+
+      const loaded = await store.load("stored-session-id");
+      assert.strictEqual(loaded?.sessionName, "Fresh Name");
+      assert.strictEqual(loaded?.cwd, "/from-file");
+
+      const sessions = await store.listAllSessions();
+      const found = sessions.find((session) => session.sessionId === "stored-session-id");
+      assert.ok(found, "Expected stored session mapping to remain visible");
+      assert.strictEqual(found?.sessionName, "Fresh Name");
+      assert.strictEqual(found?.cwd, "/from-file");
+    } finally {
+      rmSync(baseDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-store: caches session file metadata until stat snapshot changes", async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), "pi-session-store-file-cache-"));
+    const dataDir = join(baseDir, "data");
+    const sessionsDir = join(baseDir, "global-sessions");
+    const sessionPath = join(sessionsDir, `cached-${Date.now()}.jsonl`);
+    const store = new SessionStore({ dataDir, sessionsDir, serverVersion: "test" });
+    const storeAny = store as any;
+    const originalReadLatest = storeAny.readLatestSessionNameFromSessionFile.bind(storeAny);
+    let readLatestCalls = 0;
+    storeAny.readLatestSessionNameFromSessionFile = async (filePath: string) => {
+      readLatestCalls++;
+      return originalReadLatest(filePath);
+    };
+
+    try {
+      mkdirSync(sessionsDir, { recursive: true });
+      writeFileSync(
+        sessionPath,
+        JSON.stringify({ type: "session", version: 3, cwd: "/from-file" }) + "\n"
+      );
+
+      const first = await store.readSessionFileMetadata(sessionPath);
+      const second = await store.readSessionFileMetadata(sessionPath);
+      assert.strictEqual(first.cwd, "/from-file");
+      assert.deepStrictEqual(second, first);
+      assert.strictEqual(readLatestCalls, 1, "Expected unchanged file reads to hit cache");
+
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      writeFileSync(
+        sessionPath,
+        [
+          JSON.stringify({ type: "session", version: 3, cwd: "/from-file" }),
+          JSON.stringify({
+            type: "session_info",
+            id: "a",
+            parentId: null,
+            timestamp: new Date().toISOString(),
+            name: "Changed Name",
+          }),
+        ].join("\n") + "\n"
+      );
+
+      const third = await store.readSessionFileMetadata(sessionPath);
+      assert.strictEqual(third.sessionName, "Changed Name");
+      assert.strictEqual(readLatestCalls, 2, "Expected cache miss after file stat changes");
+    } finally {
+      rmSync(baseDir, { recursive: true, force: true });
+    }
+  });
+
   // Test: create_session persists metadata (ADR-0007)
   await test("session-manager: create_session persists metadata", async () => {
     const manager = new PiSessionManager();
@@ -4695,6 +5278,53 @@ async function testSessionManager() {
 
     // Cleanup
     await manager.executeCommand({ type: "delete_session", sessionId: "persist-test" });
+  });
+
+  await test("session-manager: cleanupSessions refreshes control-plane inventory", async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), "pi-session-manager-cleanup-refresh-"));
+    const homeDir = join(baseDir, "home");
+    const previousHome = process.env.HOME;
+
+    try {
+      process.env.HOME = homeDir;
+      const manager = new PiSessionManager();
+      const managerAny = manager as any;
+      const missingSessionPath = join(homeDir, ".pi", "agent", "sessions", "missing.jsonl");
+
+      await managerAny.sessionStore.save({
+        sessionId: "orphaned-session",
+        epoch: 2,
+        sessionFile: missingSessionPath,
+        cwd: "/orphaned",
+        createdAt: new Date().toISOString(),
+      });
+
+      const before = await manager.executeCommand({ type: "list_stored_sessions" } as any);
+      assert.strictEqual(before.success, true);
+      assert.ok(
+        (before as any).data.sessions.some(
+          (session: any) => session.sessionId === "orphaned-session"
+        )
+      );
+
+      const cleanup = await manager.cleanupSessions();
+      assert.strictEqual(cleanup.removed, 1);
+
+      const after = await manager.executeCommand({ type: "list_stored_sessions" } as any);
+      assert.strictEqual(after.success, true);
+      assert.ok(
+        !(after as any).data.sessions.some(
+          (session: any) => session.sessionId === "orphaned-session"
+        )
+      );
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = previousHome;
+      }
+      rmSync(baseDir, { recursive: true, force: true });
+    }
   });
 
   // Test: delete_session removes metadata (ADR-0007)
