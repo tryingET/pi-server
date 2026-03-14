@@ -23,6 +23,8 @@ export type TimeoutMode = "none" | "short" | "long";
 export type Abortability = "abortable" | "non_abortable";
 export type HistorySensitivity = "hash";
 export type CommandExecutionPlane = "control" | "data";
+export type CommandSchedulingClass = "control" | "data" | "interrupt";
+export type KnownCommandType = RpcCommand["type"];
 
 export interface CommandContract {
   timeoutMode: TimeoutMode;
@@ -31,106 +33,202 @@ export interface CommandContract {
   isMutation: boolean;
   executionPlane: CommandExecutionPlane;
   historySensitivity: HistorySensitivity;
+  schedulingClass: CommandSchedulingClass;
+}
+
+export interface RateLimitTarget {
+  plane: CommandExecutionPlane;
+  key: string;
 }
 
 // =============================================================================
-// CLASSIFICATION SETS
+// CONTRACT REGISTRY
 // =============================================================================
 
-/**
- * Commands that don't mutate session/server state.
- * These don't advance the session version on success.
- */
-const READ_ONLY_COMMANDS = new Set([
-  // Session reads
-  "get_state",
-  "get_messages",
-  "get_available_models",
-  "get_commands",
-  "get_skills",
-  "get_tools",
-  "list_session_files",
-  "get_session_stats",
-  "get_fork_messages",
-  "get_tree",
-  "get_last_assistant_text",
-  "get_context_usage",
-  // Server/control reads
-  "list_sessions",
-  "switch_session", // Switches client focus, doesn't change session
-  "get_metrics",
-  "health_check",
-  "get_startup_recovery",
-  "get_command_history",
-  "list_stored_sessions",
-]);
+function defineContract(
+  contract: Omit<CommandContract, "historySensitivity">
+): CommandContract {
+  return {
+    ...contract,
+    historySensitivity: "hash",
+  };
+}
 
-/**
- * Commands that appear to target a session but are handled specially.
- * These don't count as session mutations for version purposes.
- */
-const SPECIAL_SESSION_COMMANDS = new Set([
-  "extension_ui_response", // Handled by ExtensionUIManager, not AgentSession state
-]);
+const SESSION_READ_CONTRACT = defineContract({
+  timeoutMode: "short",
+  abortability: "non_abortable",
+  isReadOnly: true,
+  isMutation: false,
+  executionPlane: "data",
+  schedulingClass: "control",
+});
 
-/**
- * Commands that operate on server/session registry control surfaces rather than
- * consuming a session's data-plane work budget.
- */
-const CONTROL_PLANE_COMMANDS = new Set([
-  "list_sessions",
-  "create_session",
+const SERVER_READ_CONTRACT = defineContract({
+  timeoutMode: "short",
+  abortability: "non_abortable",
+  isReadOnly: true,
+  isMutation: false,
+  executionPlane: "control",
+  schedulingClass: "control",
+});
+
+const SESSION_MUTATION_LONG_CONTRACT = defineContract({
+  timeoutMode: "long",
+  abortability: "abortable",
+  isReadOnly: false,
+  isMutation: true,
+  executionPlane: "data",
+  schedulingClass: "data",
+});
+
+const SESSION_MUTATION_NO_TIMEOUT_CONTRACT = defineContract({
+  timeoutMode: "none",
+  abortability: "non_abortable",
+  isReadOnly: false,
+  isMutation: true,
+  executionPlane: "data",
+  schedulingClass: "data",
+});
+
+const SESSION_MUTATION_SHORT_INTERRUPT_CONTRACT = defineContract({
+  timeoutMode: "short",
+  abortability: "non_abortable",
+  isReadOnly: false,
+  isMutation: true,
+  executionPlane: "data",
+  schedulingClass: "interrupt",
+});
+
+const SPECIAL_INTERRUPT_CONTRACT = defineContract({
+  timeoutMode: "short",
+  abortability: "non_abortable",
+  isReadOnly: false,
+  isMutation: false,
+  executionPlane: "data",
+  schedulingClass: "interrupt",
+});
+
+const CONTROL_MUTATION_NO_TIMEOUT_CONTRACT = defineContract({
+  timeoutMode: "none",
+  abortability: "non_abortable",
+  isReadOnly: false,
+  isMutation: true,
+  executionPlane: "control",
+  schedulingClass: "data",
+});
+
+export const COMMAND_CONTRACTS = {
+  // Session commands
+  extension_ui_response: SPECIAL_INTERRUPT_CONTRACT,
+  get_available_models: SESSION_READ_CONTRACT,
+  get_commands: SESSION_READ_CONTRACT,
+  get_skills: SESSION_READ_CONTRACT,
+  get_tools: SESSION_READ_CONTRACT,
+  list_session_files: SESSION_READ_CONTRACT,
+  prompt: SESSION_MUTATION_LONG_CONTRACT,
+  steer: SESSION_MUTATION_LONG_CONTRACT,
+  follow_up: SESSION_MUTATION_LONG_CONTRACT,
+  abort: SESSION_MUTATION_SHORT_INTERRUPT_CONTRACT,
+  get_state: SESSION_READ_CONTRACT,
+  get_messages: SESSION_READ_CONTRACT,
+  set_model: defineContract({
+    timeoutMode: "none",
+    abortability: "non_abortable",
+    isReadOnly: false,
+    isMutation: true,
+    executionPlane: "data",
+    schedulingClass: "data",
+  }),
+  cycle_model: defineContract({
+    timeoutMode: "none",
+    abortability: "non_abortable",
+    isReadOnly: false,
+    isMutation: true,
+    executionPlane: "data",
+    schedulingClass: "data",
+  }),
+  set_thinking_level: defineContract({
+    timeoutMode: "none",
+    abortability: "non_abortable",
+    isReadOnly: false,
+    isMutation: true,
+    executionPlane: "data",
+    schedulingClass: "data",
+  }),
+  cycle_thinking_level: defineContract({
+    timeoutMode: "none",
+    abortability: "non_abortable",
+    isReadOnly: false,
+    isMutation: true,
+    executionPlane: "data",
+    schedulingClass: "data",
+  }),
+  compact: SESSION_MUTATION_LONG_CONTRACT,
+  abort_compaction: SESSION_MUTATION_SHORT_INTERRUPT_CONTRACT,
+  set_auto_compaction: defineContract({
+    timeoutMode: "none",
+    abortability: "non_abortable",
+    isReadOnly: false,
+    isMutation: true,
+    executionPlane: "data",
+    schedulingClass: "data",
+  }),
+  set_auto_retry: defineContract({
+    timeoutMode: "none",
+    abortability: "non_abortable",
+    isReadOnly: false,
+    isMutation: true,
+    executionPlane: "data",
+    schedulingClass: "data",
+  }),
+  abort_retry: SESSION_MUTATION_SHORT_INTERRUPT_CONTRACT,
+  bash: SESSION_MUTATION_LONG_CONTRACT,
+  abort_bash: SESSION_MUTATION_SHORT_INTERRUPT_CONTRACT,
+  get_session_stats: SESSION_READ_CONTRACT,
+  set_session_name: SESSION_MUTATION_NO_TIMEOUT_CONTRACT,
+  export_html: SESSION_MUTATION_NO_TIMEOUT_CONTRACT,
+  new_session: SESSION_MUTATION_LONG_CONTRACT,
+  switch_session_file: SESSION_MUTATION_LONG_CONTRACT,
+  fork: SESSION_MUTATION_LONG_CONTRACT,
+  get_fork_messages: SESSION_READ_CONTRACT,
+  get_tree: SESSION_READ_CONTRACT,
+  navigate_tree: defineContract({
+    timeoutMode: "none",
+    abortability: "non_abortable",
+    isReadOnly: false,
+    isMutation: true,
+    executionPlane: "data",
+    schedulingClass: "data",
+  }),
+  get_last_assistant_text: SESSION_READ_CONTRACT,
+  get_context_usage: SESSION_READ_CONTRACT,
+
+  // Server commands
+  list_sessions: SERVER_READ_CONTRACT,
+  create_session: CONTROL_MUTATION_NO_TIMEOUT_CONTRACT,
+  delete_session: CONTROL_MUTATION_NO_TIMEOUT_CONTRACT,
+  switch_session: SERVER_READ_CONTRACT,
+  get_metrics: SERVER_READ_CONTRACT,
+  health_check: SERVER_READ_CONTRACT,
+  get_startup_recovery: SERVER_READ_CONTRACT,
+  get_command_history: SERVER_READ_CONTRACT,
+  list_stored_sessions: SERVER_READ_CONTRACT,
+  load_session: CONTROL_MUTATION_NO_TIMEOUT_CONTRACT,
+} satisfies Record<KnownCommandType, CommandContract>;
+
+const TARGETED_CONTROL_PLANE_COMMANDS = new Set<KnownCommandType>([
   "delete_session",
   "switch_session",
-  "get_metrics",
-  "health_check",
-  "get_startup_recovery",
-  "get_command_history",
-  "list_stored_sessions",
-  "load_session",
 ]);
 
-/** Commands that target a specific session but should use a dedicated control bucket. */
-const TARGETED_CONTROL_PLANE_COMMANDS = new Set(["delete_session", "switch_session"]);
-
-/**
- * Commands with a real best-effort abort path.
- * Only these commands should be exposed to command timeout by default.
- */
-const ABORTABLE_COMMANDS = new Set([
-  "prompt",
-  "steer",
-  "follow_up",
-  "compact",
-  "bash",
-  "new_session",
-  "switch_session_file",
-  "fork",
-]);
-
-/**
- * Commands that are quick, operationally safe, and should keep a short timeout
- * even though they are not long-running LLM/data-plane tasks.
- */
-const EXPLICIT_SHORT_TIMEOUT_COMMANDS = new Set([
-  "abort",
-  "abort_compaction",
-  "abort_retry",
-  "abort_bash",
-  "extension_ui_response",
-]);
-
-/**
- * Commands that must never be timeout-wrapped because they can commit durable
- * mutations after the caller already received a terminal timeout response.
- */
-const EXPLICIT_NO_TIMEOUT_COMMANDS = new Set([
-  "create_session",
-  "delete_session",
-  "load_session",
-  "set_session_name",
-  "export_html",
-]);
+const UNKNOWN_COMMAND_CONTRACT: CommandContract = defineContract({
+  timeoutMode: "none",
+  abortability: "non_abortable",
+  isReadOnly: false,
+  isMutation: true,
+  executionPlane: "data",
+  schedulingClass: "data",
+});
 
 // =============================================================================
 // CONTRACT RESOLUTION
@@ -138,43 +236,9 @@ const EXPLICIT_NO_TIMEOUT_COMMANDS = new Set([
 
 /**
  * Resolve the canonical command contract.
- *
- * Default philosophy:
- * - read-only commands get short bounded timeouts
- * - abortable mutations get long timeouts plus best-effort abort hooks
- * - non-abortable mutations fail safe by default (no timeout wrapper)
  */
 export function getCommandContract(commandType: string): CommandContract {
-  const isReadOnly = READ_ONLY_COMMANDS.has(commandType);
-  const isMutation = !isReadOnly && !SPECIAL_SESSION_COMMANDS.has(commandType);
-  const executionPlane: CommandExecutionPlane = CONTROL_PLANE_COMMANDS.has(commandType)
-    ? "control"
-    : "data";
-  const abortability: Abortability = ABORTABLE_COMMANDS.has(commandType)
-    ? "abortable"
-    : "non_abortable";
-
-  let timeoutMode: TimeoutMode;
-  if (EXPLICIT_NO_TIMEOUT_COMMANDS.has(commandType)) {
-    timeoutMode = "none";
-  } else if (EXPLICIT_SHORT_TIMEOUT_COMMANDS.has(commandType)) {
-    timeoutMode = "short";
-  } else if (isReadOnly) {
-    timeoutMode = "short";
-  } else if (abortability === "abortable") {
-    timeoutMode = "long";
-  } else {
-    timeoutMode = "none";
-  }
-
-  return {
-    timeoutMode,
-    abortability,
-    isReadOnly,
-    isMutation,
-    executionPlane,
-    historySensitivity: "hash",
-  };
+  return COMMAND_CONTRACTS[commandType as KnownCommandType] ?? UNKNOWN_COMMAND_CONTRACT;
 }
 
 // =============================================================================
@@ -241,19 +305,16 @@ export function isReadOnlyCommand(commandType: string): boolean {
 
 /**
  * Resolve whether a command belongs to the control plane or data plane.
- *
- * Why this matters:
- * - control-plane operations (create/delete/switch/metrics/history) must remain
- *   operable even when a session's data-plane traffic is saturated
- * - data-plane operations should still be isolated per session
  */
 export function getCommandExecutionPlane(commandType: string): CommandExecutionPlane {
   return getCommandContract(commandType).executionPlane;
 }
 
-export interface RateLimitTarget {
-  plane: CommandExecutionPlane;
-  key: string;
+/**
+ * Resolve which scheduler class a command belongs to.
+ */
+export function getCommandSchedulingClass(commandType: string): CommandSchedulingClass {
+  return getCommandContract(commandType).schedulingClass;
 }
 
 /**
@@ -273,7 +334,7 @@ export function getRateLimitTarget(
     };
   }
 
-  if (command.sessionId && TARGETED_CONTROL_PLANE_COMMANDS.has(command.type)) {
+  if (command.sessionId && TARGETED_CONTROL_PLANE_COMMANDS.has(command.type as KnownCommandType)) {
     return {
       plane,
       key: `control:${command.sessionId}`,
@@ -308,6 +369,8 @@ export interface CommandClassification {
   isReadOnly: boolean;
   /** Whether this command is control-plane or data-plane */
   executionPlane: CommandExecutionPlane;
+  /** Which scheduler lane class the command belongs to */
+  schedulingClass: CommandSchedulingClass;
   /** How replay identity should be exposed in history/diagnostic surfaces */
   historySensitivity: HistorySensitivity;
 }
@@ -332,6 +395,7 @@ export function classifyCommand(
     isMutation: contract.isMutation,
     isReadOnly: contract.isReadOnly,
     executionPlane: contract.executionPlane,
+    schedulingClass: contract.schedulingClass,
     historySensitivity: contract.historySensitivity,
   };
 }

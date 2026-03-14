@@ -444,7 +444,14 @@ export type SessionResponse =
   | (RpcResponseBase & {
       command: "get_messages";
       success: true;
-      data: { messages: AgentMessage[] };
+      data: {
+        messages: AgentMessage[];
+        truncated: boolean;
+        returned: number;
+        totalMessages: number;
+        omittedFromStart: number;
+        maxBytes: number;
+      };
     })
   | (RpcResponseBase & { command: "set_model"; success: true; data: { model: Model<any> } })
   | (RpcResponseBase & {
@@ -491,7 +498,14 @@ export type SessionResponse =
   | (RpcResponseBase & {
       command: "get_tree";
       success: true;
-      data: { currentLeafId: string | null; nodes: SessionTreeNodePayload[] };
+      data: {
+        currentLeafId: string | null;
+        nodes: SessionTreeNodePayload[];
+        truncated: boolean;
+        returned: number;
+        maxBytes: number;
+        maxNodes: number;
+      };
     })
   | (RpcResponseBase & {
       command: "navigate_tree";

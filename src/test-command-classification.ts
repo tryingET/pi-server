@@ -11,6 +11,7 @@ import {
   isMutationCommand,
   isReadOnlyCommand,
   getCommandExecutionPlane,
+  getCommandSchedulingClass,
   getRateLimitTarget,
   classifyCommand,
 } from "./command-classification.js";
@@ -229,6 +230,23 @@ describe("command-classification", () => {
     });
   });
 
+  describe("getCommandSchedulingClass", () => {
+    it("classifies reads as control work", () => {
+      assert.strictEqual(getCommandSchedulingClass("get_state"), "control");
+      assert.strictEqual(getCommandSchedulingClass("list_sessions"), "control");
+    });
+
+    it("classifies mutating work as data work", () => {
+      assert.strictEqual(getCommandSchedulingClass("prompt"), "data");
+      assert.strictEqual(getCommandSchedulingClass("delete_session"), "data");
+    });
+
+    it("classifies abort/UI commands as interrupt work", () => {
+      assert.strictEqual(getCommandSchedulingClass("abort"), "interrupt");
+      assert.strictEqual(getCommandSchedulingClass("extension_ui_response"), "interrupt");
+    });
+  });
+
   describe("getRateLimitTarget", () => {
     it("uses dedicated control buckets for targeted control-plane commands", () => {
       assert.deepStrictEqual(
@@ -273,6 +291,7 @@ describe("command-classification", () => {
       assert.strictEqual(classification.isMutation, false);
       assert.strictEqual(classification.isReadOnly, true);
       assert.strictEqual(classification.executionPlane, "data");
+      assert.strictEqual(classification.schedulingClass, "control");
     });
 
     it("classifies get_tree as read-only", () => {
@@ -290,6 +309,7 @@ describe("command-classification", () => {
       assert.strictEqual(classification.isCancellable, true);
       assert.strictEqual(classification.isMutation, true);
       assert.strictEqual(classification.isReadOnly, false);
+      assert.strictEqual(classification.schedulingClass, "data");
     });
 
     it("classifies create_session correctly", () => {
@@ -310,6 +330,14 @@ describe("command-classification", () => {
       assert.strictEqual(classification.abortability, "non_abortable");
       assert.strictEqual(classification.isMutation, true);
       assert.strictEqual(classification.executionPlane, "control");
+      assert.strictEqual(classification.schedulingClass, "data");
+    });
+
+    it("classifies extension_ui_response as interrupt work", () => {
+      const classification = classifyCommand("extension_ui_response");
+      assert.strictEqual(classification.timeoutMs, 30000);
+      assert.strictEqual(classification.isCancellable, true);
+      assert.strictEqual(classification.schedulingClass, "interrupt");
     });
 
     it("respects custom options", () => {

@@ -199,15 +199,21 @@ For each admitted command:
 
 ### 7.3 Lane execution model
 
-Execution is serialized by lane:
+Execution is serialized by scheduler lane.
 
-- `session:<sessionId>` for session-targeted commands
-- `server` for server-level commands
+Representative lane families:
+
+- `session:<sessionId>:data` — mutating or long-running session work
+- `session:<sessionId>:control` — read-only/session status operations
+- `session:<sessionId>:interrupt` — abort and extension-UI reply commands that must bypass queued data work
+- `server:mutation` — untargeted server mutations such as auto-ID `create_session` / `load_session`
+- `server:control` — untargeted server reads/health/metrics/history
 
 Guarantees:
 
 - Within a lane, execution order is deterministic.
 - Across lanes, no global total ordering is guaranteed.
+- Clients MUST NOT infer a single total order across control/data/interrupt lanes for the same session.
 
 ### 7.4 Replay lifecycle shape
 
@@ -287,6 +293,7 @@ Timeout is a **terminal stored outcome**.
 
 Implications:
 
+- Timeout accounting begins when a command actually starts execution on its scheduler lane, not while it is merely queued behind earlier lane work.
 - A timeout response is returned with `timedOut: true`.
 - The timeout response is stored as the command outcome before return.
 - Later duplicate-id replay MUST return the same timeout response.
@@ -423,7 +430,7 @@ Emitted before server closes. Clients should expect connection termination.
 | `create_session` | Create new session | `{ sessionId, sessionInfo }` |
 | `delete_session` | Unload session from memory | `{ deleted: true }` |
 | `switch_session` | Subscribe to session | `{ sessionInfo }` |
-| `get_metrics` | Server metrics | See `get_metrics` response |
+| `get_metrics` | Server metrics | See `get_metrics` response (optional in-memory metrics may be truncated with metadata) |
 | `health_check` | Health status | `{ healthy, issues, hasOpenCircuit, hasOpenBashCircuit }` |
 | `get_startup_recovery` | Startup durable-journal recovery summary | `{ enabled, initialized, initState, initializationError?, journalPath, schemaVersion, entriesScanned, malformedEntries, unsupportedVersionEntries, recoveredOutcomes, recoveredOutcomeIds, recoveredOutcomeIdsTruncated, recoveredInFlightFailures, recoveredInFlight, recoveredInFlightTruncated, maxItemsReturned }` |
 | `get_command_history` | Bounded durable journal history query (ADR-0019) | `{ enabled, initialized, initState, initializationError?, journalPath, schemaVersion, filters, entries, returned, truncated, maxItemsReturned, maxItemsAllowed }` |
@@ -477,7 +484,7 @@ when the query exceeds those bounds.
 | Command | Purpose |
 |---------|---------|
 | `get_state` | Get SessionInfo |
-| `get_messages` | Get AgentMessage[] |
+| `get_messages` | Get bounded AgentMessage[] |
 | `set_model` | Change model (provider, modelId) |
 | `cycle_model` | Next/previous model |
 | `set_thinking_level` | Set thinking level |
@@ -517,7 +524,36 @@ when the query exceeds those bounds.
 | `get_last_assistant_text` | Get last response |
 | `get_context_usage` | Get token usage info |
 
-### 17.3 `get_tree` details
+### 17.3 `get_messages` details
+
+`get_messages` returns a byte-bounded slice of session messages. When the full serialized message list would exceed the server budget, the server returns the newest messages that fit while preserving chronological order and sets `truncated: true`.
+
+**Response shape:**
+```json
+{
+  "command": "get_messages",
+  "success": true,
+  "data": {
+    "messages": [/* AgentMessage[] */],
+    "truncated": false,
+    "returned": 12,
+    "totalMessages": 12,
+    "omittedFromStart": 0,
+    "maxBytes": 524288
+  }
+}
+```
+
+Semantics:
+
+- `messages` preserves chronological order.
+- `truncated: true` means older messages were omitted from the start of the session history.
+- `returned` is the number of messages included in this response.
+- `totalMessages` is the total message count before truncation.
+- `omittedFromStart` is the number of older messages omitted to satisfy the byte budget.
+- `maxBytes` is the server-side byte budget used for the serialized message array.
+
+### 17.4 `get_tree` details
 
 `get_tree` exposes the full session tree (all entry types) so remote UIs can render `/tree` just like the pi TUI. Unlike `get_fork_messages`, no filtering is applied—assistant replies, tool results, compaction summaries, labels, and custom entries are all included so clients can faithfully reconstruct branch structure.
 
@@ -560,7 +596,11 @@ when the query exceeds those bounds.
         "role": "toolResult",
         "text": "ls -la output..."
       }
-    ]
+    ],
+    "truncated": false,
+    "returned": 3,
+    "maxBytes": 524288,
+    "maxNodes": 10000
   }
 }
 ```
@@ -574,9 +614,17 @@ when the query exceeds those bounds.
 - `timestamp` – ISO string when available
 - `label` – resolved label attached to the entry, if any
 
-`currentLeafId` mirrors the active branch pointer and helps clients highlight the live node. The payload is read-only and small enough for short timeout classification.
+`currentLeafId` mirrors the active branch pointer and helps clients highlight the live node.
 
-### 17.4 `navigate_tree` details
+Bounded response semantics:
+
+- `nodes` is returned as a root-first prefix of the flattened traversal.
+- `truncated: true` means either the node-count guard or the byte-budget guard was hit.
+- `returned` is the number of serialized nodes included in this response.
+- `maxBytes` is the server-side byte budget for the serialized node list.
+- `maxNodes` is the hard node-count ceiling applied before byte-budget trimming.
+
+### 17.5 `navigate_tree` details
 
 Navigate the session tree to a target entry, optionally summarizing the branch.
 
@@ -620,7 +668,7 @@ Navigate the session tree to a target entry, optionally summarizing the branch.
 - `cancelled` — `true` if navigation was cancelled (e.g., by extension)
 - `aborted` — `true` if summarization was aborted
 
-### 17.5 Extension UI commands
+### 17.6 Extension UI commands
 
 See [Section 18](#18-extension-ui-protocol).
 

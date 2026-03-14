@@ -42,8 +42,6 @@ export interface ServerCommandContext {
   listStoredSessions: () => Promise<StoredSessionInfo[]>;
   /** Get metrics from governor and stores */
   getMetrics: () => RpcResponse;
-  /** Get memory sink metrics (optional, for ADR-0016 metrics system) */
-  getMemoryMetrics?: () => Record<string, unknown> | undefined;
   /** Health check */
   getHealth: () => RpcResponse;
   /** Startup durable recovery summary */
@@ -201,15 +199,7 @@ const handleLoadSession: ServerCommandHandler = async (command, context) => {
 // =============================================================================
 
 const handleGetMetrics: ServerCommandHandler = (_command, context) => {
-  const response = context.getMetrics();
-  // Add memory sink metrics if available (ADR-0016)
-  if (context.getMemoryMetrics && response.success) {
-    const memoryMetrics = context.getMemoryMetrics();
-    if (memoryMetrics && "data" in response && response.data) {
-      (response.data as Record<string, unknown>).metrics = memoryMetrics;
-    }
-  }
-  return response;
+  return context.getMetrics();
 };
 
 const handleHealthCheck: ServerCommandHandler = (_command, context) => {

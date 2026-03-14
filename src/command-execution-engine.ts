@@ -13,7 +13,7 @@ import type { RpcCommand, RpcResponse, SessionResolver } from "./types.js";
 import { getSessionId } from "./types.js";
 import type { CommandReplayStore } from "./command-replay-store.js";
 import type { SessionVersionStore } from "./session-version-store.js";
-import { getCommandTimeoutPolicy } from "./command-classification.js";
+import { getCommandSchedulingClass, getCommandTimeoutPolicy } from "./command-classification.js";
 
 /** Default timeout for session commands (5 minutes for LLM operations) */
 const DEFAULT_COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
@@ -102,6 +102,13 @@ export interface ExecutionEngineOptions {
   abortHandlers?: Partial<Record<string, AbortHandler>>;
 }
 
+export interface ScheduledLaneExecution<T> {
+  /** Resolves when the command actually begins execution on its lane. */
+  started: Promise<void>;
+  /** Full result promise, including any time spent queued behind earlier lane work. */
+  result: Promise<T>;
+}
+
 /**
  * Command Execution Engine - manages lane serialization and dependency waits.
  *
@@ -163,24 +170,50 @@ export class CommandExecutionEngine {
 
   /**
    * Get the lane key for a command.
-   * Session commands serialize per-session; server commands serialize together.
+   *
+   * Contract-aware scheduler lanes:
+   * - session:<id>:data      — mutating/session work
+   * - session:<id>:control   — read-only/status operations
+   * - session:<id>:interrupt — abort/UI replies that must bypass queued data work
+   * - server:mutation        — untargeted server mutations (e.g. auto-id create/load)
+   * - server:control         — untargeted server reads/health/metrics
    */
   getLaneKey(command: RpcCommand): string {
     const sessionId = getSessionId(command);
-    if (sessionId) return `session:${sessionId}`;
-    return "server";
+    const schedulingClass = getCommandSchedulingClass(command.type);
+
+    if (sessionId) {
+      switch (schedulingClass) {
+        case "interrupt":
+          return `session:${sessionId}:interrupt`;
+        case "control":
+          return `session:${sessionId}:control`;
+        case "data":
+          return `session:${sessionId}:data`;
+      }
+    }
+
+    return schedulingClass === "data" ? "server:mutation" : "server:control";
   }
 
   /**
-   * Run a task in a deterministic serialized lane.
-   * Commands in the same lane execute sequentially.
+   * Schedule a task onto a deterministic serialized lane.
+   *
+   * The returned `started` promise resolves only when the task actually begins
+   * execution on the lane, which lets callers start timeout accounting at
+   * execution start rather than at queue admission.
    */
-  async runOnLane<T>(laneKey: string, task: () => Promise<T>): Promise<T> {
+  scheduleOnLane<T>(laneKey: string, task: () => Promise<T>): ScheduledLaneExecution<T> {
     const previousTail = this.laneTails.get(laneKey) ?? Promise.resolve();
 
     let releaseCurrent: (() => void) | undefined;
     const currentTail = new Promise<void>((resolve) => {
       releaseCurrent = resolve;
+    });
+
+    let resolveStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      resolveStarted = resolve;
     });
 
     // Store the lane tail promise for later comparison
@@ -190,23 +223,37 @@ export class CommandExecutionEngine {
     );
     this.laneTails.set(laneKey, laneTail);
 
-    await previousTail.catch((error) => {
-      // Previous command failure should not break lane sequencing.
-      // Log for observability but continue.
-      if (error !== undefined) {
-        console.error(`[CommandExecutionEngine] Previous lane task failed for ${laneKey}:`, error);
-      }
-    });
+    const result = (async (): Promise<T> => {
+      await previousTail.catch((error) => {
+        // Previous command failure should not break lane sequencing.
+        // Log for observability but continue.
+        if (error !== undefined) {
+          console.error(`[CommandExecutionEngine] Previous lane task failed for ${laneKey}:`, error);
+        }
+      });
 
-    try {
-      return await task();
-    } finally {
-      releaseCurrent?.();
-      // Only delete if our lane tail is still the current one (not replaced by another task)
-      if (this.laneTails.get(laneKey) === laneTail) {
-        this.laneTails.delete(laneKey);
+      resolveStarted?.();
+
+      try {
+        return await task();
+      } finally {
+        releaseCurrent?.();
+        // Only delete if our lane tail is still the current one (not replaced by another task)
+        if (this.laneTails.get(laneKey) === laneTail) {
+          this.laneTails.delete(laneKey);
+        }
       }
-    }
+    })();
+
+    return { started, result };
+  }
+
+  /**
+   * Run a task in a deterministic serialized lane.
+   * Commands in the same lane execute sequentially.
+   */
+  async runOnLane<T>(laneKey: string, task: () => Promise<T>): Promise<T> {
+    return this.scheduleOnLane(laneKey, task).result;
   }
 
   // ==========================================================================
@@ -325,12 +372,17 @@ export class CommandExecutionEngine {
   async executeWithTimeout(
     commandType: string,
     promise: Promise<RpcResponse>,
-    command: RpcCommand
+    command: RpcCommand,
+    started?: Promise<void>
   ): Promise<RpcResponse> {
     const timeoutMs = this.getCommandTimeoutMs(commandType);
 
     if (timeoutMs === null) {
       return promise;
+    }
+
+    if (started) {
+      await started;
     }
 
     return withTimeout(promise, timeoutMs, commandType, () => this.abortTimedOutCommand(command));

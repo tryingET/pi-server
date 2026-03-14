@@ -32,6 +32,8 @@ export type CommandHandler = (
 const MAX_TREE_PREVIEW_LENGTH = 400;
 const MAX_TREE_DEPTH = 1000;
 const MAX_TREE_NODES = 10000;
+const MAX_TREE_RESPONSE_BYTES = 512 * 1024;
+const MAX_MESSAGES_RESPONSE_BYTES = 512 * 1024;
 
 interface SessionTreeNodeLike {
   entry: {
@@ -45,15 +47,17 @@ interface SessionTreeNodeLike {
   label?: string;
 }
 
-function serializeSessionTreeNodes(
-  tree: SessionTreeNodeLike[] | undefined
-): SessionTreeNodePayload[] {
+function serializeSessionTreeNodes(tree: SessionTreeNodeLike[] | undefined): {
+  nodes: SessionTreeNodePayload[];
+  truncated: boolean;
+} {
   if (!Array.isArray(tree) || tree.length === 0) {
-    return [];
+    return { nodes: [], truncated: false };
   }
 
   const result: SessionTreeNodePayload[] = [];
   const stack: Array<{ node: SessionTreeNodeLike; depth: number }> = [];
+  let truncated = false;
 
   // Initialize stack with depth tracking (reverse for pre-order)
   for (let i = tree.length - 1; i >= 0; i--) {
@@ -67,6 +71,7 @@ function serializeSessionTreeNodes(
   while (stack.length > 0) {
     // Hard bound on total nodes to prevent memory exhaustion
     if (result.length >= MAX_TREE_NODES) {
+      truncated = true;
       break;
     }
 
@@ -77,6 +82,7 @@ function serializeSessionTreeNodes(
 
     // Skip nodes beyond max depth (prevents stack overflow on deep trees)
     if (depth > MAX_TREE_DEPTH) {
+      truncated = true;
       continue;
     }
 
@@ -99,7 +105,7 @@ function serializeSessionTreeNodes(
     }
   }
 
-  return result;
+  return { nodes: result, truncated };
 }
 
 function serializeSingleTreeNode(node: SessionTreeNodeLike): SessionTreeNodePayload {
@@ -243,6 +249,95 @@ function normalizePreview(text: string): string {
   return `${collapsed.slice(0, MAX_TREE_PREVIEW_LENGTH)}…`;
 }
 
+function measureSerializedBytes(value: unknown): number | null {
+  try {
+    return Buffer.byteLength(JSON.stringify(value), "utf8");
+  } catch {
+    return null;
+  }
+}
+
+function selectTrailingItemsWithinByteBudget<T>(items: T[], maxBytes: number): {
+  items: T[];
+  truncated: boolean;
+  returned: number;
+  omittedFromStart: number;
+} {
+  if (!Array.isArray(items) || items.length === 0) {
+    return {
+      items: [],
+      truncated: false,
+      returned: 0,
+      omittedFromStart: 0,
+    };
+  }
+
+  const selected: T[] = [];
+  let usedBytes = 2; // []
+
+  for (let i = items.length - 1; i >= 0; i--) {
+    const item = items[i];
+    const itemBytes = measureSerializedBytes(item);
+    if (itemBytes === null) {
+      continue;
+    }
+
+    const commaBytes = selected.length > 0 ? 1 : 0;
+    if (usedBytes + commaBytes + itemBytes > maxBytes) {
+      break;
+    }
+
+    selected.push(item);
+    usedBytes += commaBytes + itemBytes;
+  }
+
+  selected.reverse();
+  return {
+    items: selected,
+    truncated: selected.length < items.length,
+    returned: selected.length,
+    omittedFromStart: Math.max(0, items.length - selected.length),
+  };
+}
+
+function selectLeadingItemsWithinByteBudget<T>(items: T[], maxBytes: number): {
+  items: T[];
+  truncated: boolean;
+  returned: number;
+} {
+  if (!Array.isArray(items) || items.length === 0) {
+    return {
+      items: [],
+      truncated: false,
+      returned: 0,
+    };
+  }
+
+  const selected: T[] = [];
+  let usedBytes = 2; // []
+
+  for (const item of items) {
+    const itemBytes = measureSerializedBytes(item);
+    if (itemBytes === null) {
+      continue;
+    }
+
+    const commaBytes = selected.length > 0 ? 1 : 0;
+    if (usedBytes + commaBytes + itemBytes > maxBytes) {
+      break;
+    }
+
+    selected.push(item);
+    usedBytes += commaBytes + itemBytes;
+  }
+
+  return {
+    items: selected,
+    truncated: selected.length < items.length,
+    returned: selected.length,
+  };
+}
+
 // =============================================================================
 // HANDLER IMPLEMENTATIONS
 // =============================================================================
@@ -285,12 +380,21 @@ const handleGetState: CommandHandler = (_session, command, getSessionInfo) => {
 };
 
 const handleGetMessages: CommandHandler = (session, command) => {
+  const bounded = selectTrailingItemsWithinByteBudget(session.messages, MAX_MESSAGES_RESPONSE_BYTES);
+
   return {
     id: command.id,
     type: "response",
     command: "get_messages",
     success: true,
-    data: { messages: session.messages },
+    data: {
+      messages: bounded.items,
+      truncated: bounded.truncated,
+      returned: bounded.returned,
+      totalMessages: session.messages.length,
+      omittedFromStart: bounded.omittedFromStart,
+      maxBytes: MAX_MESSAGES_RESPONSE_BYTES,
+    },
   };
 };
 
@@ -481,7 +585,11 @@ const handleGetForkMessages: CommandHandler = (session, command) => {
 const handleGetTree: CommandHandler = (session, command) => {
   try {
     const tree = session.sessionManager.getTree() as unknown as SessionTreeNodeLike[];
-    const nodes = serializeSessionTreeNodes(tree);
+    const serialized = serializeSessionTreeNodes(tree);
+    const bounded = selectLeadingItemsWithinByteBudget(
+      serialized.nodes,
+      MAX_TREE_RESPONSE_BYTES
+    );
     const currentLeafId = session.sessionManager.getLeafId();
     return {
       id: command.id,
@@ -490,7 +598,11 @@ const handleGetTree: CommandHandler = (session, command) => {
       success: true,
       data: {
         currentLeafId: currentLeafId ?? null,
-        nodes,
+        nodes: bounded.items,
+        truncated: serialized.truncated || bounded.truncated,
+        returned: bounded.returned,
+        maxBytes: MAX_TREE_RESPONSE_BYTES,
+        maxNodes: MAX_TREE_NODES,
       },
     };
   } catch (error) {

@@ -137,17 +137,38 @@ describe("command-execution-engine", () => {
   // ==========================================================================
 
   describe("getLaneKey", () => {
-    it("returns session lane for session commands", () => {
+    it("routes read-only session commands to the control lane", () => {
       const { engine } = createEngine();
       assert.strictEqual(
         engine.getLaneKey({ type: "get_state", sessionId: "s1" } as any),
-        "session:s1"
+        "session:s1:control"
       );
     });
 
-    it("returns server lane for server commands", () => {
+    it("routes mutating session work to the data lane", () => {
       const { engine } = createEngine();
-      assert.strictEqual(engine.getLaneKey({ type: "list_sessions" } as any), "server");
+      assert.strictEqual(
+        engine.getLaneKey({ type: "prompt", sessionId: "s1" } as any),
+        "session:s1:data"
+      );
+    });
+
+    it("routes interrupt commands to the interrupt lane", () => {
+      const { engine } = createEngine();
+      assert.strictEqual(
+        engine.getLaneKey({ type: "abort", sessionId: "s1" } as any),
+        "session:s1:interrupt"
+      );
+      assert.strictEqual(
+        engine.getLaneKey({ type: "extension_ui_response", sessionId: "s1" } as any),
+        "session:s1:interrupt"
+      );
+    });
+
+    it("routes untargeted server commands by scheduler class", () => {
+      const { engine } = createEngine();
+      assert.strictEqual(engine.getLaneKey({ type: "list_sessions" } as any), "server:control");
+      assert.strictEqual(engine.getLaneKey({ type: "create_session" } as any), "server:mutation");
     });
   });
 
@@ -570,6 +591,40 @@ describe("command-execution-engine", () => {
       setTimeout(() => {
         resolvePromise!(makeResponse({ command: "create_session", success: true }));
       }, 50);
+
+      const result = await execPromise;
+      assert.strictEqual(result.success, true);
+    });
+
+    it("starts timeout accounting when execution begins, not while queued", async () => {
+      const { engine } = createEngine();
+      let releaseStartGate: (() => void) | undefined;
+      const started = new Promise<void>((resolve) => {
+        releaseStartGate = resolve;
+      });
+
+      let resolvePromise: (value: RpcResponse) => void;
+      const promise = new Promise<RpcResponse>((resolve) => {
+        resolvePromise = resolve;
+      });
+
+      const execPromise = engine.executeWithTimeout(
+        "get_state",
+        promise,
+        {
+          type: "get_state",
+          sessionId: "s1",
+        } as any,
+        started
+      );
+
+      // Simulate queue wait longer than the short timeout. This must NOT time out yet.
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      releaseStartGate?.();
+
+      setTimeout(() => {
+        resolvePromise!(makeResponse({ command: "get_state", success: true }));
+      }, 10);
 
       const result = await execPromise;
       assert.strictEqual(result.success, true);

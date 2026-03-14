@@ -13,6 +13,7 @@
  * - Mutate state directly (delegates to stores)
  */
 
+import fs from "node:fs/promises";
 import path from "path";
 import {
   type AgentSession,
@@ -51,6 +52,7 @@ import {
   formatValidationErrors,
   normalizeSessionNameInput,
   validateSessionFileAccess,
+  validateSessionPath,
 } from "./validation.js";
 import { ResourceGovernor, DEFAULT_CONFIG } from "./resource-governor.js";
 import {
@@ -99,6 +101,8 @@ const SESSION_DISCOVERY_REFRESH_TTL_MS = 60 * 1000;
 
 /** Max entries returned per list field in get_startup_recovery. */
 const STARTUP_RECOVERY_MAX_ITEMS = 100;
+/** Bound optional in-memory metrics payloads so get_metrics stays transport-safe. */
+const MAX_MEMORY_METRICS_RESPONSE_BYTES = 128 * 1024;
 
 type DurableInitState = "disabled" | "pending" | "ready" | "failed" | "timed_out";
 
@@ -576,7 +580,10 @@ export class PiSessionManager implements SessionResolver {
     }
   }
 
-  private buildStoredSessionInfoFromMetadata(meta: StoredSessionMetadata): StoredSessionInfo {
+  private buildStoredSessionInfoFromMetadata(
+    meta: StoredSessionMetadata,
+    fileExists: boolean
+  ): StoredSessionInfo {
     return {
       sessionId: meta.sessionId,
       sessionName: meta.sessionName,
@@ -587,7 +594,7 @@ export class PiSessionManager implements SessionResolver {
       thinkingLevel: "medium",
       isStreaming: false,
       messageCount: 0,
-      fileExists: true,
+      fileExists,
     };
   }
 
@@ -612,6 +619,23 @@ export class PiSessionManager implements SessionResolver {
     };
   }
 
+  private isSessionPathVisibleToCurrentServer(sessionPath: string): boolean {
+    return validateSessionPath(sessionPath) === null;
+  }
+
+  private async sessionFileExists(sessionFile: string | undefined): Promise<boolean> {
+    if (typeof sessionFile !== "string" || sessionFile.trim().length === 0) {
+      return false;
+    }
+
+    try {
+      await fs.access(sessionFile);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private async ensureSessionControlPlaneBootstrapped(options?: {
     scheduleDiscovery?: boolean;
   }): Promise<void> {
@@ -623,20 +647,24 @@ export class PiSessionManager implements SessionResolver {
     ) {
       this.sessionControlPlaneMetadataSnapshotKey = snapshotKey;
       this.sessionControlPlaneBootstrapPromise = (async () => {
-        const [metadata, storedInfo] = await Promise.all([
-          this.sessionStore.list(),
-          this.sessionStore.listWithInfo(),
-        ]);
-        const infoBySessionId = new Map(storedInfo.map((info) => [info.sessionId, info]));
-
-        this.sessionControlPlane.seedStoredSessions(
-          metadata.map((meta) => ({
-            sessionId: meta.sessionId,
-            epoch: meta.epoch,
-            info:
-              infoBySessionId.get(meta.sessionId) ?? this.buildStoredSessionInfoFromMetadata(meta),
-          }))
+        const metadata = await this.sessionStore.list();
+        const visibleMetadata = metadata.filter((meta) =>
+          this.isSessionPathVisibleToCurrentServer(meta.sessionFile)
         );
+
+        const resolvedRows = await Promise.all(
+          visibleMetadata.map(async (meta) => {
+            const resolvedMeta = (await this.sessionStore.load(meta.sessionId)) ?? meta;
+            const fileExists = await this.sessionFileExists(resolvedMeta.sessionFile);
+            return {
+              sessionId: meta.sessionId,
+              epoch: meta.epoch,
+              info: this.buildStoredSessionInfoFromMetadata(resolvedMeta, fileExists),
+            };
+          })
+        );
+
+        this.sessionControlPlane.seedStoredSessions(resolvedRows);
       })();
     }
 
@@ -1160,10 +1188,15 @@ export class PiSessionManager implements SessionResolver {
         sessionName: session.sessionName,
       });
       metadataSaved = true;
+      const sessionFileExists = await this.sessionFileExists(session.sessionFile);
       this.sessionControlPlane.upsertStoredSession(
         sessionId,
         epoch,
-        this.buildStoredSessionInfoFromSessionInfo(sessionInfo, cwd ?? process.cwd(), true)
+        this.buildStoredSessionInfoFromSessionInfo(
+          sessionInfo,
+          cwd ?? process.cwd(),
+          sessionFileExists
+        )
       );
       this.installSessionNamePersistenceBridge(sessionId, epoch, session);
 
@@ -1363,26 +1396,31 @@ export class PiSessionManager implements SessionResolver {
   async listStoredSessions(): Promise<StoredSessionInfo[]> {
     await this.ensureSessionControlPlaneBootstrapped({ scheduleDiscovery: true });
 
-    return this.sessionControlPlane.listStoredSessions().map((stored) => {
-      const session = this.sessions.get(stored.sessionId);
-      const createdAt = this.sessionCreatedAt.get(stored.sessionId);
-      if (!session || !createdAt) {
-        return stored;
-      }
+    const storedSessions = this.sessionControlPlane.listStoredSessions();
 
-      return {
-        ...stored,
-        sessionName: session.sessionName,
-        sessionFile: session.sessionFile ?? stored.sessionFile,
-        sessionPath: session.sessionFile ?? stored.sessionPath,
-        model: session.model,
-        thinkingLevel: session.thinkingLevel,
-        isStreaming: session.isStreaming,
-        messageCount: session.messages.length,
-        createdAt: createdAt.toISOString(),
-        fileExists: typeof session.sessionFile === "string" ? true : stored.fileExists,
-      };
-    });
+    return Promise.all(
+      storedSessions.map(async (stored) => {
+        const session = this.sessions.get(stored.sessionId);
+        const createdAt = this.sessionCreatedAt.get(stored.sessionId);
+        if (!session || !createdAt) {
+          return stored;
+        }
+
+        const sessionFile = session.sessionFile ?? stored.sessionFile;
+        return {
+          ...stored,
+          sessionName: session.sessionName,
+          sessionFile,
+          sessionPath: sessionFile,
+          model: session.model,
+          thinkingLevel: session.thinkingLevel,
+          isStreaming: session.isStreaming,
+          messageCount: session.messages.length,
+          createdAt: createdAt.toISOString(),
+          fileExists: await this.sessionFileExists(sessionFile),
+        };
+      })
+    );
   }
 
   /**
@@ -1478,10 +1516,15 @@ export class PiSessionManager implements SessionResolver {
         sessionName: session.sessionName,
       });
       metadataSaved = true;
+      const sessionFileExists = await this.sessionFileExists(session.sessionFile);
       this.sessionControlPlane.upsertStoredSession(
         sessionId,
         epoch,
-        this.buildStoredSessionInfoFromSessionInfo(sessionInfo, persistedFileMetadata.cwd, true)
+        this.buildStoredSessionInfoFromSessionInfo(
+          sessionInfo,
+          persistedFileMetadata.cwd,
+          sessionFileExists
+        )
       );
       this.installSessionNamePersistenceBridge(sessionId, epoch, session);
 
@@ -1758,7 +1801,6 @@ export class PiSessionManager implements SessionResolver {
         this.loadSession(sessionId, sessionPath),
       listStoredSessions: () => this.listStoredSessions(),
       getMetrics: () => this.buildMetricsResponse(),
-      getMemoryMetrics: () => this.memoryMetricsProvider?.(),
       getHealth: () => this.buildHealthResponse(),
       getStartupRecovery: () => this.buildStartupRecoveryResponse(),
       getCommandHistory: (query) => this.buildCommandHistoryResponse(query),
@@ -1798,6 +1840,76 @@ export class PiSessionManager implements SessionResolver {
     };
   }
 
+  private boundMemoryMetricsPayload(
+    metrics: Record<string, unknown> | undefined
+  ): Record<string, unknown> | undefined {
+    if (!metrics) {
+      return undefined;
+    }
+
+    let clone: Record<string, unknown>;
+    try {
+      clone = JSON.parse(JSON.stringify(metrics)) as Record<string, unknown>;
+    } catch {
+      return {
+        truncated: true,
+        reason: "metrics payload could not be safely serialized",
+        maxBytes: MAX_MEMORY_METRICS_RESPONSE_BYTES,
+      };
+    }
+
+    const recentEvents = Array.isArray(clone.recentEvents) ? [...clone.recentEvents] : undefined;
+    const totalRecentEvents = recentEvents?.length ?? 0;
+
+    const measure = (value: unknown): number => Buffer.byteLength(JSON.stringify(value), "utf8");
+
+    if (recentEvents) {
+      let boundedRecentEvents = recentEvents;
+      let candidate: Record<string, unknown> = {
+        ...clone,
+        recentEvents: boundedRecentEvents,
+      };
+
+      while (
+        measure(candidate) > MAX_MEMORY_METRICS_RESPONSE_BYTES &&
+        boundedRecentEvents.length > 0
+      ) {
+        boundedRecentEvents = boundedRecentEvents.slice(Math.ceil(boundedRecentEvents.length / 2));
+        candidate = {
+          ...clone,
+          recentEvents: boundedRecentEvents,
+        };
+      }
+
+      if (boundedRecentEvents.length < totalRecentEvents) {
+        candidate = {
+          ...candidate,
+          truncated: true,
+          totalRecentEvents,
+          returnedRecentEvents: boundedRecentEvents.length,
+          maxBytes: MAX_MEMORY_METRICS_RESPONSE_BYTES,
+        };
+      }
+
+      if (measure(candidate) <= MAX_MEMORY_METRICS_RESPONSE_BYTES) {
+        return candidate;
+      }
+    } else if (measure(clone) <= MAX_MEMORY_METRICS_RESPONSE_BYTES) {
+      return clone;
+    }
+
+    return {
+      truncated: true,
+      reason: "metrics payload exceeded byte budget",
+      maxBytes: MAX_MEMORY_METRICS_RESPONSE_BYTES,
+      totalRecentEvents,
+      returnedRecentEvents: 0,
+      counters: clone.counters,
+      gauges: clone.gauges,
+      histograms: clone.histograms,
+    };
+  }
+
   /**
    * Build the metrics response (extracted for handler use).
    */
@@ -1816,6 +1928,8 @@ export class PiSessionManager implements SessionResolver {
     const journalStats = this.commandJournal.getStats();
     const recoveredOutcomeCount = this.startupRecoverySnapshot?.recoveredOutcomes ?? 0;
     const recoveredInFlightFailures = this.startupRecoverySnapshot?.recoveredInFlightFailures ?? 0;
+
+    const boundedMemoryMetrics = this.boundMemoryMetricsPayload(this.memoryMetricsProvider?.());
 
     return {
       type: "response",
@@ -1850,6 +1964,7 @@ export class PiSessionManager implements SessionResolver {
         },
         circuitBreakers: circuitBreakerMetrics,
         bashCircuitBreaker: bashCircuitBreakerMetrics,
+        ...(boundedMemoryMetrics ? { metrics: boundedMemoryMetrics } : {}),
       },
     };
   }
@@ -2298,7 +2413,7 @@ export class PiSessionManager implements SessionResolver {
           ifSessionVersion,
           idempotencyKey,
         });
-        const commandExecution = this.executionEngine.runOnLane<RpcResponse>(
+        const scheduledExecution = this.executionEngine.scheduleOnLane<RpcResponse>(
           laneKey,
           async (): Promise<RpcResponse> => {
             if (this.runtimeDisposed) {
@@ -2405,6 +2520,7 @@ export class PiSessionManager implements SessionResolver {
             return this.versionStore.applyVersion(command, rawResponse);
           }
         );
+        const commandExecution = scheduledExecution.result;
 
         this.registerInFlightCommand(commandExecution);
 
@@ -2412,7 +2528,8 @@ export class PiSessionManager implements SessionResolver {
           response = await this.executionEngine.executeWithTimeout(
             commandType,
             commandExecution,
-            command
+            command,
+            scheduledExecution.started
           );
         } catch (error) {
           // ADR-0001: Create timeout response and store it BEFORE returning
@@ -2439,15 +2556,20 @@ export class PiSessionManager implements SessionResolver {
     const finalizedResponse = finalizeResponse(response);
     settleTrackedExecution(finalizedResponse);
 
+    const allowLateStoreMutation = !this.runtimeDisposed;
+
     // ADR-0001: ATOMIC OUTCOME STORAGE
     // Store outcome BEFORE returning (not in async callback)
-    // This ensures same command ID always returns same response
+    // This ensures same command ID always returns same response.
+    //
+    // After shutdown disposal completes, late command completions must not
+    // repopulate replay/idempotency state that disposeAllSessions() just cleared.
     //
     // Only store outcomes for EXPLICIT client IDs (not synthetic IDs).
     // Synthetic IDs (anon:timestamp:seq) are server-generated for anonymous
     // commands and should not be stored to prevent unbounded memory growth.
     // Clients must provide explicit IDs if they want replay semantics.
-    if (isExplicitId) {
+    if (allowLateStoreMutation && isExplicitId) {
       try {
         this.replayStore.storeCommandOutcome({
           commandId: id,
@@ -2474,7 +2596,7 @@ export class PiSessionManager implements SessionResolver {
     }
 
     // Cache terminal idempotency outcome (including timeout responses)
-    if (idempotencyKey) {
+    if (allowLateStoreMutation && idempotencyKey) {
       this.replayStore.cacheIdempotencyResult({
         command,
         idempotencyKey,

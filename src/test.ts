@@ -773,6 +773,8 @@ async function testCommandRouter() {
     assert.strictEqual(data.currentLeafId, "tool-1");
     assert(Array.isArray(data.nodes), "nodes should be an array");
     assert.strictEqual(data.nodes.length, 3, "Should include all tree nodes");
+    assert.strictEqual(data.truncated, false);
+    assert.strictEqual(data.returned, 3);
 
     const assistantNode = data.nodes.find((node: any) => node.entryId === "assistant-1");
     assert(assistantNode, "Assistant node should exist");
@@ -786,6 +788,34 @@ async function testCommandRouter() {
     const userNode = data.nodes.find((node: any) => node.entryId === "user-1");
     assert(userNode, "User node should exist");
     assert.strictEqual(userNode.role, "user");
+  });
+
+  await test("router: get_messages returns bounded newest suffix", async () => {
+    const fakeSession = {
+      messages: Array.from({ length: 12 }, (_, i) => ({
+        role: i % 2 === 0 ? "user" : "assistant",
+        content: [{ type: "text", text: `message-${i}-` + "x".repeat(80_000) }],
+      })),
+    } as any;
+
+    const response = await routeSessionCommand(
+      fakeSession,
+      { type: "get_messages", sessionId: "session-msg" },
+      () => undefined
+    );
+
+    assert(response, "Should return response");
+    assert.strictEqual(response!.success, true, "get_messages should succeed");
+    const data = (response as any).data;
+    assert.strictEqual(data.truncated, true, "Large message list should be truncated");
+    assert.ok(data.returned < data.totalMessages, "Should return bounded subset");
+    assert.strictEqual(data.omittedFromStart, data.totalMessages - data.returned);
+    assert.strictEqual(data.messages.length, data.returned);
+    const firstReturnedText = data.messages[0]?.content?.[0]?.text as string;
+    assert(
+      firstReturnedText.includes(`message-${data.omittedFromStart}-`),
+      "Returned messages should preserve newest suffix in chronological order"
+    );
   });
 
   await test("router: get_tree handles empty tree", async () => {
@@ -883,6 +913,41 @@ async function testCommandRouter() {
       data.nodes.find((n: any) => n.entryId === "good-2"),
       "Should include second good node"
     );
+  });
+
+  await test("router: get_tree applies byte budget without breaking structure order", async () => {
+    const tree: any[] = Array.from({ length: 3000 }, (_, i) => ({
+      entry: {
+        type: "message",
+        id: `node-${i}`,
+        parentId: null,
+        message: { role: "user", content: `node-${i}-` + "x".repeat(600) },
+      },
+      children: [],
+    }));
+    const fakeSession = {
+      sessionManager: {
+        getTree: () => tree,
+        getLeafId: () => "node-2999",
+      },
+    } as any;
+
+    const response = await routeSessionCommand(
+      fakeSession,
+      { type: "get_tree", sessionId: "session-large-tree" },
+      () => undefined
+    );
+
+    assert(response, "Should return response");
+    assert.strictEqual(response!.success, true, "get_tree should succeed under truncation");
+    const data = (response as any).data;
+    assert.strictEqual(data.truncated, true, "Large trees should be truncated");
+    assert.ok(data.returned < tree.length, "Should return bounded prefix");
+    assert.strictEqual(data.nodes.length, data.returned);
+    assert.strictEqual(data.nodes[0]?.entryId, "node-0", "Returned nodes should preserve root-first order");
+    const lastNodeId = data.nodes[data.nodes.length - 1]?.entryId as string;
+    assert.ok(lastNodeId.startsWith("node-"), "Should return valid node IDs");
+    assert.strictEqual(data.maxBytes, 512 * 1024);
   });
 
   await test("router: switch_session_file rejects non-session files before upstream switch", async () => {
@@ -2011,6 +2076,212 @@ async function testSessionManager() {
     assert(
       third.error?.includes("not found"),
       `General limiter should have been refunded, got: ${third.error}`
+    );
+  });
+
+  await test("session-manager: abort bypasses queued data-lane work", async () => {
+    const localManager = new PiSessionManager(undefined, {
+      defaultCommandTimeoutMs: 80,
+      shortCommandTimeoutMs: 30,
+    });
+
+    const managerAny = localManager as any;
+    let releasePrompt: (() => void) | undefined;
+    const promptGate = new Promise<void>((resolve) => {
+      releasePrompt = resolve;
+    });
+
+    const fakeSession = {
+      sessionName: "lane-session",
+      sessionFile: "/tmp/lane-session.jsonl",
+      model: undefined,
+      thinkingLevel: "medium",
+      isStreaming: false,
+      messages: [],
+      prompt: async () => {
+        await promptGate;
+      },
+      abort: () => {
+        releasePrompt?.();
+      },
+      abortCompaction: () => {},
+      abortRetry: () => {},
+      abortBash: () => {},
+    };
+
+    managerAny.sessions.set("lane-session", fakeSession);
+    managerAny.sessionCreatedAt.set("lane-session", new Date());
+    managerAny.versionStore.initialize("lane-session");
+
+    const promptPromise = localManager.executeCommand({
+      id: "lane-prompt",
+      type: "prompt",
+      sessionId: "lane-session",
+      message: "hi",
+    } as any);
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const abortResponse = await localManager.executeCommand({
+      id: "lane-abort",
+      type: "abort",
+      sessionId: "lane-session",
+    } as any);
+    assert.strictEqual(abortResponse.success, true, `Abort should bypass data lane: ${abortResponse.error}`);
+
+    const promptResponse = await promptPromise;
+    assert.strictEqual(promptResponse.success, true, `Prompt should finish after abort released it: ${promptResponse.error}`);
+  });
+
+  await test("session-manager: extension_ui_response bypasses queued data-lane work", async () => {
+    const localManager = new PiSessionManager(undefined, {
+      defaultCommandTimeoutMs: 80,
+      shortCommandTimeoutMs: 30,
+    });
+
+    const managerAny = localManager as any;
+    let releasePrompt: (() => void) | undefined;
+    const promptGate = new Promise<void>((resolve) => {
+      releasePrompt = resolve;
+    });
+
+    const fakeSession = {
+      sessionName: "ui-lane-session",
+      sessionFile: "/tmp/ui-lane-session.jsonl",
+      model: undefined,
+      thinkingLevel: "medium",
+      isStreaming: false,
+      messages: [],
+      prompt: async () => {
+        await promptGate;
+      },
+      abort: () => {
+        releasePrompt?.();
+      },
+      abortCompaction: () => {},
+      abortRetry: () => {},
+      abortBash: () => {},
+    };
+
+    managerAny.sessions.set("ui-lane-session", fakeSession);
+    managerAny.sessionCreatedAt.set("ui-lane-session", new Date());
+    managerAny.versionStore.initialize("ui-lane-session");
+
+    const pending = managerAny.extensionUI.createPendingRequest("ui-lane-session", "confirm", {
+      title: "Confirm",
+      message: "Proceed?",
+      timeout: 1000,
+    });
+    assert.ok(pending, "Expected pending UI request to be created");
+
+    const promptPromise = localManager.executeCommand({
+      id: "ui-lane-prompt",
+      type: "prompt",
+      sessionId: "ui-lane-session",
+      message: "wait for ui",
+    } as any);
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const uiResponse = await localManager.executeCommand({
+      id: "ui-lane-response",
+      type: "extension_ui_response",
+      sessionId: "ui-lane-session",
+      requestId: pending.requestId,
+      response: { method: "confirm", confirmed: true },
+    } as any);
+
+    assert.strictEqual(uiResponse.success, true, `UI response should bypass data lane: ${uiResponse.error}`);
+    assert.strictEqual(managerAny.extensionUI.getPendingCount(), 0, "Pending UI request should be resolved");
+    const pendingResult = await pending.promise;
+    assert.deepStrictEqual(pendingResult, { method: "confirm", confirmed: true });
+
+    releasePrompt?.();
+    const promptResponse = await promptPromise;
+    assert.strictEqual(promptResponse.success, true, `Prompt should complete after UI reply: ${promptResponse.error}`);
+  });
+
+  await test("session-manager: health_check bypasses untargeted server mutations", async () => {
+    const localManager = new PiSessionManager(undefined, {
+      shortCommandTimeoutMs: 30,
+    });
+    const managerAny = localManager as any;
+
+    managerAny.createSession = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return {
+        sessionId: "generated-session",
+        thinkingLevel: "medium",
+        isStreaming: false,
+        messageCount: 0,
+        createdAt: new Date().toISOString(),
+      };
+    };
+
+    const createPromise = localManager.executeCommand({
+      id: "server-mutation",
+      type: "create_session",
+    } as any);
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const healthResponse = await localManager.executeCommand({
+      id: "server-health",
+      type: "health_check",
+    } as any);
+    assert.strictEqual(
+      healthResponse.success,
+      true,
+      `health_check should not be trapped behind untargeted create_session: ${healthResponse.error}`
+    );
+
+    const createResponse = await createPromise;
+    assert.strictEqual(createResponse.success, true, `create_session should still succeed: ${createResponse.error}`);
+  });
+
+  await test("session-manager: late completions after runtime disposal do not repopulate replay state", async () => {
+    const localManager = new PiSessionManager();
+    const managerAny = localManager as any;
+    const originalExecuteInternal = managerAny.executeCommandInternal.bind(localManager);
+
+    managerAny.executeCommandInternal = async (
+      command: any,
+      id: string | undefined,
+      commandType: string
+    ) => {
+      if (commandType === "list_sessions") {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        return {
+          id,
+          type: "response",
+          command: "list_sessions",
+          success: true,
+          data: { sessions: [] },
+        };
+      }
+      return originalExecuteInternal(command, id, commandType);
+    };
+
+    const responsePromise = localManager.executeCommand({
+      id: "late-store",
+      type: "list_sessions",
+    } as any);
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    localManager.markRuntimeDisposed();
+    localManager.disposeAllSessions();
+
+    const response = await responsePromise;
+    assert.strictEqual(response.success, false, "Late completion should be converted into shutdown cancellation");
+    assert.strictEqual(
+      managerAny.replayStore.getCommandOutcome("late-store"),
+      undefined,
+      "Replay store must stay empty after runtime disposal"
+    );
+    assert.strictEqual(
+      managerAny.replayStore.getStats().outcomeCount,
+      0,
+      "No explicit outcomes should be reintroduced after disposal"
     );
   });
 
@@ -3933,6 +4204,33 @@ async function testSessionManager() {
     await manager.executeCommand({ type: "delete_session", sessionId: "metrics-test" });
   });
 
+  await test("session-manager: get_metrics bounds optional memory metrics payload", async () => {
+    const manager = new PiSessionManager();
+    manager.setMemoryMetricsProvider(() => ({
+      counters: { a: 1 },
+      recentEvents: Array.from({ length: 100 }, (_, i) => ({
+        name: `event-${i}`,
+        type: "event",
+        timestamp: Date.now(),
+        tags: { payload: "x".repeat(10_000) },
+      })),
+    }));
+
+    const response = await manager.executeCommand({ type: "get_metrics" });
+    assert.strictEqual(response.success, true, "get_metrics should succeed");
+    const data = (response as any).data;
+    assert.ok(data.metrics, "Should include bounded memory metrics");
+    assert.strictEqual(data.metrics.truncated, true, "Large metrics payload should be truncated");
+    assert.ok(
+      data.metrics.returnedRecentEvents < data.metrics.totalRecentEvents,
+      "Should reduce recentEvents to stay within byte budget"
+    );
+    assert.ok(
+      Buffer.byteLength(JSON.stringify(response), "utf8") < 256 * 1024,
+      "Bounded metrics response should stay comfortably below transport-risk size"
+    );
+  });
+
   await test("session-manager: get_startup_recovery returns defaults when journal disabled", async () => {
     const response = await manager.executeCommand({ type: "get_startup_recovery" });
     assert.strictEqual(response.success, true, "get_startup_recovery should succeed");
@@ -5035,6 +5333,53 @@ async function testSessionManager() {
     }
   });
 
+  await test("session-manager: list_stored_sessions filters metadata outside current project scope", async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), "pi-session-manager-scope-filter-"));
+    const previousCwd = process.cwd();
+
+    try {
+      const projectA = join(baseDir, "project-a");
+      const projectB = join(baseDir, "project-b");
+      const dataDir = join(baseDir, "server-data");
+      const sessionsDir = join(baseDir, "global-sessions");
+      const foreignSessionDir = join(projectA, ".pi", "sessions");
+      const foreignSessionPath = join(foreignSessionDir, "foreign.jsonl");
+
+      mkdirSync(foreignSessionDir, { recursive: true });
+      mkdirSync(projectB, { recursive: true });
+      writeFileSync(
+        foreignSessionPath,
+        JSON.stringify({ type: "session", version: 3, cwd: projectA }) + "\n"
+      );
+
+      process.chdir(projectB);
+
+      const manager = new PiSessionManager();
+      const managerAny = manager as any;
+      managerAny.sessionStore = new SessionStore({ dataDir, sessionsDir, serverVersion: "test" });
+
+      await managerAny.sessionStore.save({
+        sessionId: "foreign-session",
+        epoch: 2,
+        sessionFile: foreignSessionPath,
+        cwd: projectA,
+        createdAt: new Date().toISOString(),
+      });
+
+      const response = await manager.executeCommand({ type: "list_stored_sessions" } as any);
+      assert.strictEqual(response.success, true);
+      assert.ok(
+        !(response as any).data.sessions.some(
+          (session: any) => session.sessionId === "foreign-session"
+        ),
+        "Out-of-scope stored sessions must not be advertised"
+      );
+    } finally {
+      process.chdir(previousCwd);
+      rmSync(baseDir, { recursive: true, force: true });
+    }
+  });
+
   await test("session-store: discovers project-local session files", async () => {
     const dataDir = mkdtempSync(join(tmpdir(), "pi-session-store-discover-"));
     const sessionsDir = mkdtempSync(join(tmpdir(), "pi-session-store-global-"));
@@ -5271,10 +5616,13 @@ async function testSessionManager() {
     const sessions = (response as any).data.sessions;
     const found = sessions.find((s: any) => s.sessionId === "persist-test");
     assert.ok(found, "Should find persisted session");
-    // Note: fileExists may be false if the session file is in a different location
-    // The important thing is that the metadata was persisted
     assert.ok(found.sessionFile, "Should have session file path");
     assert.ok(found.createdAt, "Should have createdAt");
+    assert.strictEqual(
+      found.fileExists,
+      existsSync(found.sessionFile),
+      "fileExists must reflect actual filesystem state"
+    );
 
     // Cleanup
     await manager.executeCommand({ type: "delete_session", sessionId: "persist-test" });
