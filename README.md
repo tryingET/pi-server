@@ -83,6 +83,17 @@ src/
 - Session version is monotonic and mutation-sensitive.
 - Fingerprint excludes retry identity (`id`, `idempotencyKey`) for semantic equivalence.
 
+### Command contract registry
+
+`src/command-classification.ts` is the ADR-0021 source of truth for every `RpcCommand` type's timeout, abortability, mutation/read-only, execution-plane, scheduling, and replay-history sensitivity contract.
+
+When adding a command:
+
+1. Add the command to the `RpcCommand` union in `src/types.ts`.
+2. Add exactly one entry to `COMMAND_CONTRACTS` in `src/command-classification.ts`.
+3. Update the registry coverage expectation in `src/test-command-classification.ts`.
+4. Run `npm run build` and `npm test`; CI fails if the command union and contract registry drift.
+
 ### Key abstractions
 
 - **`SessionResolver`** — Interface for session access (enables test doubles, future clustering)

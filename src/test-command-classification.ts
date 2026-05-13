@@ -14,9 +14,64 @@ import {
   getCommandSchedulingClass,
   getRateLimitTarget,
   classifyCommand,
+  getRegisteredCommandTypes,
 } from "./command-classification.js";
 
 describe("command-classification", () => {
+  // ==========================================================================
+  // ADR-0021 CONTRACT COVERAGE
+  // ==========================================================================
+
+  describe("contract registry coverage", () => {
+    it("keeps the command contract registry as an explicit reviewable surface", () => {
+      assert.deepStrictEqual(getRegisteredCommandTypes(), [
+        "abort",
+        "abort_bash",
+        "abort_compaction",
+        "abort_retry",
+        "bash",
+        "compact",
+        "create_session",
+        "cycle_model",
+        "cycle_thinking_level",
+        "delete_session",
+        "export_html",
+        "extension_ui_response",
+        "follow_up",
+        "fork",
+        "get_available_models",
+        "get_command_history",
+        "get_commands",
+        "get_context_usage",
+        "get_fork_messages",
+        "get_last_assistant_text",
+        "get_messages",
+        "get_metrics",
+        "get_session_stats",
+        "get_skills",
+        "get_startup_recovery",
+        "get_state",
+        "get_tools",
+        "get_tree",
+        "health_check",
+        "list_session_files",
+        "list_sessions",
+        "list_stored_sessions",
+        "load_session",
+        "navigate_tree",
+        "new_session",
+        "prompt",
+        "set_auto_compaction",
+        "set_auto_retry",
+        "set_model",
+        "set_session_name",
+        "set_thinking_level",
+        "steer",
+        "switch_session",
+        "switch_session_file",
+      ]);
+    });
+  });
   // ==========================================================================
   // TIMEOUT CLASSIFICATION
   // ==========================================================================

@@ -214,6 +214,28 @@ export const COMMAND_CONTRACTS = {
   load_session: CONTROL_MUTATION_NO_TIMEOUT_CONTRACT,
 } satisfies Record<KnownCommandType, CommandContract>;
 
+type CommandContractKey = keyof typeof COMMAND_CONTRACTS;
+type MissingCommandContract = Exclude<KnownCommandType, CommandContractKey>;
+type ExtraCommandContract = Exclude<CommandContractKey, KnownCommandType>;
+type AssertNoDrift<T extends never> = T;
+
+/** Compile-time ADR-0021 coverage gate: every RpcCommand type has exactly one contract. */
+type _AllRpcCommandsHaveContracts = AssertNoDrift<MissingCommandContract>;
+type _AllCommandContractsAreRpcCommands = AssertNoDrift<ExtraCommandContract>;
+
+const REGISTERED_COMMAND_TYPES = Object.freeze(
+  Object.keys(COMMAND_CONTRACTS).sort()
+) as readonly KnownCommandType[];
+
+/**
+ * List command types currently covered by the canonical registry.
+ * Used by tests/docs as a reviewable CI drift surface; command behavior itself
+ * must still resolve through getCommandContract().
+ */
+export function getRegisteredCommandTypes(): readonly KnownCommandType[] {
+  return REGISTERED_COMMAND_TYPES;
+}
+
 const TARGETED_CONTROL_PLANE_COMMANDS = new Set<KnownCommandType>([
   "delete_session",
   "switch_session",
