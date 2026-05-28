@@ -1,0 +1,34 @@
+{
+  "engineering_core": {
+    "tool": "engineering-core",
+    "repository": "https://github.com/lightningralf/engineering-core",
+    "ref": "workspace-local-unpinned",
+    "catalog_command": "uv tool -n run --from ~/ai-society/core/engineering-core engineering-core catalog --pretty",
+    "list_disciplines_command": "uv tool -n run --from ~/ai-society/core/engineering-core engineering-core list-disciplines",
+    "list_templates_command": "uv tool -n run --from ~/ai-society/core/engineering-core engineering-core list-templates",
+    "disciplines": [
+      "validation",
+      "testing",
+      "security-privacy",
+      "documentation",
+      "dependency-governance",
+      "observability",
+      "specification-and-dsls",
+      "engineering-reasoning"
+    ],
+    "lane": "ts",
+    "command": "uv tool -n run --from ~/ai-society/core/engineering-core engineering-core show ts",
+    "loop_validation": {
+      "version": "repo-loop-validation-v1",
+      "contract_doc": "docs/engineering.local.md#repo-loop-validation",
+      "commands": {
+        "loop-doctor": "just loop-doctor",
+        "loop-verify-fast": "just loop-verify-fast",
+        "loop-impact-plan": "just loop-impact-plan",
+        "loop-impact-run": "just loop-impact-run",
+        "loop-impact-wide": "just loop-impact-wide",
+        "loop-landing-check": "just loop-landing-check"
+      }
+    }
+  }
+}
