@@ -33,7 +33,7 @@
   },
   "catalog": {
     "source": "packaged",
-    "version": "0.6.0"
+    "version": "0.7.0"
   },
   "checks": [
     {
@@ -90,7 +90,7 @@
   "consumer_commands_executed": false,
   "external_models_invoked": false,
   "mutations_performed": [],
-  "package_version": "0.6.0",
+  "package_version": "0.7.0",
   "pin_posture": "released-match",
   "repository": "/home/tryinget/ai-society/softwareco/owned/pi-server",
   "schema": "engineering-doctor-v1",
