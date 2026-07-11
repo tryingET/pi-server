@@ -2,7 +2,7 @@
   "engineering_core": {
     "tool": "engineering-core",
     "repository": "https://github.com/lightningralf/engineering-core",
-    "ref": "workspace-local-unpinned",
+    "ref": "v0.6.0",
     "catalog_command": "uv tool -n run --from ~/ai-society/core/engineering-core engineering-core catalog --pretty",
     "list_disciplines_command": "uv tool -n run --from ~/ai-society/core/engineering-core engineering-core list-disciplines",
     "list_templates_command": "uv tool -n run --from ~/ai-society/core/engineering-core engineering-core list-templates",
@@ -28,6 +28,20 @@
         "loop-impact-run": "just loop-impact-run",
         "loop-impact-wide": "just loop-impact-wide",
         "loop-landing-check": "just loop-landing-check"
+      }
+    },
+    "capability_contract": {
+      "version": "engineering-core-capabilities-v1",
+      "capabilities": {
+        "planning": {
+          "status": "declared",
+          "schema": "engineering-plan-v1"
+        },
+        "advisor": {
+          "status": "declared",
+          "request_schema": "engineering-advice-request-v1",
+          "response_schema": "engineering-advice-response-v1"
+        }
       }
     }
   }

@@ -1,0 +1,98 @@
+{
+  "authority": "static diagnostic only; no command execution or authority promotion",
+  "capabilities": {
+    "advisor": {
+      "declaration_status": "valid",
+      "evidence_status": "not-supplied",
+      "findings": [],
+      "observation_status": "observable",
+      "schemas": {
+        "request": "engineering-advice-request-v1",
+        "response": "engineering-advice-response-v1"
+      }
+    },
+    "closed_loop": {
+      "declaration_status": "absent",
+      "evidence_status": "not-supplied",
+      "findings": [],
+      "observation_status": "not-declared",
+      "schemas": {
+        "disposition": "engineering-recommendation-disposition-v1",
+        "receipt": "engineering-evidence-receipt-v1"
+      }
+    },
+    "planning": {
+      "declaration_status": "valid",
+      "evidence_status": "not-supplied",
+      "findings": [],
+      "observation_status": "observable",
+      "schemas": {
+        "plan": "engineering-plan-v1"
+      }
+    }
+  },
+  "catalog": {
+    "source": "packaged",
+    "version": "0.6.0"
+  },
+  "checks": [
+    {
+      "evidence": [],
+      "id": "advisor",
+      "status": "pass",
+      "summary": "advisor request built deterministically"
+    },
+    {
+      "evidence": [],
+      "id": "capability-schemas",
+      "status": "pass",
+      "summary": "capability contract: valid"
+    },
+    {
+      "evidence": [],
+      "id": "catalog",
+      "status": "pass",
+      "summary": "catalog and typed protocols loaded"
+    },
+    {
+      "evidence": [],
+      "id": "package-version",
+      "status": "pass",
+      "summary": "package and catalog versions match"
+    },
+    {
+      "evidence": [],
+      "id": "pin",
+      "status": "pass",
+      "summary": "pin posture: released-match"
+    },
+    {
+      "evidence": [],
+      "id": "plan",
+      "status": "pass",
+      "summary": "plan compiled deterministically"
+    },
+    {
+      "evidence": [],
+      "id": "policy",
+      "status": "pass",
+      "summary": "policy loaded"
+    },
+    {
+      "evidence": [
+        "/home/tryinget/ai-society/softwareco/owned/pi-server"
+      ],
+      "id": "target",
+      "status": "pass",
+      "summary": "target is a readable directory"
+    }
+  ],
+  "consumer_commands_executed": false,
+  "external_models_invoked": false,
+  "mutations_performed": [],
+  "package_version": "0.6.0",
+  "pin_posture": "released-match",
+  "repository": "/home/tryinget/ai-society/softwareco/owned/pi-server",
+  "schema": "engineering-doctor-v1",
+  "status": "healthy"
+}
