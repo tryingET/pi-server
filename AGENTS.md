@@ -1237,6 +1237,21 @@ const response = await executeCommand({ type: "get_metrics" });
 
 Comprehensive test suite exists. Run with `npm test`.
 
+### Hermetic agent-driven validation
+
+Tests exercise Pi session discovery. Automated agents and governed loops MUST NOT run `npm test`, `npm run ci`, or the repo loop landing gate against the operator's ambient `HOME`, because the global Pi session corpus is not a test fixture and can make discovery unbounded. Create fresh mode-0700 directories and preserve the full gate:
+
+```bash
+mkdir -p "$RUN_ROOT"/{home,agent,tmp}
+chmod 700 "$RUN_ROOT" "$RUN_ROOT"/{home,agent,tmp}
+env HOME="$RUN_ROOT/home" \
+  PI_CODING_AGENT_DIR="$RUN_ROOT/agent" \
+  TMPDIR="$RUN_ROOT/tmp" \
+  npm run ci
+```
+
+Use a task-owned evidence or temporary root for `RUN_ROOT`. This isolates external session state only; it does not permit skipping or weakening any gate.
+
 ### Test Structure
 
 | File | What it tests |
