@@ -239,8 +239,11 @@ Replay hits MUST NOT emit `command_accepted` or `command_started`.
 
 - Same `id` + same fingerprint → MUST replay prior outcome.
 - Same `id` + different fingerprint → MUST fail with conflict error.
+- When both `id` and `idempotencyKey` are present, the explicit `id` MUST be resolved first. The key is a retry alias only when that ID has no completed or in-flight record.
 
 ### 8.2 `idempotencyKey`
+
+These key rules apply only when no completed or in-flight explicit command-ID record exists; explicit-ID resolution takes precedence as defined in §8.1.
 
 - Scope is per session (server commands use server scope).
 - Same key + same fingerprint inside TTL → MUST replay prior outcome.
