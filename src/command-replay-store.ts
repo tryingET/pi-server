@@ -530,12 +530,48 @@ export class CommandReplayStore {
     const commandType = typeof command.type === "string" ? command.type : "unknown";
     const idempotencyKey = getCommandIdempotencyKey(command);
 
-    // 1. Check idempotency key cache
+    // 1. Resolve the explicit command ID first. It is the primary command
+    // identity; an idempotency key is only a retry alias and must never bypass
+    // an existing terminal or in-flight ID record.
+    if (id) {
+      const completed = this.commandOutcomes.get(id);
+      if (completed) {
+        if (!this.fingerprintsMatch(completed.fingerprint, fingerprint, command)) {
+          return {
+            kind: "conflict",
+            response: this.createConflictResponse(id, commandType, "id", id, completed.commandType),
+          };
+        }
+
+        return {
+          kind: "replay_cached",
+          response: this.cloneResponseForRequest({ ...completed.response, replayed: true }, id),
+        };
+      }
+
+      const inFlight = this.commandInFlightById.get(id);
+      if (inFlight) {
+        if (!this.fingerprintsMatch(inFlight.fingerprint, fingerprint, command)) {
+          return {
+            kind: "conflict",
+            response: this.createConflictResponse(id, commandType, "id", id, inFlight.commandType),
+          };
+        }
+
+        return {
+          kind: "replay_inflight",
+          promise: inFlight.promise.then((response) =>
+            this.cloneResponseForRequest({ ...response, replayed: true }, id)
+          ),
+        };
+      }
+    }
+
+    // 2. Only an unclaimed command ID may fall back to the idempotency alias.
     if (idempotencyKey) {
       const cacheKey = this.buildIdempotencyCacheKey(command, idempotencyKey);
       const cached = this.idempotencyCache.get(cacheKey);
       if (cached) {
-        // Fingerprint conflict?
         if (!this.fingerprintsMatch(cached.fingerprint, fingerprint, command)) {
           return {
             kind: "conflict",
@@ -549,7 +585,6 @@ export class CommandReplayStore {
           };
         }
 
-        // Replay cached response
         return {
           kind: "replay_cached",
           response: this.cloneResponseForRequest({ ...cached.response, replayed: true }, id),
@@ -580,48 +615,6 @@ export class CommandReplayStore {
       }
     }
 
-    // 2. Check for explicit command ID
-    if (id) {
-      // 2a. Check completed outcomes
-      const completed = this.commandOutcomes.get(id);
-      if (completed) {
-        // Fingerprint conflict?
-        if (!this.fingerprintsMatch(completed.fingerprint, fingerprint, command)) {
-          return {
-            kind: "conflict",
-            response: this.createConflictResponse(id, commandType, "id", id, completed.commandType),
-          };
-        }
-
-        // Replay completed response
-        return {
-          kind: "replay_cached",
-          response: this.cloneResponseForRequest({ ...completed.response, replayed: true }, id),
-        };
-      }
-
-      // 2b. Check in-flight commands
-      const inFlight = this.commandInFlightById.get(id);
-      if (inFlight) {
-        // Fingerprint conflict?
-        if (!this.fingerprintsMatch(inFlight.fingerprint, fingerprint, command)) {
-          return {
-            kind: "conflict",
-            response: this.createConflictResponse(id, commandType, "id", id, inFlight.commandType),
-          };
-        }
-
-        // Wait for in-flight to complete and replay
-        return {
-          kind: "replay_inflight",
-          promise: inFlight.promise.then((response) =>
-            this.cloneResponseForRequest({ ...response, replayed: true }, id)
-          ),
-        };
-      }
-    }
-
-    // No replay possible, proceed with execution
     return { kind: "proceed" };
   }
 

@@ -413,6 +413,103 @@ describe("command-replay-store", () => {
       }
     });
 
+    it("resolves explicit IDs before idempotency aliases across stored states", async () => {
+      const scenarios = [
+        { idState: "completed", keyState: "cached", winner: "key" },
+        { idState: "inflight", keyState: "inflight", winner: "key" },
+        { idState: "completed", keyState: "inflight", winner: "id" },
+        { idState: "inflight", keyState: "cached", winner: "id" },
+      ] as const;
+
+      for (const scenario of scenarios) {
+        const store = new CommandReplayStore();
+        const commandById = makeCommand({ id: "same-id", type: "list_sessions" });
+        const commandByKey = makeCommand({
+          id: "key-origin",
+          type: "health_check",
+          idempotencyKey: "k-health",
+        });
+        const compoundCommand = makeCommand({
+          id: "same-id",
+          type: scenario.winner === "id" ? "list_sessions" : "health_check",
+          idempotencyKey: "k-health",
+        });
+        const idFingerprint = store.getCommandFingerprint(commandById);
+        const keyFingerprint = store.getCommandFingerprint(commandByKey);
+        const idResponse = makeResponse({
+          id: "same-id",
+          command: "list_sessions",
+          success: true,
+          data: { source: "command-id" } as any,
+        });
+        const keyResponse = makeResponse({
+          id: "key-origin",
+          command: "health_check",
+          success: true,
+        });
+
+        if (scenario.idState === "completed") {
+          store.storeCommandOutcome({
+            commandId: "same-id",
+            commandType: "list_sessions",
+            laneKey: "server",
+            fingerprint: idFingerprint,
+            success: true,
+            response: idResponse,
+            finishedAt: Date.now(),
+          });
+        } else {
+          store.registerInFlight("same-id", {
+            commandType: "list_sessions",
+            laneKey: "server",
+            fingerprint: idFingerprint,
+            promise: Promise.resolve(idResponse),
+          });
+        }
+
+        if (scenario.keyState === "cached") {
+          store.cacheIdempotencyResult({
+            command: commandByKey,
+            idempotencyKey: "k-health",
+            commandType: "health_check",
+            fingerprint: keyFingerprint,
+            response: keyResponse,
+          });
+        } else {
+          store.registerIdempotencyInFlight(commandByKey, "k-health", {
+            commandType: "health_check",
+            laneKey: "server",
+            fingerprint: keyFingerprint,
+            promise: Promise.resolve(keyResponse),
+          });
+        }
+
+        const fingerprint = scenario.winner === "id" ? idFingerprint : keyFingerprint;
+        const result = store.checkReplay(compoundCommand, fingerprint);
+        const label = `${scenario.idState} ID / ${scenario.keyState} key`;
+        if (scenario.winner === "key") {
+          assert.strictEqual(result.kind, "conflict", label);
+          if (result.kind === "conflict") {
+            assert.ok(result.response.error?.includes("Conflicting id 'same-id'"), label);
+          }
+          continue;
+        }
+
+        let response: RpcResponse;
+        if (scenario.idState === "completed") {
+          assert.strictEqual(result.kind, "replay_cached", label);
+          if (result.kind !== "replay_cached") continue;
+          response = result.response;
+        } else {
+          assert.strictEqual(result.kind, "replay_inflight", label);
+          if (result.kind !== "replay_inflight") continue;
+          response = await result.promise;
+        }
+        assert.strictEqual(response.command, "list_sessions", label);
+        assert.deepStrictEqual((response as any).data, { source: "command-id" }, label);
+      }
+    });
+
     it("returns replay_inflight for matching in-flight idempotency key", async () => {
       const store = new CommandReplayStore();
       const command1 = makeCommand({
