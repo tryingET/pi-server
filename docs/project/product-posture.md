@@ -24,6 +24,8 @@ The protocol remains the architecture boundary: client-visible behavior belongs 
 
 The repository contains unit, integration, and fuzz suites plus a full `npm run ci` gate. Accepted ADRs and implementation surfaces cover atomic terminal outcomes, session locking, transport backpressure, bounded stores, authentication, observability, structured logging, and the durable command-journal foundation.
 
+For the bounded generated-state follow-up, `git check-ignore` confirmed that observed `.ontology/` runtime files and `.pi/sessions/` fixtures are ignored while `.pi/prompts/commit.md` remains visible for intentional review. `just loop-impact-run` passed typecheck, lint, policy JSON validation, and strict docs validation. This proof covers only the two task-scoped files and does not green unrelated dirty paths.
+
 For Nexus task `#4609` iteration one, the configured-agent-root round trip is covered across create, metadata rebootstrap, background discovery, list, load, and switch. `just loop-impact-run` passed the fast code/docs gate, and `just loop-impact-wide` passed the full local CI-equivalent gate in an isolated `HOME`/Pi-agent sandbox: build, typecheck, lint, format, consistency, 220 main tests, 49 command-classification tests, 32 integration tests, 17 fuzz tests, and strict docs validation.
 
 For iteration two, focused red tests reproduced the completed-ID and in-flight-ID precedence bypasses. After the initial fix, the replay-store module passed 41/41 tests across cached and in-flight ID/key combinations; `just loop-impact-run`, targeted formatting, and `npm run build` also passed. An earlier independent read-only diff review found no blocking defect, and its requested positive cross-state cases were incorporated.
@@ -38,9 +40,15 @@ The leading broader reliability gap is replay retention: `maxCommandOutcomes` ca
 
 Terminal policy rejection now has an explicit degraded contract rather than a privacy/determinism ambiguity: policy authority wins, committed truth remains replayable in the current process, and a later restart returns a conservative quarantine failure when policy permits that recovery record, preventing re-execution without reconstructing the unpersisted response. If policy rejects the recovery record, startup fails closed. This is deliberately not proof that the business mutation failed. Exact cross-restart replay after policy rejection would require a separate owner-approved lossless persistence representation.
 
-Separate lifecycle findings remain around cancellable background discovery and failed-start ownership. They should not be bundled into replay-retention work. The working tree also contains unrelated pre-existing changes that task `#4609` must continue to preserve.
+Separate lifecycle findings remain around cancellable background discovery and failed-start ownership. They should not be bundled into replay-retention work. The generated-state boundary reduces accidental staging but does not move fixtures out of the repository, assert post-test cleanliness, refresh the stale handoff, or establish generated-changelog metadata ownership. Those deep-review findings are outside task `#4609`'s path authority and remain owner-routed gaps rather than silently claimed closure. The working tree also contains unrelated pre-existing changes that task `#4609` must continue to preserve.
 
 ## Authority and provenance boundaries
+
+### Repository-local generated-state boundary
+
+`.ontology/` and `.pi/sessions/` are local generated runtime state, not product truth, AK evidence, or review artifacts. They are ignored to prevent accidental staging, while `.pi/prompts/` remains visible so an intentional repository prompt still requires explicit review.
+
+This is a staging-safety boundary, not proof that tests avoid repository-local fixtures or that the worktree is clean after interruption. The deep-review findings involving `src/test.ts`, `next_session_prompt.md`, and generated `CHANGELOG.md` metadata are outside task `#4609`'s allowed paths and remain explicitly unresolved; this bounded slice does not claim otherwise.
 
 - `PROTOCOL.md` and protocol/type/validation tests own client-visible wire semantics.
 - Product posture can map the observed precedence behavior but cannot amend the wire contract. This iteration preserved the protected pre-existing `PROTOCOL.md` changes; any normative precedence wording requires authorization at that owner surface.
@@ -53,4 +61,4 @@ Separate lifecycle findings remain around cancellable background discovery and f
 
 ## Next highest-leverage frontier
 
-Before choosing new product work, obtain the fresh successful two-iteration Nexus receipt and run the repo-declared final landing gate for task `#4609`. The next product slice should then follow AK `#4642`'s authority over replay retention while preserving policy-approved journal bytes, first-terminal authority, pre-yield alias claims, structured scope separation, explicit-ID-first resolution, and the configured-agent session-root invariant. Leave completion and evidence authority with AK.
+Before choosing new product work, obtain the fresh successful two-iteration Nexus receipt and run the repo-declared final landing gate for task `#4609`. Any follow-up to the operational-truth findings must first gain AK and source-owner scope for the affected files; it must not be folded into replay-retention work by convenience. After this task closes, the next product slice should follow AK `#4642`'s authority over replay retention while preserving policy-approved journal bytes, first-terminal authority, pre-yield alias claims, structured scope separation, explicit-ID-first resolution, and the configured-agent session-root invariant. Leave completion and evidence authority with AK.
