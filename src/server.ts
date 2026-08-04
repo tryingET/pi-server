@@ -12,7 +12,7 @@
 import fs from "fs";
 import * as readline from "readline";
 import { WebSocketServer, WebSocket } from "ws";
-import { PiSessionManager } from "./session-manager.js";
+import { PiSessionManager, type SessionDeletionReceipt } from "./session-manager.js";
 import type { DurableCommandJournalOptions } from "./command-journal.js";
 import type { RpcCommand, RpcResponse, Subscriber, RpcBroadcast } from "./types.js";
 import { getSessionId as getSessionIdFromCmd, isCreateSessionResponse } from "./types.js";
@@ -204,7 +204,9 @@ export function sendWithStdioBackpressure(
       if (!state.drainHandlerRegistered) {
         state.drainHandlerRegistered = true;
         process.stdout.once("drain", () => {
-          state.hasBackpressure = false;
+          if (!state.broken) {
+            state.hasBackpressure = false;
+          }
           state.drainHandlerRegistered = false;
         });
       }
@@ -212,7 +214,10 @@ export function sendWithStdioBackpressure(
 
     return true;
   } catch (error) {
-    // If write throws, stdout is broken
+    // A synchronous write failure is terminal for this stdio channel. Keep the
+    // latch set even if a previously registered drain callback fires later.
+    state.broken = true;
+    state.hasBackpressure = true;
     if (isCritical) {
       // For critical messages, try to log to stderr as fallback
       console.error(`[stdio] Critical message failed:`, error);
@@ -455,74 +460,106 @@ export class PiServer {
       });
     }
 
-    // Start WebSocket server
-    this.wss = new WebSocketServer({ port });
-    this.setupWebSocket(this.wss);
-
-    await new Promise<void>((resolve, reject) => {
-      const onListening = () => {
-        this.wss?.off("error", onError);
-        resolve();
-      };
-      const onError = (error: Error) => {
-        this.wss?.off("listening", onListening);
-        reject(error);
-      };
-
-      this.wss?.once("listening", onListening);
-      this.wss?.once("error", onError);
-    }).catch((error) => {
-      throw new Error(
-        `Failed to start WebSocket server on port ${port}: ${error instanceof Error ? error.message : String(error)}`
-      );
-    });
-
-    // Setup stdio transport
-    this.registerStdoutErrorHandler();
     try {
+      // Start WebSocket server
+      this.wss = new WebSocketServer({ port });
+      this.setupWebSocket(this.wss);
+
+      await new Promise<void>((resolve, reject) => {
+        const onListening = () => {
+          this.wss?.off("error", onError);
+          resolve();
+        };
+        const onError = (error: Error) => {
+          this.wss?.off("listening", onListening);
+          reject(error);
+        };
+
+        this.wss?.once("listening", onListening);
+        this.wss?.once("error", onError);
+      }).catch((error) => {
+        throw new Error(
+          `Failed to start WebSocket server on port ${port}: ${error instanceof Error ? error.message : String(error)}`
+        );
+      });
+
+      // Setup stdio transport
+      this.registerStdoutErrorHandler();
       this.stdinInterface = await this.setupStdio();
+
+      // ADR-0007: Start periodic session metadata cleanup (every hour)
+      this.sessionManager.startSessionCleanup(3600000);
+
+      // Start periodic rate limit timestamp cleanup (every 5 minutes)
+      this.sessionManager.getGovernor().startPeriodicCleanup(300000);
+
+      // Broadcast server_ready
+      const readyEvent: RpcBroadcast = {
+        type: "server_ready",
+        data: {
+          serverVersion: SERVER_VERSION,
+          protocolVersion: PROTOCOL_VERSION,
+          transports: ["websocket", "stdio"],
+        },
+      };
+      this.sessionManager.broadcast(JSON.stringify(readyEvent));
+
+      // Optional convenience event: startup recovery summary.
+      // Endpoint-first flow remains canonical via get_startup_recovery.
+      if (this.startupRecoverySummaryEventEnabled) {
+        const startupRecoveryEvent: RpcBroadcast =
+          this.sessionManager.getStartupRecoverySummaryEvent({
+            includeSensitiveData: this.startupRecoverySummaryIncludeSensitiveData,
+          });
+        this.sessionManager.broadcast(JSON.stringify(startupRecoveryEvent));
+      }
+
+      // Record server start metric
+      this.metrics.event(MetricNames.EVENT_SESSION_CREATED, { event: "server_ready" });
+
+      this.logger.info("Server started", {
+        version: SERVER_VERSION,
+        protocol: PROTOCOL_VERSION,
+        port,
+        transports: ["websocket", "stdio"],
+      });
     } catch (error) {
+      // Startup is transactional across acquired transport/timer resources.
+      this.sessionManager.stopSessionCleanup();
+      this.sessionManager.getGovernor().stopPeriodicCleanup();
+      this.sessionManager.markRuntimeDisposed();
+      this.sessionManager.disposeAllSessions();
+
+      if (this.stdinInterface) {
+        this.stdinInterface.close();
+        this.stdinInterface = null;
+      }
       this.unregisterStdoutErrorHandler();
+
+      if (this.wss) {
+        const wss = this.wss;
+        this.wss = null;
+
+        for (const client of wss.clients) {
+          try {
+            client.terminate();
+          } catch {
+            // Best effort during failed startup unwind.
+          }
+        }
+
+        await new Promise<void>((resolve) => {
+          try {
+            wss.close(() => resolve());
+          } catch {
+            // close() throws when the underlying server never reached listening.
+            resolve();
+          }
+        });
+      }
+
       throw error;
     }
-
-    // ADR-0007: Start periodic session metadata cleanup (every hour)
-    this.sessionManager.startSessionCleanup(3600000);
-
-    // Start periodic rate limit timestamp cleanup (every 5 minutes)
-    this.sessionManager.getGovernor().startPeriodicCleanup(300000);
-
-    // Broadcast server_ready
-    const readyEvent: RpcBroadcast = {
-      type: "server_ready",
-      data: {
-        serverVersion: SERVER_VERSION,
-        protocolVersion: PROTOCOL_VERSION,
-        transports: ["websocket", "stdio"],
-      },
-    };
-    this.sessionManager.broadcast(JSON.stringify(readyEvent));
-
-    // Optional convenience event: startup recovery summary.
-    // Endpoint-first flow remains canonical via get_startup_recovery.
-    if (this.startupRecoverySummaryEventEnabled) {
-      const startupRecoveryEvent: RpcBroadcast = this.sessionManager.getStartupRecoverySummaryEvent(
-        {
-          includeSensitiveData: this.startupRecoverySummaryIncludeSensitiveData,
-        }
-      );
-      this.sessionManager.broadcast(JSON.stringify(startupRecoveryEvent));
-    }
-
-    // Record server start metric
-    this.metrics.event(MetricNames.EVENT_SESSION_CREATED, { event: "server_ready" });
-
-    this.logger.info("Server started", {
-      version: SERVER_VERSION,
-      protocol: PROTOCOL_VERSION,
-      port,
-      transports: ["websocket", "stdio"],
-    });
   }
 
   /**
@@ -725,13 +762,16 @@ export class PiServer {
   }
 
   private unregisterStdoutErrorHandler(): void {
-    if (!this.stdoutErrorHandler) {
-      return;
+    if (this.stdoutErrorHandler) {
+      process.stdout.off("error", this.stdoutErrorHandler);
+      this.stdoutErrorHandler = null;
     }
 
-    process.stdout.off("error", this.stdoutErrorHandler);
-    this.stdoutErrorHandler = null;
+    // A stopped/failed transport must not carry terminal backpressure state
+    // into a later registration attempt.
     this.stdioState.broken = false;
+    this.stdioState.hasBackpressure = false;
+    this.stdioState.drainHandlerRegistered = false;
   }
 
   // ==========================================================================
@@ -1085,11 +1125,18 @@ export class PiServer {
     subscriber: Subscriber,
     respond: (response: RpcResponse) => boolean | undefined
   ): Promise<void> {
-    // Execute command
+    const deletionReceipts: SessionDeletionReceipt[] = [];
+
+    // Execute command. The deletion receipt is emitted only by the execution
+    // that commits the epoch transition; replay cannot manufacture one.
     const response = await this.sessionManager.executeCommand(command, {
       principal: subscriber.identity,
+      onSessionDeleted: (receipt) => {
+        deletionReceipts.push(receipt);
+      },
     });
     const delivered = respond(response);
+    const deletionReceipt = deletionReceipts[0];
 
     // Handle subscription AFTER successful switch_session
     if (delivered !== false && command.type === "switch_session" && response.success) {
@@ -1100,7 +1147,11 @@ export class PiServer {
     }
 
     // Broadcast session lifecycle events
-    if (command.type === "create_session" && isCreateSessionResponse(response)) {
+    if (
+      command.type === "create_session" &&
+      response.replayed !== true &&
+      isCreateSessionResponse(response)
+    ) {
       const broadcast: RpcBroadcast = {
         type: "session_created",
         data: {
@@ -1109,10 +1160,10 @@ export class PiServer {
         },
       };
       this.sessionManager.broadcast(JSON.stringify(broadcast));
-    } else if (command.type === "delete_session" && response.success) {
+    } else if (command.type === "delete_session" && deletionReceipt) {
       const broadcast: RpcBroadcast = {
         type: "session_deleted",
-        data: { sessionId: getSessionIdFromCmd(command)! },
+        data: { sessionId: deletionReceipt.sessionId },
       };
       this.sessionManager.broadcast(JSON.stringify(broadcast));
     }

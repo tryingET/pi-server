@@ -395,13 +395,15 @@ export class CommandReplayStore {
    * Store a completed command outcome.
    */
   storeCommandOutcome(outcome: CommandOutcomeRecord): void {
-    const existed = this.commandOutcomes.has(outcome.commandId);
-    this.commandOutcomes.set(outcome.commandId, outcome);
-
-    if (!existed) {
-      this.commandOutcomeOrder.push(outcome.commandId);
-      this.trimCommandOutcomes();
+    // The first terminal response is authoritative. A late completion or an
+    // early-rejection path must never replace it before replay checking.
+    if (this.commandOutcomes.has(outcome.commandId)) {
+      return;
     }
+
+    this.commandOutcomes.set(outcome.commandId, outcome);
+    this.commandOutcomeOrder.push(outcome.commandId);
+    this.trimCommandOutcomes();
   }
 
   /**
@@ -525,7 +527,7 @@ export class CommandReplayStore {
    */
   checkReplay(command: RpcCommand, fingerprint: string): ReplayCheckResult {
     const id = getCommandId(command);
-    const commandType = command.type;
+    const commandType = typeof command.type === "string" ? command.type : "unknown";
     const idempotencyKey = getCommandIdempotencyKey(command);
 
     // 1. Check idempotency key cache

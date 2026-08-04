@@ -16,7 +16,7 @@ import fs from "fs/promises";
 import fsRegular from "fs";
 import path from "path";
 import type { SessionInfo } from "./types.js";
-import { getDefaultAllowedSessionDirectories } from "./validation.js";
+import { resolveSessionPathCapabilities } from "./validation.js";
 
 /** Metadata persisted for each session. */
 export interface StoredSessionMetadata {
@@ -71,8 +71,10 @@ export interface SessionGroup {
 export interface SessionStoreConfig {
   /** Directory to store session metadata (default: ~/.pi/agent/server/) */
   dataDir?: string;
-  /** Directory where pi-coding-agent stores sessions (default: ~/.pi/agent/sessions/) */
+  /** Directory where pi-coding-agent stores sessions (default: configured Pi agent sessions root) */
   sessionsDir?: string;
+  /** Canonical roots authorized for session discovery and loading. */
+  allowedSessionDirectories?: readonly string[];
   /** Server version for migration tracking */
   serverVersion?: string;
 }
@@ -135,6 +137,7 @@ const ACTIVE_METADATA_LOCKS = new Set<string>();
 export class SessionStore {
   private readonly dataDir: string;
   private readonly sessionsDir: string;
+  private readonly allowedSessionDirectories: readonly string[];
   private readonly serverVersion: string;
   private readonly metadataPath: string;
   private readonly metadataLockPath: string;
@@ -161,9 +164,16 @@ export class SessionStore {
   private mutationChain: Promise<void> = Promise.resolve();
 
   constructor(config: SessionStoreConfig = {}) {
+    const pathCapabilities = resolveSessionPathCapabilities({ cwd: process.cwd() });
+
     this.dataDir = config.dataDir ?? path.join(process.env.HOME ?? "~", ".pi", "agent", "server");
-    this.sessionsDir =
-      config.sessionsDir ?? path.join(process.env.HOME ?? "~", ".pi", "agent", "sessions");
+    this.sessionsDir = path.resolve(config.sessionsDir ?? pathCapabilities.sessionsDir);
+    this.allowedSessionDirectories = Array.from(
+      new Set([
+        this.sessionsDir,
+        ...(config.allowedSessionDirectories ?? pathCapabilities.allowedSessionDirectories),
+      ])
+    );
     this.serverVersion = config.serverVersion ?? DEFAULT_SERVER_VERSION;
     this.metadataPath = path.join(this.dataDir, METADATA_FILE);
     this.metadataLockPath = `${this.metadataPath}.lock`;
@@ -617,9 +627,7 @@ export class SessionStore {
   // ==========================================================================
 
   private getDiscoveryRoots(): string[] {
-    return Array.from(
-      new Set([this.sessionsDir, ...getDefaultAllowedSessionDirectories(process.cwd())])
-    );
+    return [...this.allowedSessionDirectories];
   }
 
   private async collectSessionFiles(rootDir: string): Promise<string[]> {

@@ -45,7 +45,7 @@ We establish a new architectural source of truth:
 
 > **Every command must resolve through a canonical command contract before execution, journaling, timeout handling, replay conflict detection, or external history export.**
 
-This ADR introduces five linked rules.
+This ADR introduces six linked rules.
 
 ---
 
@@ -164,6 +164,36 @@ If an integration surface exposes `dispose()`, shutdown must invoke it.
 
 ---
 
+## 6. Terminal outcomes have one first-write-wins boundary
+
+Cross-cutting terminal behavior cannot be left to scattered early returns. Commands can finish through normal execution, timeout, replay, validation, shutdown, rate limiting, capacity rejection, or unexpected failure.
+
+### Rule
+
+Every live-runtime terminal response flows through one terminalization seam that decides:
+
+- whether `command_finished` is appended durably
+- whether the terminal lifecycle event is broadcast
+- whether an explicit-ID outcome is stored
+- whether an idempotency result is cached
+
+The first stored terminal outcome for an explicit command ID is authoritative. Later code paths and late completions cannot replace it.
+
+### Ordering
+
+Retained replay identity is checked before pre-admission failures can overwrite it, then checked again after durable initialization because initialization may rehydrate outcomes. Replay/conflict paths emit terminal visibility without appending new durable lifecycle state.
+
+First-seen validation, shutdown, rate-limit, and capacity failures append standalone `command_finished` records when durability is available. Completed runtime disposal is the hard exception: requests after disposal do not allocate identity, reopen the journal, emit lifecycle callbacks, or mutate replay state.
+
+### Transport and lifecycle application
+
+- failed server startup unwinds acquired transports, timers, and durable writer ownership
+- synchronous stdout write failure latches the channel as broken until transport teardown
+- deletion broadcast uses an epoch-specific commit receipt, so cleanup warnings do not hide a committed deletion and replay cannot manufacture another event
+- replayed successful creation responses do not republish `session_created`
+
+---
+
 ## Resulting Architecture
 
 ```text
@@ -207,22 +237,28 @@ Transport Layer
 1. A non-abortable mutation must not return a timeout response and then commit later.
 2. Timeout-wrapped commands must have an explicit operationally safe timeout policy.
 3. Command classification must be derivable from one module, not reconstructed ad hoc.
+4. Every live-runtime terminal response must pass through the canonical terminalization seam.
 
 ### Replay invariants
 
-4. Semantically identical commands must produce the same replay identity independent of key order.
-5. Replay identity must not expose plaintext semantic payloads in durable history.
-6. Legacy replay identities must remain readable during migration.
+5. Semantically identical commands must produce the same replay identity independent of key order.
+6. Replay identity must not expose plaintext semantic payloads in durable history.
+7. Legacy replay identities must remain readable during migration.
+8. The first stored terminal outcome for an explicit ID must not be overwritten.
+9. Replay/conflict must not append duplicate durable lifecycle state.
+10. Disposed runtimes must not repopulate replay, idempotency, or journal state.
 
 ### Transport invariants
 
-7. Built-in stdio `stdout` output must always be parseable protocol JSON.
-8. Human-readable diagnostics must not be emitted on the stdio protocol channel.
+11. Built-in stdio `stdout` output must always be parseable protocol JSON.
+12. Human-readable diagnostics must not be emitted on the stdio protocol channel.
+13. Partial startup failure must release every acquired transport and durable writer resource.
 
 ### Lifecycle invariants
 
-9. Process-global env sanitization must behave as if session creation were serialized.
-10. Server shutdown must release pluggable observability resources, not only flush them.
+14. Process-global env sanitization must behave as if session creation were serialized.
+15. Server shutdown must release pluggable observability resources, not only flush them.
+16. Session lifecycle broadcasts must reflect committed epoch transitions, not cleanup-status booleans or replayed responses.
 
 ---
 
@@ -247,6 +283,7 @@ Transport Layer
 
 - custom third-party logger/sink implementations can still violate stdout purity if they write directly to `stdout`
 - future commands added without consulting the contract registry would reintroduce drift
+- in-memory outcome retention remains bounded; indefinite replay after retention eviction needs an explicit durable-retention or admission policy rather than an unbounded map
 
 ---
 
@@ -271,6 +308,14 @@ Key regression coverage includes:
 - legacy raw fingerprints still replay correctly
 - logger and metrics sink `dispose()` run during shutdown
 - concurrent AgentSession creation keeps npm env sanitization serialized
+- explicit-ID validation and shutdown rejections cannot overwrite an earlier outcome
+- pre-admission validation outcomes rehydrate through the durable journal
+- fail-closed terminal append failures replay the first stored outcome
+- disposed late completions cannot reacquire journal ownership
+- failed startup releases WebSocket, stdout-listener, timer, and journal resources
+- stdout broken state survives drain and is reset only by transport teardown
+- committed deletion broadcasts despite cleanup warnings and remains ABA-safe under retained replay
+- replayed creation responses do not duplicate `session_created`
 
 ---
 
@@ -301,6 +346,7 @@ Primary regression coverage lives in:
 1. Introduce a hard output-channel abstraction for custom sinks/loggers so stdout purity can be enforced universally, not only for built-ins.
 2. Consider exposing `historySensitivity` more explicitly in type-level command metadata so new command additions fail review without classification.
 3. If replay history grows beyond current expectations, add an explicit fingerprint schema version field in durable export rather than relying only on prefix naming.
+4. Define the long-horizon explicit-ID contract after bounded in-memory outcome eviction, including whether durable lookup is mandatory or new explicit-ID admission must fail closed once retention is exhausted.
 
 ## Related ADRs
 

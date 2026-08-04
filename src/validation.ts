@@ -14,6 +14,7 @@ export interface ValidationError {
 
 import fs from "fs";
 import path from "path";
+import { getAgentDir } from "@mariozechner/pi-coding-agent";
 import { SYNTHETIC_ID_PREFIX } from "./command-replay-store.js";
 import { getExtensionUIResponseValidationError } from "./extension-ui.js";
 
@@ -40,13 +41,27 @@ const SESSION_FILE_PROBE_BYTES = 64 * 1024;
 
 export interface SessionFileAccessOptions {
   /** Explicitly allowed root directories for session files. */
-  allowedDirs?: string[];
+  allowedDirs?: readonly string[];
   /** Base working directory used to derive default project-local roots. */
   cwd?: string;
   /** Require the target path to already exist on disk. */
   requireExistingFile?: boolean;
   /** Require the target file to look like a session file header. */
   requireSessionHeader?: boolean;
+}
+
+export interface SessionPathCapabilitiesOptions {
+  /** Server working directory used to derive project-local session roots. */
+  cwd?: string;
+  /** Pi runtime agent directory. Defaults to pi-coding-agent's configured directory. */
+  agentDir?: string;
+}
+
+/** Canonical runtime-owned roots shared by persistence, inventory, and path authorization. */
+export interface SessionPathCapabilities {
+  agentDir: string;
+  sessionsDir: string;
+  allowedSessionDirectories: string[];
 }
 
 function hasControlCharacters(value: string): boolean {
@@ -89,14 +104,22 @@ function isPathWithin(candidatePath: string, parentPath: string): boolean {
 }
 
 /**
- * Derive default allowed session roots for the active server process.
+ * Resolve the canonical Pi runtime session root and project-local authorization roots.
  *
- * This keeps project-local access anchored to the current working tree rather
- * than accepting any absolute path that merely contains `/.pi/sessions/`.
+ * The Pi runtime owns the agent directory (including PI_CODING_AGENT_DIR handling).
+ * Capturing that root once lets creation, persistence discovery, inventory visibility,
+ * and load/switch authorization use the same capability set.
  */
-export function getDefaultAllowedSessionDirectories(cwd = process.cwd()): string[] {
-  const dirs = new Set<string>();
+export function resolveSessionPathCapabilities(
+  options: SessionPathCapabilitiesOptions = {}
+): SessionPathCapabilities {
+  const cwd = options.cwd ?? process.cwd();
+  const agentDir = resolveCanonicalPath(options.agentDir ?? getAgentDir());
+  const sessionsDir = resolveCanonicalPath(path.join(agentDir, "sessions"));
+  const dirs = new Set<string>([sessionsDir]);
 
+  // Preserve access to the historical default root when a custom Pi agent
+  // directory is configured so existing sessions remain loadable.
   const home = process.env.HOME ?? "";
   if (home) {
     dirs.add(resolveCanonicalPath(path.join(home, ".pi", "agent", "sessions")));
@@ -121,7 +144,16 @@ export function getDefaultAllowedSessionDirectories(cwd = process.cwd()): string
     current = parent;
   }
 
-  return Array.from(dirs);
+  return {
+    agentDir,
+    sessionsDir,
+    allowedSessionDirectories: Array.from(dirs),
+  };
+}
+
+/** Derive default allowed session roots for the active server process. */
+export function getDefaultAllowedSessionDirectories(cwd = process.cwd()): string[] {
+  return resolveSessionPathCapabilities({ cwd }).allowedSessionDirectories;
 }
 
 function looksLikeSessionHeader(header: Record<string, unknown> | null): boolean {
@@ -224,7 +256,10 @@ function validatePath(path: string, fieldName: string): string | null {
  * @param allowedDirs - Optional array of allowed directories (defaults to standard locations)
  * @returns Error message if invalid, null if valid
  */
-export function validateSessionPath(sessionPath: string, allowedDirs?: string[]): string | null {
+export function validateSessionPath(
+  sessionPath: string,
+  allowedDirs?: readonly string[]
+): string | null {
   // First check for dangerous path components
   const pathError = validatePath(sessionPath, "sessionPath");
   if (pathError) return pathError;
@@ -262,7 +297,7 @@ export function validateSessionPath(sessionPath: string, allowedDirs?: string[])
     }
   }
 
-  return "sessionPath must be under an allowed session directory for this server (e.g. ~/.pi/agent/sessions/ or this project's .pi/sessions/)";
+  return "sessionPath must be under an allowed session directory for this server (the configured Pi agent sessions root or this project's .pi/sessions/)";
 }
 
 /**

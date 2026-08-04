@@ -465,6 +465,16 @@ export class DurableCommandJournal {
     this.lockPath = `${this.journalPath}.lock`;
   }
 
+  private throwIfInitializationAborted(signal?: AbortSignal): void {
+    if (!signal?.aborted) {
+      return;
+    }
+
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new Error("Durable command journal initialization aborted");
+  }
+
   isEnabled(): boolean {
     return this.enabled;
   }
@@ -1315,7 +1325,9 @@ export class DurableCommandJournal {
     }
   }
 
-  async initialize(): Promise<CommandJournalRecoverySummary> {
+  async initialize(signal?: AbortSignal): Promise<CommandJournalRecoverySummary> {
+    this.throwIfInitializationAborted(signal);
+
     if (!this.enabled) {
       this.initialized = true;
       return {
@@ -1346,9 +1358,12 @@ export class DurableCommandJournal {
     }
 
     await this.ensureJournalFileExists();
+    this.throwIfInitializationAborted(signal);
     this.acquireProcessLock();
 
     try {
+      this.throwIfInitializationAborted(signal);
+
       // Apply retention/compaction policy before startup rehydration so recovered
       // outcomes match retained durable history.
       this.compactNow();
@@ -1374,6 +1389,7 @@ export class DurableCommandJournal {
         });
 
         for await (const rawLine of rl) {
+          this.throwIfInitializationAborted(signal);
           const line = rawLine.trim();
           if (!line) continue;
 
@@ -1433,11 +1449,14 @@ export class DurableCommandJournal {
         fileStream.destroy();
       }
 
+      this.throwIfInitializationAborted(signal);
+
       const recoveredInFlight: RecoveredInFlightCommand[] = [];
 
       // Deterministic crash recovery policy (foundation):
       // Pre-crash in-flight explicit commands are marked failed and journaled as terminal outcomes.
       for (const state of inFlight.values()) {
+        this.throwIfInitializationAborted(signal);
         if (!state.explicitId || state.commandId.startsWith(SYNTHETIC_ID_PREFIX)) {
           continue;
         }
@@ -1476,6 +1495,8 @@ export class DurableCommandJournal {
         });
 
         const recoveryEntry: CommandJournalEntryV1 = {
+          // The signal is checked again immediately before the recovery append
+          // below; this object construction itself is effect-free.
           schemaVersion: CURRENT_JOURNAL_SCHEMA_VERSION,
           kind: "command_lifecycle",
           phase: "command_finished",
@@ -1502,10 +1523,12 @@ export class DurableCommandJournal {
           recoveryReason: "restart_inflight_marked_failed",
         };
 
+        this.throwIfInitializationAborted(signal);
         this.appendRecord(this.applyPersistenceRedaction(recoveryEntry));
       }
 
       const recoveredOutcomes = [...recoveredOutcomeById.values()];
+      this.throwIfInitializationAborted(signal);
       this.recoveredOutcomes = recoveredOutcomes.length;
       this.recoveredInFlightFailures = recoveredInFlight.length;
       this.initialized = true;

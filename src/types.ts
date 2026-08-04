@@ -293,6 +293,7 @@ export type ServerResponse =
         bashCircuitBreaker: {
           enabled: boolean;
           globalState: string;
+          globalFailureCount: number;
           sessionCount: number;
           openSessionCount: number;
           totalCalls: number;

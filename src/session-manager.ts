@@ -53,6 +53,7 @@ import {
   normalizeSessionNameInput,
   validateSessionFileAccess,
   validateSessionPath,
+  resolveSessionPathCapabilities,
 } from "./validation.js";
 import { ResourceGovernor, DEFAULT_CONFIG } from "./resource-governor.js";
 import {
@@ -172,6 +173,8 @@ export interface SessionManagerRuntimeOptions {
   idempotencyTtlMs?: number;
   /** Server version for session metadata tracking */
   serverVersion?: string;
+  /** Explicit Pi runtime agent directory (defaults to pi-coding-agent configuration). */
+  agentDir?: string;
   /** Circuit breaker configuration (optional, uses defaults if not provided) */
   circuitBreakerConfig?: Partial<Omit<CircuitBreakerConfig, "providerName">>;
   /** Bash circuit breaker configuration (optional, uses defaults if not provided) */
@@ -182,6 +185,18 @@ export interface SessionManagerRuntimeOptions {
   durableInitTimeoutMs?: number;
   /** Timeout for best-effort session-name metadata sync writes. */
   sessionNameSyncTimeoutMs?: number;
+}
+
+/** Proof that one concrete session epoch crossed the committed deletion boundary. */
+export interface SessionDeletionReceipt {
+  sessionId: string;
+  epoch: number;
+}
+
+export interface ExecuteCommandOptions {
+  principal?: string;
+  /** Called only by the execution that commits a session deletion, never by replay. */
+  onSessionDeleted?: (receipt: SessionDeletionReceipt) => void;
 }
 
 export class PiSessionManager implements SessionResolver {
@@ -209,8 +224,8 @@ export class PiSessionManager implements SessionResolver {
   private sessionControlPlaneMetadataSnapshotKey: string | null = null;
   /** Background discovered-session refresh promise. */
   private sessionDiscoveryRefreshPromise: Promise<void> | null = null;
-  /** Pending low-priority discovery refresh timer. */
-  private sessionDiscoveryRefreshTimer: NodeJS.Timeout | null = null;
+  /** Pending low-priority discovery refresh task. */
+  private sessionDiscoveryRefreshTimer: NodeJS.Immediate | null = null;
   /** Last successful discovered-session refresh timestamp. */
   private lastSessionDiscoveryRefreshAt = 0;
   /** Circuit breaker for LLM providers (ADR-0010). */
@@ -234,6 +249,8 @@ export class PiSessionManager implements SessionResolver {
   private isShuttingDown = false;
   /** Runtime has been fully torn down; late completions must not mutate stores. */
   private runtimeDisposed = false;
+  /** Cancels journal recovery effects if disposal wins an initialization race. */
+  private readonly runtimeAbortController = new AbortController();
   private inFlightCommands = new Set<Promise<unknown>>();
 
   // Periodic cleanup timers
@@ -244,6 +261,10 @@ export class PiSessionManager implements SessionResolver {
   private readonly dependencyWaitTimeoutMs: number;
   private readonly durableInitTimeoutMs: number;
   private readonly sessionNameSyncTimeoutMs: number;
+  /** Runtime paths captured once so creation and authorization cannot drift. */
+  private readonly serverCwd: string;
+  private readonly agentDir: string;
+  private readonly allowedSessionDirectories: readonly string[];
 
   // Extension UI request tracking
   private extensionUI = new ExtensionUIManager((sessionId: string, event: AgentSessionEvent) =>
@@ -258,6 +279,13 @@ export class PiSessionManager implements SessionResolver {
   private npmSanitizationDiagnosticLogged = false;
 
   constructor(governor?: ResourceGovernor, options: SessionManagerRuntimeOptions = {}) {
+    this.serverCwd = process.cwd();
+    const sessionPathCapabilities = resolveSessionPathCapabilities({
+      cwd: this.serverCwd,
+      agentDir: options.agentDir,
+    });
+    this.agentDir = sessionPathCapabilities.agentDir;
+    this.allowedSessionDirectories = [...sessionPathCapabilities.allowedSessionDirectories];
     this.governor = governor ?? new ResourceGovernor(DEFAULT_CONFIG);
     this.defaultCommandTimeoutMs =
       typeof options.defaultCommandTimeoutMs === "number" && options.defaultCommandTimeoutMs > 0
@@ -297,6 +325,8 @@ export class PiSessionManager implements SessionResolver {
     this.lockManager = new SessionLockManager();
     this.sessionStore = new SessionStore({
       serverVersion: options.serverVersion,
+      sessionsDir: sessionPathCapabilities.sessionsDir,
+      allowedSessionDirectories: this.allowedSessionDirectories,
     });
     this.circuitBreakers = new CircuitBreakerManager(options.circuitBreakerConfig);
     this.bashCircuitBreaker = new BashCircuitBreaker(options.bashCircuitBreakerConfig);
@@ -369,6 +399,9 @@ export class PiSessionManager implements SessionResolver {
    * Ensure durable journal recovery has completed (idempotent and bounded).
    */
   private async ensureDurableJournalInitialized(): Promise<void> {
+    if (this.runtimeDisposed) {
+      throw new Error("Durable journal initialization cancelled because server shutdown completed");
+    }
     if (!this.commandJournal.isEnabled()) {
       this.durableInitState = "disabled";
       this.durableInitError = null;
@@ -391,7 +424,17 @@ export class PiSessionManager implements SessionResolver {
 
       const initPromise = (async () => {
         try {
-          const recovery = await this.commandJournal.initialize();
+          const recovery = await this.commandJournal.initialize(this.runtimeAbortController.signal);
+
+          // Shutdown may complete while initialization is awaiting filesystem
+          // work. Release any newly acquired writer lock before touching replay
+          // state so a disposed runtime cannot resurrect durability resources.
+          if (this.runtimeDisposed) {
+            this.commandJournal.dispose();
+            throw new Error(
+              "Durable journal initialization cancelled because server shutdown completed"
+            );
+          }
 
           for (const outcome of recovery.recoveredOutcomes) {
             this.replayStore.storeCommandOutcome(outcome);
@@ -620,7 +663,7 @@ export class PiSessionManager implements SessionResolver {
   }
 
   private isSessionPathVisibleToCurrentServer(sessionPath: string): boolean {
-    return validateSessionPath(sessionPath) === null;
+    return validateSessionPath(sessionPath, this.allowedSessionDirectories) === null;
   }
 
   private async sessionFileExists(sessionFile: string | undefined): Promise<boolean> {
@@ -689,7 +732,10 @@ export class PiSessionManager implements SessionResolver {
     }
 
     const refresh = new Promise<void>((resolve) => {
-      this.sessionDiscoveryRefreshTimer = setTimeout(() => {
+      // Keep this one-turn scheduling task referenced until it starts. An
+      // unref'ed timer can leave direct SDK/test callers awaiting a refresh
+      // promise that never begins when no transport handle is active.
+      this.sessionDiscoveryRefreshTimer = setImmediate(() => {
         this.sessionDiscoveryRefreshTimer = null;
         if (this.runtimeDisposed || this.isShuttingDown) {
           resolve();
@@ -706,11 +752,7 @@ export class PiSessionManager implements SessionResolver {
             resolve();
           }
         })();
-      }, 0);
-
-      if (this.sessionDiscoveryRefreshTimer?.unref) {
-        this.sessionDiscoveryRefreshTimer.unref();
-      }
+      });
     });
 
     this.sessionDiscoveryRefreshPromise = refresh;
@@ -853,6 +895,11 @@ export class PiSessionManager implements SessionResolver {
    */
   markRuntimeDisposed(): void {
     this.runtimeDisposed = true;
+    if (!this.runtimeAbortController.signal.aborted) {
+      this.runtimeAbortController.abort(
+        new Error("Durable journal initialization cancelled because server shutdown completed")
+      );
+    }
   }
 
   /**
@@ -1109,11 +1156,12 @@ export class PiSessionManager implements SessionResolver {
     ) {
       return sourceCwd;
     }
-    return process.cwd();
+    return this.serverCwd;
   }
 
   async createSession(sessionId: string, cwd?: string): Promise<SessionInfo> {
     await this.ensureSessionControlPlaneBootstrapped();
+    const runtimeCwd = cwd ?? this.serverCwd;
 
     // Validate session ID (validation doesn't need lock)
     const sessionIdError = this.governor.validateSessionId(sessionId);
@@ -1155,7 +1203,8 @@ export class PiSessionManager implements SessionResolver {
       epoch = this.sessionControlPlane.beginSessionEpoch(sessionId);
 
       ({ session } = await this.createAgentSessionWithSanitizedNpmEnv({
-        cwd: cwd ?? process.cwd(),
+        cwd: runtimeCwd,
+        agentDir: this.agentDir,
       }));
 
       // Wire extension UI before exposing the session to callers.
@@ -1182,7 +1231,7 @@ export class PiSessionManager implements SessionResolver {
         sessionId,
         epoch,
         sessionFile: session.sessionFile,
-        cwd: cwd ?? process.cwd(),
+        cwd: runtimeCwd,
         createdAt: sessionInfo.createdAt,
         modelId: session.model?.id,
         sessionName: session.sessionName,
@@ -1192,11 +1241,7 @@ export class PiSessionManager implements SessionResolver {
       this.sessionControlPlane.upsertStoredSession(
         sessionId,
         epoch,
-        this.buildStoredSessionInfoFromSessionInfo(
-          sessionInfo,
-          cwd ?? process.cwd(),
-          sessionFileExists
-        )
+        this.buildStoredSessionInfoFromSessionInfo(sessionInfo, runtimeCwd, sessionFileExists)
       );
       this.installSessionNamePersistenceBridge(sessionId, epoch, session);
 
@@ -1261,7 +1306,10 @@ export class PiSessionManager implements SessionResolver {
     }
   }
 
-  async deleteSession(sessionId: string): Promise<void> {
+  async deleteSession(
+    sessionId: string,
+    onCommitted?: (receipt: SessionDeletionReceipt) => void
+  ): Promise<void> {
     await this.ensureSessionControlPlaneBootstrapped();
 
     // Acquire lock for this session ID to prevent concurrent create/delete races
@@ -1305,6 +1353,17 @@ export class PiSessionManager implements SessionResolver {
 
       // Clean up stale governor data for this session
       this.governor.cleanupStaleData(new Set(this.sessions.keys()));
+
+      // Capture committed state truth before best-effort runtime cleanup. The
+      // observer only records a receipt; it must not be able to roll deletion
+      // back or convert cleanup warnings into a false "not deleted" signal.
+      if (onCommitted) {
+        try {
+          onCommitted({ sessionId, epoch });
+        } catch (error) {
+          console.error(`[deleteSession] Deletion observer failed:`, error);
+        }
+      }
 
       const cleanupErrors: string[] = [];
 
@@ -1440,7 +1499,8 @@ export class PiSessionManager implements SessionResolver {
 
     // Validate session path (prevents path traversal, outsider paths, and file clobbering)
     const sessionPathError = validateSessionFileAccess(sessionPath, {
-      cwd: process.cwd(),
+      allowedDirs: this.allowedSessionDirectories,
+      cwd: this.serverCwd,
       requireExistingFile: true,
       requireSessionHeader: true,
     });
@@ -1478,6 +1538,7 @@ export class PiSessionManager implements SessionResolver {
       // Create session using the source session's cwd when available.
       ({ session } = await this.createAgentSessionWithSanitizedNpmEnv({
         cwd: this.resolveLoadSessionRuntimeCwd(persistedFileMetadata.cwd),
+        agentDir: this.agentDir,
       }));
 
       // Switch to the specified session file
@@ -1660,9 +1721,15 @@ export class PiSessionManager implements SessionResolver {
    * Also cleans up stale circuit breakers for unused providers.
    */
   private async cleanupExpiredSessions(): Promise<void> {
+    if (this.runtimeDisposed) {
+      return;
+    }
     const expiredIds = this.governor.getExpiredSessions();
 
     for (const sessionId of expiredIds) {
+      if (this.runtimeDisposed) {
+        return;
+      }
       try {
         console.error(`[SessionManager] Deleting expired session: ${sessionId}`);
         await this.deleteSession(sessionId);
@@ -1673,6 +1740,10 @@ export class PiSessionManager implements SessionResolver {
     }
 
     // Clean up stale circuit breakers (ADR-0011)
+
+    if (this.runtimeDisposed) {
+      return;
+    }
     const staleBreakersRemoved = this.circuitBreakers.cleanupStaleBreakers();
     if (staleBreakersRemoved > 0) {
       console.error(`[SessionManager] Cleaned up ${staleBreakersRemoved} stale circuit breakers`);
@@ -1789,14 +1860,17 @@ export class PiSessionManager implements SessionResolver {
    * This is the NEXUS seam - provides everything handlers need without
    * direct coupling to SessionManager internals.
    */
-  private createCommandContext(principal?: string): ServerCommandContext {
+  private createCommandContext(
+    principal?: string,
+    onSessionDeleted?: (receipt: SessionDeletionReceipt) => void
+  ): ServerCommandContext {
     return {
       principal,
       getSession: (sessionId: string) => this.sessions.get(sessionId),
       getSessionInfo: (sessionId: string) => this.getSessionInfo(sessionId),
       listSessions: () => this.listSessions(),
       createSession: (sessionId: string, cwd?: string) => this.createSession(sessionId, cwd),
-      deleteSession: (sessionId: string) => this.deleteSession(sessionId),
+      deleteSession: (sessionId: string) => this.deleteSession(sessionId, onSessionDeleted),
       loadSession: (sessionId: string, sessionPath: string) =>
         this.loadSession(sessionId, sessionPath),
       listStoredSessions: () => this.listStoredSessions(),
@@ -2129,12 +2203,184 @@ export class PiSessionManager implements SessionResolver {
 
   async executeCommand(
     command: RpcCommand,
-    options: { principal?: string } = {}
+    options: ExecuteCommandOptions = {}
   ): Promise<RpcResponse> {
     const id = getCommandId(command);
     const commandType = getCommandType(command);
+
+    // Completed shutdown is a hard boundary: do not allocate synthetic IDs,
+    // initialize durability, inspect replay state, or emit lifecycle callbacks.
+    if (this.runtimeDisposed) {
+      return {
+        id,
+        type: "response",
+        command: commandType ?? "unknown",
+        success: false,
+        error: "Server has completed shutdown",
+      };
+    }
     const isDurableObservabilityCommand =
       commandType === "get_startup_recovery" || commandType === "get_command_history";
+    const sessionId = getSessionId(command);
+    const commandId = this.replayStore.getOrCreateCommandId(command);
+    const dependsOn = getCommandDependsOn(command) ?? [];
+    const ifSessionVersion = getCommandIfSessionVersion(command);
+    const idempotencyKey = getCommandIdempotencyKey(command);
+    const laneKey = this.executionEngine.getLaneKey(command);
+    const fingerprint = this.replayStore.getCommandFingerprint(command);
+    const isExplicitId = typeof id === "string" && !id.startsWith(SYNTHETIC_ID_PREFIX);
+
+    const finalizeTerminalResponse = (
+      response: RpcResponse,
+      terminalOptions: {
+        appendToJournal?: boolean;
+        storeOutcome?: boolean;
+        cacheIdempotency?: boolean;
+        emitLifecycle?: boolean;
+      } = {}
+    ): RpcResponse => {
+      const {
+        appendToJournal = true,
+        storeOutcome = isExplicitId,
+        cacheIdempotency = false,
+        emitLifecycle = true,
+      } = terminalOptions;
+
+      let finalizedResponse = response;
+      const allowStateMutation = !this.runtimeDisposed;
+      if (appendToJournal && allowStateMutation) {
+        const finishedAppend = this.appendCommandLifecycleToJournal({
+          phase: "command_finished",
+          commandId,
+          commandType,
+          laneKey,
+          fingerprint,
+          explicitId: isExplicitId,
+          sessionId,
+          dependsOn,
+          ifSessionVersion,
+          idempotencyKey,
+          success: response.success,
+          error: response.success ? undefined : response.error,
+          sessionVersion: response.sessionVersion,
+          replayed: response.replayed,
+          timedOut: response.timedOut,
+          response,
+        });
+
+        if (!finishedAppend.ok && finishedAppend.failClosed && !isDurableObservabilityCommand) {
+          finalizedResponse = {
+            id: response.id ?? id,
+            type: "response",
+            command: response.command,
+            success: false,
+            error: finishedAppend.error ?? "Durable journal append failed during command_finished",
+          };
+
+          const fallbackAppend = this.appendFailClosedTerminalFailureToJournal({
+            commandId,
+            commandType,
+            laneKey,
+            fingerprint,
+            explicitId: isExplicitId,
+            sessionId,
+            dependsOn,
+            ifSessionVersion,
+            idempotencyKey,
+            success: finalizedResponse.success,
+            error: finalizedResponse.error,
+            sessionVersion: finalizedResponse.sessionVersion,
+            replayed: finalizedResponse.replayed,
+            timedOut: finalizedResponse.timedOut,
+            response: finalizedResponse,
+          });
+
+          if (!fallbackAppend.ok && fallbackAppend.error) {
+            finalizedResponse = {
+              ...finalizedResponse,
+              error: `${finalizedResponse.error ?? "Durable journal append failed during command_finished"} (fallback persistence also failed: ${fallbackAppend.error})`,
+            };
+          }
+        }
+      }
+
+      // Runtime disposal is a hard mutation boundary. Late completions may
+      // finish observability, but they must not repopulate cleared replay state.
+      if (allowStateMutation && storeOutcome && isExplicitId) {
+        try {
+          this.replayStore.storeCommandOutcome({
+            commandId: id,
+            commandType: commandType ?? finalizedResponse.command,
+            laneKey,
+            fingerprint,
+            success: finalizedResponse.success,
+            error: finalizedResponse.success ? undefined : finalizedResponse.error,
+            response: finalizedResponse,
+            sessionVersion: finalizedResponse.sessionVersion,
+            finishedAt: Date.now(),
+          });
+        } catch (outcomeError) {
+          console.error(
+            `[executeCommand] Failed to store command outcome for ${id}:`,
+            outcomeError
+          );
+        }
+      }
+
+      if (allowStateMutation && cacheIdempotency && idempotencyKey) {
+        this.replayStore.cacheIdempotencyResult({
+          command,
+          idempotencyKey,
+          commandType: commandType ?? finalizedResponse.command,
+          fingerprint,
+          response: finalizedResponse,
+        });
+      }
+
+      if (emitLifecycle) {
+        this.broadcastCommandLifecycle("command_finished", {
+          commandId,
+          commandType: commandType ?? finalizedResponse.command,
+          sessionId,
+          dependsOn,
+          ifSessionVersion,
+          idempotencyKey,
+          success: finalizedResponse.success,
+          error: finalizedResponse.success ? undefined : finalizedResponse.error,
+          sessionVersion: finalizedResponse.sessionVersion,
+          replayed: finalizedResponse.replayed,
+        });
+      }
+
+      return finalizedResponse;
+    };
+
+    this.replayStore.cleanupIdempotencyCache();
+
+    const resolveReplay = (): RpcResponse | Promise<RpcResponse> | null => {
+      const replayCheck = this.replayStore.checkReplay(command, fingerprint);
+      if (replayCheck.kind === "proceed") {
+        return null;
+      }
+
+      const finalizeReplay = (replayResponse: RpcResponse): RpcResponse =>
+        finalizeTerminalResponse(replayResponse, {
+          appendToJournal: false,
+          storeOutcome: false,
+          cacheIdempotency: false,
+        });
+
+      return replayCheck.kind === "replay_inflight"
+        ? replayCheck.promise.then(finalizeReplay)
+        : finalizeReplay(replayCheck.response);
+    };
+
+    // Protect an already-terminal identity before any pre-admission rejection
+    // can replace it. Replay remains free even while shutdown is beginning.
+    const preInitializationReplay = resolveReplay();
+    if (preInitializationReplay) {
+      return preInitializationReplay;
+    }
 
     // Durable observability commands must remain available even when durable init fails,
     // but they should still flow through normal admission/replay/lifecycle handling.
@@ -2148,25 +2394,28 @@ export class PiSessionManager implements SessionResolver {
       try {
         await this.ensureDurableJournalInitialized();
       } catch (error) {
-        return {
-          id,
-          type: "response",
-          command: commandType ?? "unknown",
-          success: false,
-          error: `Durable journal initialization failed: ${error instanceof Error ? error.message : String(error)}`,
-        };
+        if (this.runtimeDisposed) {
+          return {
+            id,
+            type: "response",
+            command: commandType ?? "unknown",
+            success: false,
+            error: "Server has completed shutdown",
+          };
+        }
+        return finalizeTerminalResponse(
+          {
+            id,
+            type: "response",
+            command: commandType ?? "unknown",
+            success: false,
+            error: `Durable journal initialization failed: ${error instanceof Error ? error.message : String(error)}`,
+          },
+          { appendToJournal: false, cacheIdempotency: false }
+        );
       }
     }
-    const sessionId = getSessionId(command);
-    const commandId = this.replayStore.getOrCreateCommandId(command);
-    const dependsOn = getCommandDependsOn(command) ?? [];
-    const ifSessionVersion = getCommandIfSessionVersion(command);
-    const idempotencyKey = getCommandIdempotencyKey(command);
-    const laneKey = this.executionEngine.getLaneKey(command);
-    const fingerprint = this.replayStore.getCommandFingerprint(command);
-    const isExplicitId = typeof id === "string" && !id.startsWith(SYNTHETIC_ID_PREFIX);
 
-    // Check for shutdown / disposed runtime - reject new commands during teardown
     if (this.runtimeDisposed) {
       return {
         id,
@@ -2177,135 +2426,45 @@ export class PiSessionManager implements SessionResolver {
       };
     }
 
-    if (this.isShuttingDown) {
-      return {
-        id,
-        type: "response",
-        command: commandType ?? "unknown",
-        success: false,
-        error: "Server is shutting down",
-      };
+    // Initialization can rehydrate outcomes, so repeat the free replay check
+    // before applying shutdown, validation, or rate-limit rejection semantics.
+    const postInitializationReplay = resolveReplay();
+    if (postInitializationReplay) {
+      return postInitializationReplay;
     }
 
-    // Input validation FIRST (don't rate-limit invalid commands)
+    if (this.isShuttingDown) {
+      return finalizeTerminalResponse(
+        {
+          id,
+          type: "response",
+          command: commandType ?? "unknown",
+          success: false,
+          error: "Server is shutting down",
+        },
+        { cacheIdempotency: false }
+      );
+    }
+
     const validationErrors = validateCommand(command);
     if (validationErrors.length > 0) {
-      return {
-        id,
-        type: "response",
-        command: commandType ?? "unknown",
-        success: false,
-        error: `Validation failed: ${formatValidationErrors(validationErrors)}`,
-      };
-    }
-
-    this.replayStore.cleanupIdempotencyCache();
-
-    const broadcastTerminalLifecycle = (response: RpcResponse): void => {
-      this.broadcastCommandLifecycle("command_finished", {
-        commandId,
-        commandType,
-        sessionId,
-        dependsOn,
-        ifSessionVersion,
-        idempotencyKey,
-        success: response.success,
-        error: response.success ? undefined : response.error,
-        sessionVersion: response.sessionVersion,
-        replayed: response.replayed,
-      });
-    };
-
-    const finalizeResponse = (response: RpcResponse): RpcResponse => {
-      const finishedAppend = this.appendCommandLifecycleToJournal({
-        phase: "command_finished",
-        commandId,
-        commandType,
-        laneKey,
-        fingerprint,
-        explicitId: isExplicitId,
-        sessionId,
-        dependsOn,
-        ifSessionVersion,
-        idempotencyKey,
-        success: response.success,
-        error: response.success ? undefined : response.error,
-        sessionVersion: response.sessionVersion,
-        replayed: response.replayed,
-        timedOut: response.timedOut,
-        response,
-      });
-
-      let finalizedResponse = response;
-      if (!finishedAppend.ok && finishedAppend.failClosed && !isDurableObservabilityCommand) {
-        finalizedResponse = {
-          id: response.id ?? id,
+      return finalizeTerminalResponse(
+        {
+          id,
           type: "response",
-          command: response.command,
+          command: commandType ?? "unknown",
           success: false,
-          error: finishedAppend.error ?? "Durable journal append failed during command_finished",
-        };
-
-        const fallbackAppend = this.appendFailClosedTerminalFailureToJournal({
-          commandId,
-          commandType,
-          laneKey,
-          fingerprint,
-          explicitId: isExplicitId,
-          sessionId,
-          dependsOn,
-          ifSessionVersion,
-          idempotencyKey,
-          success: finalizedResponse.success,
-          error: finalizedResponse.error,
-          sessionVersion: finalizedResponse.sessionVersion,
-          replayed: finalizedResponse.replayed,
-          timedOut: finalizedResponse.timedOut,
-          response: finalizedResponse,
-        });
-
-        if (!fallbackAppend.ok && fallbackAppend.error) {
-          finalizedResponse = {
-            ...finalizedResponse,
-            error: `${finalizedResponse.error ?? "Durable journal append failed during command_finished"} (fallback persistence also failed: ${fallbackAppend.error})`,
-          };
-        }
-      }
-
-      broadcastTerminalLifecycle(finalizedResponse);
-      return finalizedResponse;
-    };
-
-    const finalizeEphemeralTerminalResponse = async (
-      responseOrPromise: RpcResponse | Promise<RpcResponse>
-    ): Promise<RpcResponse> => {
-      const response = await responseOrPromise;
-      broadcastTerminalLifecycle(response);
-      return response;
-    };
-
-    // Check for replay opportunities or conflicts (ADR-0001: Free replay)
-    // Replay/conflict paths must remain free of durable side effects, but they
-    // still emit terminal lifecycle events so subscribers observe completion.
-    const replayCheck = this.replayStore.checkReplay(command, fingerprint);
-
-    if (replayCheck.kind === "conflict") {
-      return finalizeEphemeralTerminalResponse(replayCheck.response);
-    }
-
-    if (replayCheck.kind === "replay_cached") {
-      return finalizeEphemeralTerminalResponse(replayCheck.response);
-    }
-
-    if (replayCheck.kind === "replay_inflight") {
-      return finalizeEphemeralTerminalResponse(replayCheck.promise);
+          error: `Validation failed: ${formatValidationErrors(validationErrors)}`,
+        },
+        { cacheIdempotency: false }
+      );
     }
 
     // ADR-0001: Rate limiting only for NEW executions (replay is free)
     const rateLimitTarget = getRateLimitTarget(command as RpcCommand & { sessionId?: string });
     const rateLimitResult = this.governor.canExecuteCommand(rateLimitTarget.key);
     if (!rateLimitResult.allowed) {
-      return finalizeResponse({
+      return finalizeTerminalResponse({
         id,
         type: "response",
         command: commandType,
@@ -2329,7 +2488,7 @@ export class PiSessionManager implements SessionResolver {
       const extRateLimitResult = this.governor.canExecuteExtensionUIResponse(sessionId);
       if (!extRateLimitResult.allowed) {
         refundAdmissionCharges();
-        return finalizeResponse({
+        return finalizeTerminalResponse({
           id,
           type: "response",
           command: commandType,
@@ -2364,7 +2523,7 @@ export class PiSessionManager implements SessionResolver {
       const registered = this.replayStore.registerInFlight(id, inFlightRecord);
       if (!registered) {
         refundAdmissionCharges();
-        return finalizeResponse({
+        return finalizeTerminalResponse({
           id,
           type: "response",
           command: commandType,
@@ -2506,7 +2665,8 @@ export class PiSessionManager implements SessionResolver {
               command,
               id,
               commandType,
-              options.principal
+              options.principal,
+              options.onSessionDeleted
             );
             if (this.runtimeDisposed) {
               return {
@@ -2553,39 +2713,10 @@ export class PiSessionManager implements SessionResolver {
       };
     }
 
-    const finalizedResponse = finalizeResponse(response);
+    const finalizedResponse = finalizeTerminalResponse(response, {
+      cacheIdempotency: Boolean(idempotencyKey),
+    });
     settleTrackedExecution(finalizedResponse);
-
-    const allowLateStoreMutation = !this.runtimeDisposed;
-
-    // ADR-0001: ATOMIC OUTCOME STORAGE
-    // Store outcome BEFORE returning (not in async callback)
-    // This ensures same command ID always returns same response.
-    //
-    // After shutdown disposal completes, late command completions must not
-    // repopulate replay/idempotency state that disposeAllSessions() just cleared.
-    //
-    // Only store outcomes for EXPLICIT client IDs (not synthetic IDs).
-    // Synthetic IDs (anon:timestamp:seq) are server-generated for anonymous
-    // commands and should not be stored to prevent unbounded memory growth.
-    // Clients must provide explicit IDs if they want replay semantics.
-    if (allowLateStoreMutation && isExplicitId) {
-      try {
-        this.replayStore.storeCommandOutcome({
-          commandId: id,
-          commandType,
-          laneKey,
-          fingerprint,
-          success: finalizedResponse.success,
-          error: finalizedResponse.success ? undefined : finalizedResponse.error,
-          response: finalizedResponse,
-          sessionVersion: finalizedResponse.sessionVersion,
-          finishedAt: Date.now(),
-        });
-      } catch (outcomeError) {
-        console.error(`[executeCommand] Failed to store command outcome for ${id}:`, outcomeError);
-      }
-    }
 
     if (explicitInFlightRegistered && id && this.replayStore.getInFlight(id) === inFlightRecord) {
       this.replayStore.unregisterInFlight(id, inFlightRecord);
@@ -2593,17 +2724,6 @@ export class PiSessionManager implements SessionResolver {
 
     if (idempotencyInFlightRegistered && idempotencyKey) {
       this.replayStore.unregisterIdempotencyInFlight(command, idempotencyKey, inFlightRecord);
-    }
-
-    // Cache terminal idempotency outcome (including timeout responses)
-    if (allowLateStoreMutation && idempotencyKey) {
-      this.replayStore.cacheIdempotencyResult({
-        command,
-        idempotencyKey,
-        commandType,
-        fingerprint,
-        response: finalizedResponse,
-      });
     }
 
     return finalizedResponse;
@@ -2699,7 +2819,8 @@ export class PiSessionManager implements SessionResolver {
     command: RpcCommand,
     id: string | undefined,
     commandType: string,
-    principal?: string
+    principal?: string,
+    onSessionDeleted?: (receipt: SessionDeletionReceipt) => void
   ): Promise<RpcResponse> {
     const failResponse = (error: string, responseCommand = commandType): RpcResponse => {
       return {
@@ -2712,7 +2833,7 @@ export class PiSessionManager implements SessionResolver {
     };
 
     try {
-      const context = this.createCommandContext(principal);
+      const context = this.createCommandContext(principal, onSessionDeleted);
 
       // Try server command handlers first
       const serverResponse = routeServerCommand(command, context);
@@ -2760,7 +2881,10 @@ export class PiSessionManager implements SessionResolver {
       }
 
       // Other session commands: route without circuit breaker
-      const routed = routeSessionCommand(session, command, (sid) => this.getSessionInfo(sid));
+      const routed = routeSessionCommand(session, command, (sid) => this.getSessionInfo(sid), {
+        allowedSessionDirectories: this.allowedSessionDirectories,
+        cwd: this.serverCwd,
+      });
       if (routed === undefined) {
         return failResponse(`Unknown command type: ${commandType}`);
       }
@@ -2823,7 +2947,10 @@ export class PiSessionManager implements SessionResolver {
     }
 
     try {
-      return await createAgentSession(options);
+      return await createAgentSession({
+        ...options,
+        agentDir: this.agentDir,
+      });
     } finally {
       for (const snapshot of snapshots) {
         if (!snapshot.had) continue;

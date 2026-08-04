@@ -16,6 +16,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -573,6 +574,7 @@ import {
   validateSessionPath,
   validateSessionFileAccess,
   getDefaultAllowedSessionDirectories,
+  resolveSessionPathCapabilities,
 } from "./validation.js";
 
 async function testSessionPathValidation() {
@@ -688,6 +690,35 @@ async function testSessionPathValidation() {
       allowedDirs.some((dir) => dir.endsWith(join(".pi", "sessions"))),
       "Expected current project .pi/sessions to be in default allowed dirs"
     );
+  });
+
+  await test("sessionPath: default capabilities include configured Pi agent sessions", () => {
+    const baseDir = mkdtempSync(join(tmpdir(), "pi-configured-agent-root-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+
+    try {
+      const agentDir = join(baseDir, "agent");
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      mkdirSync(agentDir, { recursive: true });
+
+      const capabilities = resolveSessionPathCapabilities({ cwd: process.cwd() });
+      const candidate = join(capabilities.sessionsDir, "project", "session.jsonl");
+      const allowedDirs = getDefaultAllowedSessionDirectories();
+
+      assert.strictEqual(capabilities.agentDir, realpathSync(agentDir));
+      assert(
+        allowedDirs.includes(capabilities.sessionsDir),
+        "Expected configured Pi agent sessions root to be authorized"
+      );
+      assert.strictEqual(validateSessionPath(candidate, allowedDirs), null);
+    } finally {
+      if (previousAgentDir === undefined) {
+        delete process.env.PI_CODING_AGENT_DIR;
+      } else {
+        process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      }
+      rmSync(baseDir, { recursive: true, force: true });
+    }
   });
 }
 
@@ -2042,6 +2073,139 @@ async function testSessionManager() {
     assert(r2.error?.includes("Rate limit"), `Expected rate limit error, got: ${r2.error}`);
   });
 
+  await test("session-manager: explicit-id validation failure remains deterministic", async () => {
+    const localManager = new PiSessionManager();
+
+    const first = await localManager.executeCommand({
+      id: "validation-deterministic-1",
+      type: "prompt",
+      sessionId: "missing-session",
+    } as any);
+    assert.strictEqual(first.success, false);
+    assert(first.error?.includes("Validation failed"));
+
+    const second = await localManager.executeCommand({
+      id: "validation-deterministic-1",
+      type: "prompt",
+      sessionId: "missing-session",
+      message: "hello",
+    } as any);
+
+    assert.strictEqual(second.success, false);
+    assert(
+      second.error?.includes("Conflicting id 'validation-deterministic-1'"),
+      `Expected conflict after explicit-id validation failure, got: ${second.error}`
+    );
+  });
+
+  await test("session-manager: pre-admission rejection cannot overwrite an existing outcome", async () => {
+    const localManager = new PiSessionManager();
+    const first = await localManager.executeCommand({
+      id: "pre-admission-clobber-1",
+      type: "list_sessions",
+    } as any);
+    assert.strictEqual(first.success, true);
+
+    const conflict = await localManager.executeCommand({
+      id: "pre-admission-clobber-1",
+      type: "prompt",
+      sessionId: "missing-session",
+    } as any);
+    assert.strictEqual(conflict.success, false);
+    assert(conflict.error?.includes("Conflicting id 'pre-admission-clobber-1'"));
+
+    const replayed = await localManager.executeCommand({
+      id: "pre-admission-clobber-1",
+      type: "list_sessions",
+    } as any);
+    assert.strictEqual(replayed.success, true);
+    assert.strictEqual(replayed.replayed, true);
+
+    const stored = (localManager as any).replayStore.getCommandOutcome("pre-admission-clobber-1");
+    assert.strictEqual(stored.commandType, "list_sessions");
+    assert.strictEqual(stored.success, true);
+  });
+
+  await test("session-manager: pre-admission validation outcome rehydrates across restart", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-validation-restart-"));
+
+    try {
+      const firstBoot = new PiSessionManager(undefined, {
+        durableJournal: { enabled: true, dataDir: journalDir },
+      });
+      await firstBoot.initialize();
+
+      const rejected = await firstBoot.executeCommand({
+        id: "validation-restart-1",
+        type: "prompt",
+        sessionId: "missing-session",
+      } as any);
+      assert.strictEqual(rejected.success, false);
+      assert(rejected.error?.includes("Validation failed"));
+
+      const missingType = await firstBoot.executeCommand({
+        id: "validation-restart-unknown-type",
+      } as any);
+      assert.strictEqual(missingType.success, false);
+      assert.strictEqual(missingType.command, "unknown");
+      assert(missingType.error?.includes("Validation failed"));
+      firstBoot.disposeAllSessions();
+
+      const secondBoot = new PiSessionManager(undefined, {
+        durableJournal: { enabled: true, dataDir: journalDir },
+      });
+      await secondBoot.initialize();
+
+      const conflict = await secondBoot.executeCommand({
+        id: "validation-restart-1",
+        type: "prompt",
+        sessionId: "missing-session",
+        message: "now valid",
+      } as any);
+      assert.strictEqual(conflict.success, false);
+      assert(conflict.error?.includes("Conflicting id 'validation-restart-1'"));
+
+      const unknownTypeConflict = await secondBoot.executeCommand({
+        id: "validation-restart-unknown-type",
+        type: "list_sessions",
+      } as any);
+      assert.strictEqual(unknownTypeConflict.success, false);
+      assert(
+        unknownTypeConflict.error?.includes("Conflicting id 'validation-restart-unknown-type'")
+      );
+      secondBoot.disposeAllSessions();
+    } finally {
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-manager: explicit-id rate-limit rejection replays deterministically", async () => {
+    const governor = new ResourceGovernor({
+      ...DEFAULT_CONFIG,
+      maxCommandsPerMinute: 1,
+      maxGlobalCommandsPerMinute: 100,
+    });
+    const localManager = new PiSessionManager(governor);
+
+    const warmup = await localManager.executeCommand({ type: "list_sessions" } as any);
+    assert.strictEqual(warmup.success, true);
+
+    const first = await localManager.executeCommand({
+      id: "rate-limit-deterministic-1",
+      type: "list_sessions",
+    } as any);
+    assert.strictEqual(first.success, false);
+    assert(first.error?.includes("Rate limit"));
+
+    const replayed = await localManager.executeCommand({
+      id: "rate-limit-deterministic-1",
+      type: "list_sessions",
+    } as any);
+    assert.strictEqual(replayed.success, false);
+    assert.strictEqual(replayed.error, first.error);
+    assert.strictEqual(replayed.replayed, true);
+  });
+
   await test("session-manager: extension_ui_response secondary limiter refunds general rate limit", async () => {
     const governor = new ResourceGovernor({
       ...DEFAULT_CONFIG,
@@ -2317,6 +2481,138 @@ async function testSessionManager() {
     );
   });
 
+  await test("session-manager: disposal aborts in-progress journal recovery before append", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-abort-journal-init-"));
+    const seedJournal = new DurableCommandJournal({ enabled: true, dataDir: journalDir });
+
+    try {
+      await seedJournal.initialize();
+      seedJournal.appendLifecycle({
+        phase: "command_accepted",
+        commandId: "abort-journal-init-1",
+        commandType: "list_sessions",
+        laneKey: "server:control",
+        fingerprint: "v2:sha256:abort-journal-init",
+        explicitId: true,
+      });
+      seedJournal.dispose();
+
+      const localManager = new PiSessionManager(undefined, {
+        durableJournal: { enabled: true, dataDir: journalDir },
+      });
+      const managerAny = localManager as any;
+      const journalAny = managerAny.commandJournal as any;
+      const originalParseEntry = journalAny.parseEntry.bind(journalAny);
+      let disposalTriggered = false;
+
+      journalAny.parseEntry = (line: string) => {
+        const parsed = originalParseEntry(line);
+        if (!disposalTriggered) {
+          disposalTriggered = true;
+          localManager.markRuntimeDisposed();
+          localManager.disposeAllSessions();
+        }
+        return parsed;
+      };
+
+      await assert.rejects(localManager.initialize(), /shutdown completed/);
+      assert.strictEqual(disposalTriggered, true);
+      assert.strictEqual(journalAny.lockAcquired, false);
+      assert.strictEqual(existsSync(join(journalDir, "command-journal.jsonl.lock")), false);
+
+      const records = readFileSync(join(journalDir, "command-journal.jsonl"), "utf-8")
+        .trim()
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+        .filter((entry) => entry.commandId === "abort-journal-init-1");
+      assert.strictEqual(records.length, 1);
+      assert.strictEqual(records[0]?.phase, "command_accepted");
+    } finally {
+      seedJournal.dispose();
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-manager: disposed late completion cannot reacquire durable journal", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-disposed-journal-"));
+    const firstManager = new PiSessionManager(undefined, {
+      durableJournal: { enabled: true, dataDir: journalDir },
+    });
+    const secondManager = new PiSessionManager(undefined, {
+      durableJournal: { enabled: true, dataDir: journalDir },
+    });
+    const firstAny = firstManager as any;
+    const secondAny = secondManager as any;
+    let releaseExecution!: () => void;
+    const executionGate = new Promise<void>((resolve) => {
+      releaseExecution = resolve;
+    });
+    let executionStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      executionStarted = resolve;
+    });
+    const originalExecuteInternal = firstAny.executeCommandInternal.bind(firstManager);
+
+    firstAny.executeCommandInternal = async (
+      command: any,
+      id: string | undefined,
+      commandType: string,
+      ...rest: any[]
+    ) => {
+      if (commandType === "list_sessions") {
+        executionStarted();
+        await executionGate;
+        return {
+          id,
+          type: "response",
+          command: commandType,
+          success: true,
+          data: { sessions: [] },
+        };
+      }
+      return originalExecuteInternal(command, id, commandType, ...rest);
+    };
+
+    try {
+      await firstManager.initialize();
+      const lateResponse = firstManager.executeCommand({
+        id: "disposed-journal-late-1",
+        type: "list_sessions",
+      } as any);
+      await started;
+
+      firstManager.markRuntimeDisposed();
+      firstManager.disposeAllSessions();
+      await secondManager.initialize();
+
+      releaseExecution();
+      const response = await lateResponse;
+      assert.strictEqual(response.success, false);
+      assert(response.error?.includes("shutdown completed"));
+      assert.strictEqual(firstAny.commandJournal.lockAcquired, false);
+      assert.strictEqual(secondAny.commandJournal.lockAcquired, true);
+
+      const journalPath = join(journalDir, "command-journal.jsonl");
+      const records = readFileSync(journalPath, "utf-8")
+        .trim()
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+        .filter((entry) => entry.commandId === "disposed-journal-late-1");
+      assert.strictEqual(
+        records.filter((entry) => entry.phase === "command_finished").length,
+        1,
+        "Only recovery may append the terminal record after disposal"
+      );
+    } finally {
+      releaseExecution();
+      firstManager.disposeAllSessions();
+      secondManager.disposeAllSessions();
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
   await test("session-manager: replay operations are FREE (ADR-0001)", async () => {
     const governor = new ResourceGovernor({
       ...DEFAULT_CONFIG,
@@ -2374,6 +2670,16 @@ async function testSessionManager() {
       undefined,
       "Session must not be created on rejection"
     );
+
+    const stored = (localManager as any).replayStore.getCommandOutcome("busy-create");
+    assert.ok(stored, "Busy rejection should be stored for explicit-ID determinism");
+
+    const conflict = await localManager.executeCommand({
+      id: "busy-create",
+      type: "health_check",
+    } as any);
+    assert.strictEqual(conflict.success, false);
+    assert(conflict.error?.includes("Conflicting id 'busy-create'"));
   });
 
   await test("session-manager: pre-execution busy rejection refunds general rate limit", async () => {
@@ -3309,6 +3615,14 @@ async function testSessionManager() {
       const metadata = await managerAny.sessionStore.load(sessionId);
       assert.strictEqual(metadata?.sessionName, "extension-set name");
     } finally {
+      // Fault-injection barriers must be released before cleanup, including when
+      // an assertion fails before the normal success-path release.
+      releaseUpdateName();
+      const pendingSync = managerAny.pendingSessionNameMetadataSyncs.get(sessionId)?.running;
+      if (pendingSync) {
+        await pendingSync.catch(() => {});
+      }
+
       try {
         await localManager.executeCommand({ type: "delete_session", sessionId } as any);
       } catch {
@@ -4048,6 +4362,48 @@ async function testSessionManager() {
     // Note: session is still there, just can't execute commands
   });
 
+  await test("session-manager: explicit-id shutdown rejection remains deterministic before disposal", async () => {
+    const localManager = new PiSessionManager();
+    await localManager.initiateShutdown(1000);
+
+    const first = await localManager.executeCommand({
+      id: "shutdown-deterministic-1",
+      type: "list_sessions",
+    } as any);
+    const second = await localManager.executeCommand({
+      id: "shutdown-deterministic-1",
+      type: "list_sessions",
+    } as any);
+
+    assert.strictEqual(first.success, false);
+    assert(first.error?.includes("shutting down"));
+    assert.strictEqual(second.success, false);
+    assert.strictEqual(second.error, first.error);
+    assert.strictEqual(second.replayed, true);
+    const stored = (localManager as any).replayStore.getCommandOutcome("shutdown-deterministic-1");
+    assert.ok(stored, "Pre-disposal shutdown rejection should be stored");
+    assert.deepStrictEqual(stored.response, first);
+  });
+
+  await test("session-manager: completed-shutdown rejection does not mutate replay state", async () => {
+    const localManager = new PiSessionManager();
+    const managerAny = localManager as any;
+    localManager.markRuntimeDisposed();
+    localManager.disposeAllSessions();
+
+    const response = await localManager.executeCommand({
+      id: "shutdown-complete-1",
+      type: "list_sessions",
+      idempotencyKey: "shutdown-complete-key",
+    } as any);
+
+    assert.strictEqual(response.success, false);
+    assert(response.error?.includes("completed shutdown"));
+    assert.strictEqual(managerAny.replayStore.getCommandOutcome("shutdown-complete-1"), undefined);
+    assert.strictEqual(managerAny.replayStore.getStats().outcomeCount, 0);
+    assert.strictEqual(managerAny.replayStore.getStats().idempotencyCacheSize, 0);
+  });
+
   // Test: Shutdown with no in-flight commands
   await test("session-manager: shutdown with no in-flight commands", async () => {
     const manager = new PiSessionManager();
@@ -4234,6 +4590,18 @@ async function testSessionManager() {
 
     // Cleanup
     await manager.executeCommand({ type: "delete_session", sessionId: "metrics-test" });
+  });
+
+  await test("types: bash circuit breaker metrics expose globalFailureCount", async () => {
+    const localManager = new PiSessionManager();
+    const response = await localManager.executeCommand({ type: "get_metrics" });
+
+    if (!response.success || response.command !== "get_metrics") {
+      assert.fail(`Expected successful get_metrics response, got: ${response.error}`);
+    }
+
+    const globalFailureCount: number = response.data.bashCircuitBreaker.globalFailureCount;
+    assert.strictEqual(typeof globalFailureCount, "number");
   });
 
   await test("session-manager: get_metrics bounds optional memory metrics payload", async () => {
@@ -4724,6 +5092,13 @@ async function testSessionManager() {
         "Stored response must match downgraded failure"
       );
       assert.ok(stored.error?.includes("command_finished"));
+
+      const replayed = await localManager.executeCommand({
+        id: "append-fail-closed-finished-1",
+        type: "list_sessions",
+      } as any);
+      assert.strictEqual(replayed.replayed, true);
+      assert.strictEqual(replayed.error, response.error);
 
       localManager.disposeAllSessions();
     } finally {
@@ -5261,6 +5636,128 @@ async function testSessionManager() {
     const response = await manager.executeCommand({ type: "list_stored_sessions" });
     assert.strictEqual(response.success, true, "list_stored_sessions should succeed");
     assert.ok(Array.isArray((response as any).data.sessions), "Should have sessions array");
+  });
+
+  await test("session-manager: configured agent sessions round-trip through create, list, load, and switch", async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), "pi-session-root-roundtrip-"));
+    const agentDir = join(baseDir, "agent");
+    const capabilities = resolveSessionPathCapabilities({
+      agentDir,
+      cwd: process.cwd(),
+    });
+    const sessionDir = join(capabilities.sessionsDir, "configured-project");
+    const sessionPath = join(sessionDir, "runtime-created.jsonl");
+    const discoveredSessionPath = join(sessionDir, "runtime-discovered.jsonl");
+    const manager = new PiSessionManager(undefined, {
+      agentDir,
+      serverVersion: "test",
+    });
+    const managerAny = manager as any;
+    const observedAgentDirs: Array<string | undefined> = [];
+    const switchedPaths: string[] = [];
+
+    const createFakeSession = () => {
+      let currentSessionFile = sessionPath;
+      const fakeSession: any = {
+        bindExtensions: async () => {},
+        subscribe: () => () => {},
+        dispose: () => {},
+        abort: () => {},
+        abortCompaction: () => {},
+        abortBash: () => {},
+        abortRetry: () => {},
+        model: { id: "fake-model" },
+        thinkingLevel: "medium",
+        isStreaming: false,
+        messages: [],
+        sessionName: "runtime-root",
+        get sessionFile() {
+          return currentSessionFile;
+        },
+        switchSession: async (target: string) => {
+          switchedPaths.push(target);
+          currentSessionFile = target;
+          return true;
+        },
+      };
+      fakeSession.setSessionName = (name: string) => {
+        fakeSession.sessionName = name;
+      };
+      return fakeSession;
+    };
+
+    try {
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(
+        sessionPath,
+        JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "runtime-created",
+          timestamp: new Date().toISOString(),
+          cwd: process.cwd(),
+        }) + "\n"
+      );
+      writeFileSync(
+        discoveredSessionPath,
+        JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "runtime-discovered",
+          timestamp: new Date().toISOString(),
+          cwd: process.cwd(),
+        }) + "\n"
+      );
+
+      managerAny.sessionStore = new SessionStore({
+        dataDir: join(baseDir, "server"),
+        sessionsDir: capabilities.sessionsDir,
+        allowedSessionDirectories: [capabilities.sessionsDir],
+        serverVersion: "test",
+      });
+      managerAny.createAgentSessionWithSanitizedNpmEnv = async (options: { agentDir?: string }) => {
+        observedAgentDirs.push(options.agentDir);
+        return { session: createFakeSession() };
+      };
+
+      const created = await manager.createSession("runtime-created");
+      assert.strictEqual(created.sessionFile, sessionPath);
+
+      // Metadata snapshot refresh used to clear this entry because visibility
+      // reconstructed only the historical ~/.pi/agent root.
+      const stored = await manager.listStoredSessions();
+      assert(
+        stored.some((entry) => entry.sessionId === "runtime-created"),
+        "Expected runtime-created session to remain visible after metadata bootstrap"
+      );
+
+      const discoveryRefresh = managerAny.sessionDiscoveryRefreshPromise as Promise<void> | null;
+      if (discoveryRefresh) {
+        await discoveryRefresh;
+      }
+      const storedAfterDiscovery = await manager.listStoredSessions();
+      assert(
+        storedAfterDiscovery.some((entry) => entry.sessionFile === discoveredSessionPath),
+        "Expected unregistered session under configured root to become list-visible"
+      );
+
+      const switched = await manager.executeCommand({
+        type: "switch_session_file",
+        sessionId: "runtime-created",
+        sessionPath,
+      } as any);
+      assert.strictEqual(switched.success, true);
+
+      const loaded = await manager.loadSession("runtime-loaded", sessionPath);
+      assert.strictEqual(loaded.sessionFile, sessionPath);
+      assert.deepStrictEqual(observedAgentDirs, [capabilities.agentDir, capabilities.agentDir]);
+      assert.deepStrictEqual(switchedPaths, [sessionPath, sessionPath]);
+    } finally {
+      await manager.initiateShutdown(1000);
+      manager.markRuntimeDisposed();
+      manager.disposeAllSessions();
+      rmSync(baseDir, { recursive: true, force: true });
+    }
   });
 
   await test("session-manager: list_stored_sessions bootstraps fresh stored metadata without discovery", async () => {
@@ -6087,6 +6584,241 @@ async function testSessionManager() {
     }
   });
 
+  await test("server: failed startup unwinds partially initialized transports", async () => {
+    const before = process.stdout.listenerCount("error");
+    const server = new PiServer({ startupRecoverySummaryEvent: { enabled: false } });
+    const serverAny = server as any;
+    serverAny.setupStdio = async () => {
+      throw new Error("stdio boom");
+    };
+
+    await assert.rejects(server.start(0), /stdio boom/);
+    assert.strictEqual(serverAny.stdinInterface, null);
+    assert.strictEqual(serverAny.wss, null, "WebSocket server should be closed on startup failure");
+    assert.strictEqual(
+      process.stdout.listenerCount("error"),
+      before,
+      "Stdout error handler should be removed on startup failure"
+    );
+  });
+
+  await test("server: failed startup releases durable journal ownership", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-startup-journal-unwind-"));
+    const server = new PiServer({
+      durableJournal: { enabled: true, dataDir: journalDir },
+      startupRecoverySummaryEvent: { enabled: false },
+    });
+    const serverAny = server as any;
+    serverAny.setupStdio = async () => {
+      throw new Error("stdio journal boom");
+    };
+
+    try {
+      await assert.rejects(server.start(0), /stdio journal boom/);
+      const failedManagerAny = server.getSessionManager() as any;
+      assert.strictEqual(failedManagerAny.commandJournal.lockAcquired, false);
+      assert.strictEqual(
+        existsSync(join(journalDir, "command-journal.jsonl.lock")),
+        false,
+        "Failed startup must release the single-writer lock"
+      );
+
+      const replacement = new PiSessionManager(undefined, {
+        durableJournal: { enabled: true, dataDir: journalDir },
+      });
+      await replacement.initialize();
+      replacement.disposeAllSessions();
+    } finally {
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("server: replayed create_session does not rebroadcast session_created", async () => {
+    const server = new PiServer({ startupRecoverySummaryEvent: { enabled: false } });
+    const serverAny = server as any;
+    const manager = server.getSessionManager() as any;
+    const events: any[] = [];
+    let executions = 0;
+
+    manager.executeCommandInternal = async (
+      _command: any,
+      id: string | undefined,
+      commandType: string
+    ) => {
+      executions++;
+      return {
+        id,
+        type: "response",
+        command: commandType,
+        success: true,
+        data: {
+          sessionId: "create-replay-session",
+          sessionInfo: {
+            sessionId: "create-replay-session",
+            thinkingLevel: "medium",
+            isStreaming: false,
+            messageCount: 0,
+            createdAt: new Date().toISOString(),
+          },
+        },
+      };
+    };
+    manager.addSubscriber({
+      send: (data: string) => events.push(JSON.parse(data)),
+      subscribedSessions: new Set<string>(),
+    });
+
+    const command = {
+      id: "create-replay-event-1",
+      type: "create_session",
+      sessionId: "create-replay-session",
+    };
+    const responses: any[] = [];
+    const transport = {
+      identity: undefined,
+      subscribedSessions: new Set<string>(),
+      send: () => {},
+    };
+
+    await serverAny.handleCommand(command, transport, (response: any) => {
+      responses.push(response);
+      return true;
+    });
+    await serverAny.handleCommand(command, transport, (response: any) => {
+      responses.push(response);
+      return true;
+    });
+
+    assert.strictEqual(executions, 1);
+    assert.strictEqual(responses[1]?.replayed, true);
+    assert.strictEqual(
+      events.filter((event) => event.type === "session_created").length,
+      1,
+      "Retained replay must not publish a second creation transition"
+    );
+    manager.disposeAllSessions();
+  });
+
+  await test("server: delete_session broadcast reflects committed deletion despite cleanup warnings", async () => {
+    const server = new PiServer({ startupRecoverySummaryEvent: { enabled: false } });
+    const serverAny = server as any;
+    const manager = server.getSessionManager() as any;
+    const captured: any[] = [];
+    const responses: any[] = [];
+    const sessionId = "delete-broadcast-warning";
+
+    const fakeSession = {
+      dispose: () => {
+        throw new Error("dispose boom");
+      },
+      sessionFile: "/tmp/delete-broadcast-warning.jsonl",
+      model: undefined,
+      thinkingLevel: "medium",
+      isStreaming: false,
+      messages: [],
+      sessionName: "delete-broadcast-warning",
+    };
+
+    const epoch = manager.sessionControlPlane.beginSessionEpoch(sessionId);
+    manager.sessions.set(sessionId, fakeSession);
+    manager.sessionCreatedAt.set(sessionId, new Date());
+    manager.versionStore.initialize(sessionId);
+    manager.governor.tryReserveSessionSlot();
+    manager.governor.recordHeartbeat(sessionId);
+    manager.sessionStore.delete = async () => true;
+    manager.unsubscribers.set(sessionId, () => {
+      throw new Error("unsubscribe boom");
+    });
+    manager.addSubscriber({
+      send: (data: string) => {
+        captured.push(JSON.parse(data));
+      },
+      subscribedSessions: new Set<string>(),
+    });
+
+    await serverAny.handleCommand(
+      { id: "delete-broadcast-warning-1", type: "delete_session", sessionId },
+      { identity: undefined, subscribedSessions: new Set<string>(), send: () => {} },
+      (response: any) => {
+        responses.push(response);
+
+        // Simulate a delete/recreate ABA transition before the transport emits
+        // the lifecycle event. The committed deletion receipt must still win.
+        const replacementEpoch = manager.sessionControlPlane.beginSessionEpoch(sessionId);
+        assert(replacementEpoch > epoch);
+        manager.sessions.set(sessionId, { ...fakeSession, dispose: () => {} });
+        manager.sessionCreatedAt.set(sessionId, new Date());
+        manager.versionStore.initialize(sessionId);
+        manager.governor.tryReserveSessionSlot();
+        return true;
+      }
+    );
+
+    assert.strictEqual(responses[0]?.success, false, "Cleanup warning should still surface");
+    const deletedEvents = captured.filter((event) => event.type === "session_deleted");
+    assert.strictEqual(deletedEvents.length, 1, "Committed deletion must broadcast exactly once");
+    assert.strictEqual(deletedEvents[0].data.sessionId, sessionId);
+    assert.ok(manager.getSession(sessionId), "Replacement epoch must remain live");
+
+    const replayedResponses: any[] = [];
+    await serverAny.handleCommand(
+      { id: "delete-broadcast-warning-1", type: "delete_session", sessionId },
+      { identity: undefined, subscribedSessions: new Set<string>(), send: () => {} },
+      (response: any) => {
+        replayedResponses.push(response);
+        return true;
+      }
+    );
+
+    assert.strictEqual(replayedResponses[0]?.replayed, true);
+    assert.ok(manager.getSession(sessionId), "Replay must not delete the replacement epoch");
+    assert.strictEqual(
+      captured.filter((event) => event.type === "session_deleted").length,
+      1,
+      "Replay must not manufacture another deletion receipt"
+    );
+
+    manager.disposeAllSessions();
+  });
+
+  await test("server: delete/recreate ABA emits deletion for the committed epoch only", async () => {
+    const localManager = new PiSessionManager();
+    const managerAny = localManager as any;
+    const receipts: Array<{ sessionId: string; epoch: number }> = [];
+    const sessionId = "delete-receipt-epoch";
+    const session = {
+      dispose: () => {},
+      sessionFile: "/tmp/delete-receipt-epoch.jsonl",
+      model: undefined,
+      thinkingLevel: "medium",
+      isStreaming: false,
+      messages: [],
+      sessionName: sessionId,
+    };
+
+    const epoch = managerAny.sessionControlPlane.beginSessionEpoch(sessionId);
+    managerAny.sessions.set(sessionId, session);
+    managerAny.sessionCreatedAt.set(sessionId, new Date());
+    managerAny.versionStore.initialize(sessionId);
+    managerAny.governor.tryReserveSessionSlot();
+    managerAny.governor.recordHeartbeat(sessionId);
+    managerAny.sessionStore.delete = async () => true;
+
+    const response = await localManager.executeCommand(
+      { id: "delete-receipt-epoch-1", type: "delete_session", sessionId } as any,
+      { onSessionDeleted: (receipt) => receipts.push(receipt) }
+    );
+    assert.strictEqual(response.success, true);
+    assert.deepStrictEqual(receipts, [{ sessionId, epoch }]);
+
+    const replayed = await localManager.executeCommand(
+      { id: "delete-receipt-epoch-1", type: "delete_session", sessionId } as any,
+      { onSessionDeleted: (receipt) => receipts.push(receipt) }
+    );
+    assert.strictEqual(replayed.replayed, true);
+    assert.deepStrictEqual(receipts, [{ sessionId, epoch }], "Replay must not emit a receipt");
+  });
+
   await test("server: startup_recovery_summary can include sensitive fields via opt-in", async () => {
     const server = new PiServer({
       startupRecoverySummaryEvent: {
@@ -6168,6 +6900,63 @@ async function testSessionManager() {
     } finally {
       (process.stdout as any).write = originalWrite;
     }
+  });
+
+  await test("stdio backpressure: sync write failure latches broken stdout state", () => {
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    const originalConsoleError = console.error;
+    let writeCalls = 0;
+    (process.stdout as any).write = () => {
+      writeCalls++;
+      if (writeCalls === 1) {
+        return false;
+      }
+      throw new Error("stdout boom");
+    };
+    console.error = () => {};
+
+    const state = {
+      hasBackpressure: false,
+      droppedCount: 0,
+      drainHandlerRegistered: false,
+    };
+
+    try {
+      const backpressured = sendWithStdioBackpressure("critical-backpressure", state, {
+        isCritical: true,
+      });
+      const failed = sendWithStdioBackpressure("critical-fail", state, { isCritical: true });
+      (process.stdout as any).emit("drain");
+      const dropped = sendWithStdioBackpressure("non-critical-after-fail", state, {
+        isCritical: false,
+      });
+
+      assert.strictEqual(backpressured, true);
+      assert.strictEqual(failed, false);
+      assert.strictEqual(dropped, false);
+      assert.strictEqual((state as any).broken, true, "Broken stdout should latch in state");
+      assert.strictEqual(state.hasBackpressure, true, "Drain must not clear a broken channel");
+      assert.strictEqual(state.drainHandlerRegistered, false);
+      assert.strictEqual(state.droppedCount, 1);
+      assert.strictEqual(writeCalls, 2, "Broken channel must not attempt another write");
+    } finally {
+      (process.stdout as any).write = originalWrite;
+      console.error = originalConsoleError;
+    }
+  });
+
+  await test("stdio backpressure: unregister clears terminal channel state", () => {
+    const serverAny = new PiServer({ startupRecoverySummaryEvent: { enabled: false } }) as any;
+    serverAny.registerStdoutErrorHandler();
+    serverAny.stdioState.broken = true;
+    serverAny.stdioState.hasBackpressure = true;
+    serverAny.stdioState.drainHandlerRegistered = true;
+
+    serverAny.unregisterStdoutErrorHandler();
+
+    assert.strictEqual(serverAny.stdioState.broken, false);
+    assert.strictEqual(serverAny.stdioState.hasBackpressure, false);
+    assert.strictEqual(serverAny.stdioState.drainHandlerRegistered, false);
   });
 
   await test("stdio backpressure: drain resets pressure and critical writes still attempt", () => {

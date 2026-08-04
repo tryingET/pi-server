@@ -19,10 +19,18 @@ import { validateSessionFileAccess } from "./validation.js";
 // HANDLER TYPE
 // =============================================================================
 
+export interface SessionCommandRuntimeContext {
+  /** Canonical session roots authorized by the owning PiSessionManager. */
+  allowedSessionDirectories?: readonly string[];
+  /** Server cwd captured when the owning PiSessionManager was created. */
+  cwd?: string;
+}
+
 export type CommandHandler = (
   session: AgentSession,
   command: any,
-  getSessionInfo: (sessionId: string) => SessionInfo | undefined
+  getSessionInfo: (sessionId: string) => SessionInfo | undefined,
+  context: SessionCommandRuntimeContext
 ) => Promise<RpcResponse> | RpcResponse;
 
 // =============================================================================
@@ -539,9 +547,15 @@ const handleNewSession: CommandHandler = async (session, command) => {
   };
 };
 
-const handleSwitchSessionFile: CommandHandler = async (session, command) => {
+const handleSwitchSessionFile: CommandHandler = async (
+  session,
+  command,
+  _getSessionInfo,
+  context
+) => {
   const sessionPathError = validateSessionFileAccess(command.sessionPath, {
-    cwd: process.cwd(),
+    allowedDirs: context.allowedSessionDirectories,
+    cwd: context.cwd,
     requireExistingFile: true,
     requireSessionHeader: true,
   });
@@ -836,13 +850,14 @@ export const sessionCommandHandlers: Record<string, CommandHandler> = {
 export function routeSessionCommand(
   session: AgentSession,
   command: any,
-  getSessionInfo: (sessionId: string) => SessionInfo | undefined
+  getSessionInfo: (sessionId: string) => SessionInfo | undefined,
+  context: SessionCommandRuntimeContext = {}
 ): Promise<RpcResponse> | RpcResponse | undefined {
   const handler = sessionCommandHandlers[command.type];
   if (!handler) {
     return undefined;
   }
-  return handler(session, command, getSessionInfo);
+  return handler(session, command, getSessionInfo, context);
 }
 
 /**

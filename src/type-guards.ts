@@ -16,14 +16,14 @@ import type { RpcCommand, RpcResponse, RpcResponseBase, SessionCommand } from ".
  * Get the optional command ID from any RpcCommand.
  */
 export function getCommandId(cmd: RpcCommand): string | undefined {
-  return cmd.id;
+  return typeof cmd.id === "string" ? cmd.id : undefined;
 }
 
 /**
  * Get the command type as a string.
  */
 export function getCommandType(cmd: RpcCommand): string {
-  return cmd.type;
+  return typeof cmd.type === "string" ? cmd.type : "unknown";
 }
 
 /**
@@ -31,7 +31,7 @@ export function getCommandType(cmd: RpcCommand): string {
  * Returns undefined for server commands that don't have sessionId.
  */
 export function getSessionId(cmd: RpcCommand): string | undefined {
-  if ("sessionId" in cmd) return cmd.sessionId;
+  if ("sessionId" in cmd && typeof cmd.sessionId === "string") return cmd.sessionId;
   return undefined;
 }
 
@@ -48,7 +48,9 @@ export function getCommandDependsOn(cmd: RpcCommand): string[] | undefined {
  * Optional optimistic concurrency precondition.
  */
 export function getCommandIfSessionVersion(cmd: RpcCommand): number | undefined {
-  return typeof cmd.ifSessionVersion === "number" ? cmd.ifSessionVersion : undefined;
+  return typeof cmd.ifSessionVersion === "number" && Number.isFinite(cmd.ifSessionVersion)
+    ? cmd.ifSessionVersion
+    : undefined;
 }
 
 /**

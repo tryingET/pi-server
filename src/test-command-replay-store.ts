@@ -255,7 +255,7 @@ describe("command-replay-store", () => {
       assert.strictEqual(outcome?.success, true);
     });
 
-    it("updates existing outcome", () => {
+    it("keeps the first terminal outcome authoritative", () => {
       const store = new CommandReplayStore();
       store.storeCommandOutcome({
         commandId: "cmd-1",
@@ -279,8 +279,9 @@ describe("command-replay-store", () => {
       });
 
       const outcome = store.getCommandOutcome("cmd-1");
-      assert.strictEqual(outcome?.success, false);
-      assert.strictEqual(outcome?.finishedAt, 2000);
+      assert.strictEqual(outcome?.success, true);
+      assert.strictEqual(outcome?.fingerprint, "fp1");
+      assert.strictEqual(outcome?.finishedAt, 1000);
     });
   });
 

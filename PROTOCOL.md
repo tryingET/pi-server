@@ -126,7 +126,8 @@ Commands MAY include:
 ### 4.2 Validation behavior
 
 - Invalid commands MUST return `success: false`.
-- Commands rejected before admission MUST NOT emit lifecycle events.
+- Commands rejected before admission MUST NOT emit `command_accepted` or `command_started`.
+- A terminal `command_finished` MAY be emitted for a pre-admission rejection.
 
 ---
 
@@ -188,6 +189,13 @@ A command is **admitted** only after validation, shutdown checks, replay checks,
 - Newly admitted executions MUST emit `command_accepted`.
 - Commands rejected before admission MUST NOT emit `command_accepted` or `command_started`.
 - Terminal `command_finished` events may still be emitted for replay hits and pre-admission rejections so clients can observe a final outcome.
+
+Implementation requirements:
+
+- Retained terminal identities MUST be checked before a later validation, shutdown, or rate-limit rejection can replace them.
+- The first stored terminal outcome for an explicit command ID is authoritative; late completion MUST NOT overwrite it.
+- When durable journaling is available, first-seen pre-admission outcomes MUST be persisted as standalone `command_finished` records for restart-safe replay.
+- Once runtime disposal completes, new requests MUST NOT allocate replay identity, reopen the journal, or mutate replay/idempotency state.
 
 ### 7.2 Per-command phase order
 

@@ -320,12 +320,13 @@ describe("fuzz: outcome storage", () => {
     }
   });
 
-  it("outcome update preserves latest", async () => {
+  it("outcome update preserves the first terminal result", async () => {
     const { replayStore } = createEngine();
     const cmdId = "update-cmd";
     const updates = 50;
+    const baseTime = Date.now();
 
-    // Rapid updates to same command
+    // Rapid attempts to replace the same terminal command outcome.
     for (let i = 0; i < updates; i++) {
       replayStore.storeCommandOutcome({
         commandId: cmdId,
@@ -337,16 +338,16 @@ describe("fuzz: outcome storage", () => {
           success: i % 2 === 0,
           error: i % 2 === 0 ? undefined : `error-${i}`,
         }),
-        finishedAt: Date.now() + i,
+        finishedAt: baseTime + i,
       });
     }
 
-    // Should have latest update
+    // The first terminal response is authoritative; later writes are ignored.
     const outcome = replayStore.getCommandOutcome(cmdId);
     assert.ok(outcome, "Should have outcome");
-    // Last update was i=49 (odd), so success=false
-    assert.strictEqual(outcome.success, false, "Should have last update");
-    assert.strictEqual(outcome.finishedAt, Date.now() + updates - 1);
+    assert.strictEqual(outcome.success, true, "Should keep the first terminal result");
+    assert.strictEqual(outcome.fingerprint, "fp-0");
+    assert.strictEqual(outcome.finishedAt, baseTime);
   });
 
   it("outcome retention is bounded", async () => {
