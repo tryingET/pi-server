@@ -162,9 +162,24 @@ export interface IdempotencyCacheEntry {
  */
 export type ReplayCheckResult =
   | { kind: "proceed" }
-  | { kind: "conflict"; response: RpcResponse }
-  | { kind: "replay_cached"; response: RpcResponse }
-  | { kind: "replay_inflight"; promise: Promise<RpcResponse> };
+  | {
+      kind: "conflict";
+      response: RpcResponse;
+      fromIdempotencyKey?: true;
+      claimExplicitId?: true;
+    }
+  | {
+      kind: "replay_cached";
+      response: RpcResponse;
+      fromIdempotencyKey?: true;
+      claimExplicitId?: true;
+    }
+  | {
+      kind: "replay_inflight";
+      promise: Promise<RpcResponse>;
+      fromIdempotencyKey?: true;
+      claimExplicitId?: true;
+    };
 
 /**
  * Configuration options for the replay store.
@@ -325,11 +340,12 @@ export class CommandReplayStore {
   // ==========================================================================
 
   /**
-   * Build a cache key for idempotency lookup.
+   * Build a collision-safe cache key for the scoped idempotency tuple.
+   * The scope discriminator prevents a real session ID from aliasing server scope.
    */
   private buildIdempotencyCacheKey(command: RpcCommand, key: string): string {
-    const sessionId = getSessionId(command) ?? "_server_";
-    return `${sessionId}:${key}`;
+    const sessionId = getSessionId(command);
+    return JSON.stringify(sessionId === undefined ? ["server", key] : ["session", sessionId, key]);
   }
 
   /**
@@ -570,6 +586,10 @@ export class CommandReplayStore {
     // 2. Only an unclaimed command ID may fall back to the idempotency alias.
     if (idempotencyKey) {
       const cacheKey = this.buildIdempotencyCacheKey(command, idempotencyKey);
+      const replayMetadata =
+        id === undefined
+          ? ({ fromIdempotencyKey: true } as const)
+          : ({ fromIdempotencyKey: true, claimExplicitId: true } as const);
       const cached = this.idempotencyCache.get(cacheKey);
       if (cached) {
         if (!this.fingerprintsMatch(cached.fingerprint, fingerprint, command)) {
@@ -582,12 +602,14 @@ export class CommandReplayStore {
               idempotencyKey,
               cached.commandType
             ),
+            ...replayMetadata,
           };
         }
 
         return {
           kind: "replay_cached",
           response: this.cloneResponseForRequest({ ...cached.response, replayed: true }, id),
+          ...replayMetadata,
         };
       }
 
@@ -603,6 +625,7 @@ export class CommandReplayStore {
               idempotencyKey,
               inFlightByKey.commandType
             ),
+            ...replayMetadata,
           };
         }
 
@@ -611,6 +634,7 @@ export class CommandReplayStore {
           promise: inFlightByKey.promise.then((response) =>
             this.cloneResponseForRequest({ ...response, replayed: true }, id)
           ),
+          ...replayMetadata,
         };
       }
     }

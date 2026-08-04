@@ -1653,7 +1653,7 @@ async function testExtensionUI() {
 
 import { PiSessionManager } from "./session-manager.js";
 import { PiServer, sendWithStdioBackpressure } from "./server.js";
-import { DurableCommandJournal } from "./command-journal.js";
+import { DurableCommandJournal, JournalStorageAppendError } from "./command-journal.js";
 import { createServerUIContext } from "./server-ui-context.js";
 import { SessionStore } from "./session-store.js";
 import { MetricNames, type MetricEvent, type MetricsSink } from "./metrics-types.js";
@@ -5047,7 +5047,7 @@ async function testSessionManager() {
     }
   });
 
-  await test("session-manager: fail_closed command_finished append failure downgrades terminal response", async () => {
+  await test("session-manager: terminal policy rejection preserves commit without leaking raw response", async () => {
     const journalDir = mkdtempSync(
       join(tmpdir(), "pi-server-journal-append-fail-closed-finished-")
     );
@@ -5064,7 +5064,7 @@ async function testSessionManager() {
           redaction: {
             beforePersist: (entry) => {
               if (entry.phase === "command_finished") {
-                throw new Error("injected-append-failure-command-finished");
+                throw new Error("injected-policy-rejection-command-finished");
               }
               return entry;
             },
@@ -5073,33 +5073,210 @@ async function testSessionManager() {
       });
       await localManager.initialize();
 
-      const response = await localManager.executeCommand({
-        id: "append-fail-closed-finished-1",
-        type: "list_sessions",
-      } as any);
+      const createdSessions = new Set<string>();
+      (localManager as any).createSession = async (sessionId: string) => {
+        if (createdSessions.has(sessionId)) {
+          throw new Error(`duplicate mutation for ${sessionId}`);
+        }
+        createdSessions.add(sessionId);
+        return {
+          sessionId,
+          sessionName: "RAW_TERMINAL_SECRET",
+          thinkingLevel: "medium",
+          isStreaming: false,
+          messageCount: 0,
+          createdAt: new Date(0).toISOString(),
+        };
+      };
 
-      assert.strictEqual(response.success, false, "Fail-closed should downgrade terminal response");
-      assert.ok(response.error?.includes("command_finished"));
-      assert.ok(response.error?.includes("injected-append-failure-command-finished"));
+      const command = {
+        id: "append-fail-closed-finished-1",
+        type: "create_session",
+        sessionId: "committed-session",
+      } as const;
+      const response = await localManager.executeCommand(command as any);
+
+      assert.strictEqual(response.success, true, "Persistence failure must not hide a commit");
+      assert.strictEqual((response as any).data.sessionInfo.sessionName, "RAW_TERMINAL_SECRET");
+      assert.deepStrictEqual([...createdSessions], ["committed-session"]);
+      assert.strictEqual((localManager as any).durableInitState, "failed");
 
       const replayStore = (localManager as any).replayStore;
       const stored = replayStore.getCommandOutcome("append-fail-closed-finished-1");
       assert.ok(stored, "Expected stored terminal outcome");
-      assert.strictEqual(stored.success, false, "Stored outcome must match downgraded failure");
-      assert.strictEqual(
-        stored.response.success,
-        false,
-        "Stored response must match downgraded failure"
-      );
-      assert.ok(stored.error?.includes("command_finished"));
+      assert.strictEqual(stored.success, true, "Stored outcome must preserve commit truth");
+      assert.strictEqual(stored.response.success, true);
 
-      const replayed = await localManager.executeCommand({
-        id: "append-fail-closed-finished-1",
-        type: "list_sessions",
-      } as any);
+      const replayed = await localManager.executeCommand(command as any);
+      assert.strictEqual(replayed.success, true);
       assert.strictEqual(replayed.replayed, true);
-      assert.strictEqual(replayed.error, response.error);
+      assert.deepStrictEqual([...createdSessions], ["committed-session"]);
 
+      const journalRaw = readFileSync(join(journalDir, "command-journal.jsonl"), "utf-8");
+      assert.ok(!journalRaw.includes("RAW_TERMINAL_SECRET"), "Rejected payload reached disk");
+      assert.ok(
+        !journalRaw.includes('"phase":"command_finished"'),
+        "Policy-rejected terminal record must not be bypass-persisted"
+      );
+
+      localManager.disposeAllSessions();
+    } finally {
+      console.error = originalConsoleError;
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-manager: pre-write retry reuses exact policy-approved bytes", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-approved-retry-"));
+    const originalConsoleError = console.error;
+
+    try {
+      console.error = () => {};
+      let terminalHookCalls = 0;
+      const firstBoot = new PiSessionManager(undefined, {
+        durableJournal: {
+          enabled: true,
+          dataDir: journalDir,
+          appendFailurePolicy: "fail_closed",
+          redaction: {
+            beforePersist: (entry) => {
+              if (entry.phase === "command_finished") {
+                terminalHookCalls += 1;
+              }
+              return {
+                ...entry,
+                idempotencyKey: entry.idempotencyKey ? "[redacted-idempotency]" : undefined,
+              };
+            },
+          },
+        },
+      });
+      await firstBoot.initialize();
+
+      const journal = (firstBoot as any).commandJournal;
+      const appendPreparedRecord = journal.appendPreparedRecord.bind(journal);
+      let injected = false;
+      let terminalWriteAttempts = 0;
+      let firstPrepared: any;
+      let retryPrepared: any;
+      journal.appendPreparedRecord = (prepared: any) => {
+        if (
+          prepared.entry.commandId === "approved-retry-1" &&
+          prepared.entry.phase === "command_finished"
+        ) {
+          terminalWriteAttempts += 1;
+          if (!injected) {
+            injected = true;
+            firstPrepared = prepared;
+            throw new JournalStorageAppendError("injected-pre-write-failure", "not_started");
+          }
+          retryPrepared = prepared;
+        }
+        return appendPreparedRecord(prepared);
+      };
+
+      const command = {
+        id: "approved-retry-1",
+        type: "list_sessions",
+        idempotencyKey: "RAW_IDEMPOTENCY_SECRET",
+      } as const;
+      const response = await firstBoot.executeCommand(command as any);
+      assert.strictEqual(response.success, true);
+      assert.strictEqual((firstBoot as any).durableInitState, "ready");
+      assert.strictEqual(terminalHookCalls, 1, "Retry must not rerun beforePersist");
+      assert.strictEqual(terminalWriteAttempts, 2, "Expected one pre-write retry");
+      assert.strictEqual(
+        retryPrepared,
+        firstPrepared,
+        "Retry must reuse the approved record object"
+      );
+      assert.strictEqual(retryPrepared.entry.laneSequence, firstPrepared.entry.laneSequence);
+      assert.strictEqual(retryPrepared.entry.recordedAt, firstPrepared.entry.recordedAt);
+      assert.ok(retryPrepared.bytes.equals(firstPrepared.bytes));
+
+      const journalRaw = readFileSync(join(journalDir, "command-journal.jsonl"), "utf-8");
+      assert.ok(!journalRaw.includes("RAW_IDEMPOTENCY_SECRET"));
+      assert.ok(journalRaw.includes("[redacted-idempotency]"));
+      const terminalRecords = journalRaw
+        .trim()
+        .split(/\r?\n/)
+        .map((line) => JSON.parse(line))
+        .filter(
+          (entry) => entry.commandId === "approved-retry-1" && entry.phase === "command_finished"
+        );
+      assert.strictEqual(terminalRecords.length, 1, "Retry must persist one terminal record");
+      firstBoot.disposeAllSessions();
+
+      const secondBoot = new PiSessionManager(undefined, {
+        durableJournal: { enabled: true, dataDir: journalDir },
+      });
+      await secondBoot.initialize();
+      const replayed = await secondBoot.executeCommand(command as any);
+      assert.strictEqual(replayed.success, true);
+      assert.strictEqual(replayed.replayed, true);
+      secondBoot.disposeAllSessions();
+    } finally {
+      console.error = originalConsoleError;
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-manager: ambiguous terminal write is not blindly retried", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-ambiguous-write-"));
+    const originalConsoleError = console.error;
+
+    try {
+      console.error = () => {};
+      const localManager = new PiSessionManager(undefined, {
+        durableJournal: {
+          enabled: true,
+          dataDir: journalDir,
+          appendFailurePolicy: "fail_closed",
+        },
+      });
+      await localManager.initialize();
+
+      const journal = (localManager as any).commandJournal;
+      const appendPreparedRecord = journal.appendPreparedRecord.bind(journal);
+      let terminalWriteAttempts = 0;
+      journal.appendPreparedRecord = (prepared: any) => {
+        if (
+          prepared.entry.commandId === "ambiguous-write-1" &&
+          prepared.entry.phase === "command_finished"
+        ) {
+          terminalWriteAttempts += 1;
+          throw new JournalStorageAppendError("injected-ambiguous-write", "may_have_written");
+        }
+        return appendPreparedRecord(prepared);
+      };
+
+      let executionCount = 0;
+      (localManager as any).createSession = async (sessionId: string) => {
+        executionCount += 1;
+        return {
+          sessionId,
+          thinkingLevel: "medium",
+          isStreaming: false,
+          messageCount: 0,
+          createdAt: new Date(0).toISOString(),
+        };
+      };
+      const command = {
+        id: "ambiguous-write-1",
+        type: "create_session",
+        sessionId: "ambiguous-write-session",
+      } as const;
+
+      const response = await localManager.executeCommand(command as any);
+      assert.strictEqual(response.success, true);
+      assert.strictEqual(terminalWriteAttempts, 1, "Ambiguous writes must not be retried");
+      assert.strictEqual(executionCount, 1);
+      assert.strictEqual((localManager as any).durableInitState, "failed");
+
+      const replayed = await localManager.executeCommand(command as any);
+      assert.strictEqual(replayed.success, true);
+      assert.strictEqual(replayed.replayed, true);
+      assert.strictEqual(executionCount, 1);
       localManager.disposeAllSessions();
     } finally {
       console.error = originalConsoleError;
@@ -5162,35 +5339,55 @@ async function testSessionManager() {
     }
   });
 
-  await test("session-manager: fail_closed append failures remain deterministic across restart", async () => {
-    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-fail-closed-restart-"));
-    const originalConsoleError = console.error;
+  await test("session-manager: idempotency aliases cannot bypass structural validation", async () => {
+    const localManager = new PiSessionManager();
+    const original = await localManager.executeCommand({
+      id: "validated-alias-origin",
+      type: "list_sessions",
+      idempotencyKey: "validated-alias-key",
+    } as any);
+    assert.strictEqual(original.success, true);
+
+    for (const invalidId of ["", "anon:reserved", "x".repeat(257)]) {
+      const rejected = await localManager.executeCommand({
+        id: invalidId,
+        type: "list_sessions",
+        idempotencyKey: "validated-alias-key",
+      } as any);
+      assert.strictEqual(rejected.success, false, `Expected validation failure for '${invalidId}'`);
+      assert.ok(rejected.error?.includes("Validation failed"));
+      assert.notStrictEqual(rejected.replayed, true);
+    }
+
+    localManager.disposeAllSessions();
+  });
+
+  await test("session-manager: idempotency replay durably claims a new explicit ID", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-alias-claim-"));
 
     try {
-      console.error = () => {};
-
       const firstBoot = new PiSessionManager(undefined, {
-        durableJournal: {
-          enabled: true,
-          dataDir: journalDir,
-          appendFailurePolicy: "fail_closed",
-          redaction: {
-            beforePersist: (entry) => {
-              if (entry.phase === "command_finished") {
-                throw new Error("restart-finished-failure");
-              }
-              return entry;
-            },
-          },
-        },
+        durableJournal: { enabled: true, dataDir: journalDir },
       });
       await firstBoot.initialize();
 
-      const firstResponse = await firstBoot.executeCommand({
-        id: "fail-closed-restart-1",
+      const original = await firstBoot.executeCommand({
+        id: "alias-origin",
         type: "list_sessions",
+        idempotencyKey: "alias-key",
       } as any);
-      assert.strictEqual(firstResponse.success, false);
+      const alias = await firstBoot.executeCommand({
+        id: "alias-claimed-id",
+        type: "list_sessions",
+        idempotencyKey: "alias-key",
+      } as any);
+      assert.strictEqual(original.success, true);
+      assert.strictEqual(alias.success, true);
+      assert.strictEqual(alias.replayed, true);
+      assert.ok(
+        (firstBoot as any).replayStore.getCommandOutcome("alias-claimed-id"),
+        "Alias replay must claim its correlated explicit ID"
+      );
       firstBoot.disposeAllSessions();
 
       const secondBoot = new PiSessionManager(undefined, {
@@ -5198,13 +5395,139 @@ async function testSessionManager() {
       });
       await secondBoot.initialize();
 
-      const secondResponse = await secondBoot.executeCommand({
-        id: "fail-closed-restart-1",
-        type: "list_sessions",
+      const conflict = await secondBoot.executeCommand({
+        id: "alias-claimed-id",
+        type: "health_check",
       } as any);
+      assert.strictEqual(conflict.success, false);
+      assert.ok(conflict.error?.includes("Conflicting id 'alias-claimed-id'"));
+      secondBoot.disposeAllSessions();
+    } finally {
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("session-manager: in-flight idempotency replay claims explicit ID before yielding", async () => {
+    const localManager = new PiSessionManager();
+    const managerAny = localManager as any;
+    const originalExecuteInternal = managerAny.executeCommandInternal.bind(localManager);
+    let releaseExecution: (() => void) | undefined;
+    let markStarted: (() => void) | undefined;
+    const executionStarted = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const executionGate = new Promise<void>((resolve) => {
+      releaseExecution = resolve;
+    });
+    let executionCount = 0;
+
+    managerAny.executeCommandInternal = async (...args: any[]) => {
+      const [command, id, commandType] = args;
+      if (commandType !== "list_sessions") {
+        return originalExecuteInternal(...args);
+      }
+      executionCount += 1;
+      markStarted?.();
+      await executionGate;
+      return {
+        id,
+        type: "response",
+        command: command.type,
+        success: true,
+        data: { sessions: [] },
+      };
+    };
+
+    const originalPromise = localManager.executeCommand({
+      id: "inflight-alias-origin",
+      type: "list_sessions",
+      idempotencyKey: "inflight-alias-key",
+    } as any);
+    await executionStarted;
+
+    const aliasPromise = localManager.executeCommand({
+      id: "inflight-alias-id",
+      type: "list_sessions",
+      idempotencyKey: "inflight-alias-key",
+    } as any);
+    const conflictingReuse = await localManager.executeCommand({
+      id: "inflight-alias-id",
+      type: "health_check",
+    } as any);
+    assert.strictEqual(conflictingReuse.success, false);
+    assert.ok(conflictingReuse.error?.includes("Conflicting id 'inflight-alias-id'"));
+
+    releaseExecution?.();
+    const [original, alias] = await Promise.all([originalPromise, aliasPromise]);
+    assert.strictEqual(original.success, true);
+    assert.strictEqual(alias.success, true);
+    assert.strictEqual(alias.replayed, true);
+    assert.strictEqual(executionCount, 1, "Alias replay must not execute a second command");
+    localManager.disposeAllSessions();
+  });
+
+  await test("session-manager: terminal policy rejection quarantines restart uncertainty", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-fail-closed-restart-"));
+    const originalConsoleError = console.error;
+
+    try {
+      console.error = () => {};
+      const terminalPolicy = {
+        beforePersist: (entry: any) => {
+          if (entry.phase === "command_finished" && entry.recovered !== true) {
+            throw new Error("restart-finished-policy-rejection");
+          }
+          return entry;
+        },
+      };
+
+      const firstBoot = new PiSessionManager(undefined, {
+        durableJournal: {
+          enabled: true,
+          dataDir: journalDir,
+          appendFailurePolicy: "fail_closed",
+          redaction: terminalPolicy,
+        },
+      });
+      await firstBoot.initialize();
+      let firstBootExecutions = 0;
+      (firstBoot as any).createSession = async (sessionId: string) => {
+        firstBootExecutions += 1;
+        return {
+          sessionId,
+          thinkingLevel: "medium",
+          isStreaming: false,
+          messageCount: 0,
+          createdAt: new Date(0).toISOString(),
+        };
+      };
+
+      const command = {
+        id: "fail-closed-restart-1",
+        type: "create_session",
+        sessionId: "restart-committed-session",
+      } as const;
+      const firstResponse = await firstBoot.executeCommand(command as any);
+      assert.strictEqual(firstResponse.success, true);
+      assert.strictEqual(firstBootExecutions, 1);
+      firstBoot.disposeAllSessions();
+
+      const secondBoot = new PiSessionManager(undefined, {
+        durableJournal: { enabled: true, dataDir: journalDir, redaction: terminalPolicy },
+      });
+      await secondBoot.initialize();
+      let secondBootExecutions = 0;
+      (secondBoot as any).createSession = async () => {
+        secondBootExecutions += 1;
+        throw new Error("Recovered identity must not execute again");
+      };
+
+      const secondResponse = await secondBoot.executeCommand(command as any);
       assert.strictEqual(secondResponse.success, false);
       assert.strictEqual(secondResponse.replayed, true);
-      assert.strictEqual(secondResponse.error, firstResponse.error);
+      assert.ok(secondResponse.error?.includes("may have committed"));
+      assert.ok(secondResponse.error?.includes("prevent re-execution"));
+      assert.strictEqual(secondBootExecutions, 0);
 
       secondBoot.disposeAllSessions();
     } finally {
@@ -5222,13 +5545,22 @@ async function testSessionManager() {
         dataDir: journalDir,
         redaction: {
           beforePersist: (entry) => {
-            if (entry.phase === "command_finished") {
+            if (entry.phase !== "command_finished") {
+              return entry;
+            }
+            if (entry.commandId === "redaction-invariant-cmd-1") {
               return {
                 ...entry,
                 response: undefined,
               };
             }
-            return entry;
+            return {
+              ...entry,
+              response: {
+                ...entry.response!,
+                data: { sessions: ["rewritten"] },
+              } as any,
+            };
           },
         },
       });
@@ -5253,6 +5585,27 @@ async function testSessionManager() {
             },
           }),
         /replay-critical response/
+      );
+
+      assert.throws(
+        () =>
+          journal.appendLifecycle({
+            phase: "command_finished",
+            commandId: "redaction-invariant-cmd-2",
+            commandType: "list_sessions",
+            laneKey: "server",
+            fingerprint: JSON.stringify({ type: "list_sessions" }),
+            explicitId: true,
+            success: true,
+            response: {
+              id: "redaction-invariant-cmd-2",
+              type: "response",
+              command: "list_sessions",
+              success: true,
+              data: { sessions: [] },
+            },
+          }),
+        /cannot modify replay-critical response/
       );
 
       journal.dispose();
@@ -5286,10 +5639,21 @@ async function testSessionManager() {
         },
       });
       await localManager.initialize();
+      (localManager as any).createSession = async (sessionId: string) => ({
+        sessionId,
+        sessionName: undefined,
+        sessionFile: undefined,
+        model: undefined,
+        thinkingLevel: "medium",
+        isStreaming: false,
+        messageCount: 0,
+        createdAt: new Date(0).toISOString(),
+      });
 
       const executed = await localManager.executeCommand({
         id: "redaction-hook-cmd-1",
-        type: "list_sessions",
+        type: "create_session",
+        sessionId: "redaction-undefined-optionals",
         idempotencyKey: "secret-idempotency-token",
       } as any);
       assert.strictEqual(executed.success, true);
@@ -5310,6 +5674,205 @@ async function testSessionManager() {
       assert.strictEqual(finishedEntry.idempotencyKey, "[redacted-idempotency]");
       assert.strictEqual(finishedEntry.fingerprint, "[redacted-fingerprint]");
 
+      localManager.disposeAllSessions();
+    } finally {
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("command-journal: replay-invalid terminals cannot erase quarantine", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-invalid-terminal-"));
+
+    try {
+      const journalPath = join(journalDir, "command-journal.jsonl");
+      const now = Date.now();
+      const fingerprint = JSON.stringify({ type: "list_sessions" });
+      const lifecycle = (
+        phase: "command_accepted" | "command_started" | "command_finished",
+        commandId: string,
+        laneSequence: number,
+        extra: Record<string, unknown> = {}
+      ) => ({
+        schemaVersion: 1,
+        kind: "command_lifecycle",
+        phase,
+        recordedAt: now - 10_000 + laneSequence,
+        serverVersion: "test",
+        commandId,
+        commandType: "list_sessions",
+        laneKey: "server",
+        laneSequence,
+        fingerprint,
+        explicitId: true,
+        ...extra,
+      });
+      const entries = [
+        lifecycle("command_accepted", "invalid-then-valid-1", 1),
+        lifecycle("command_started", "invalid-then-valid-1", 2),
+        lifecycle("command_finished", "invalid-then-valid-1", 3, {
+          success: true,
+          response: {
+            id: "wrong-response-id",
+            type: "response",
+            command: "list_sessions",
+            success: true,
+            data: { sessions: [] },
+          },
+        }),
+        lifecycle("command_finished", "invalid-then-valid-1", 4, {
+          success: true,
+          response: {
+            id: "invalid-then-valid-1",
+            type: "response",
+            command: "list_sessions",
+            success: true,
+            data: { sessions: [], source: "valid-terminal" },
+          },
+        }),
+        lifecycle("command_accepted", "invalid-only-1", 5),
+        lifecycle("command_started", "invalid-only-1", 6),
+        lifecycle("command_finished", "invalid-only-1", 7, {
+          success: true,
+          response: {
+            id: "invalid-only-1",
+            type: "response",
+            command: "list_sessions",
+            success: false,
+            error: "top-level and response success disagree",
+          },
+        }),
+      ];
+      writeFileSync(
+        journalPath,
+        `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+        "utf-8"
+      );
+
+      const localManager = new PiSessionManager(undefined, {
+        durableJournal: {
+          enabled: true,
+          dataDir: journalDir,
+          retention: { maxEntries: 100 },
+        },
+      });
+      await localManager.initialize();
+
+      const recovery = await localManager.executeCommand({ type: "get_startup_recovery" } as any);
+      assert.strictEqual(recovery.success, true);
+      assert.strictEqual((recovery as any).data.recoveredInFlightFailures, 1);
+
+      const validReplay = await localManager.executeCommand({
+        id: "invalid-then-valid-1",
+        type: "list_sessions",
+      } as any);
+      assert.strictEqual(validReplay.success, true);
+      assert.strictEqual(validReplay.replayed, true);
+      assert.strictEqual((validReplay as any).data.source, "valid-terminal");
+
+      const quarantinedReplay = await localManager.executeCommand({
+        id: "invalid-only-1",
+        type: "list_sessions",
+      } as any);
+      assert.strictEqual(quarantinedReplay.success, false);
+      assert.strictEqual(quarantinedReplay.replayed, true);
+      assert.ok(quarantinedReplay.error?.includes("may have committed"));
+      localManager.disposeAllSessions();
+    } finally {
+      rmSync(journalDir, { recursive: true, force: true });
+    }
+  });
+
+  await test("command-journal: recovery keeps first valid terminal outcome authoritative", async () => {
+    const journalDir = mkdtempSync(join(tmpdir(), "pi-server-journal-first-terminal-"));
+
+    try {
+      const journalPath = join(journalDir, "command-journal.jsonl");
+      const now = Date.now();
+      const fingerprint = JSON.stringify({ type: "list_sessions" });
+      const entries = [
+        {
+          schemaVersion: 1,
+          kind: "command_lifecycle",
+          phase: "command_finished",
+          recordedAt: now - 3000,
+          serverVersion: "test",
+          commandId: "first-terminal-wins-1",
+          commandType: "list_sessions",
+          laneKey: "server",
+          laneSequence: 1,
+          fingerprint,
+          explicitId: true,
+          success: true,
+          response: {
+            id: "first-terminal-wins-1",
+            type: "response",
+            command: "list_sessions",
+            success: true,
+            data: { sessions: [], source: "first" },
+          },
+        },
+        {
+          schemaVersion: 1,
+          kind: "command_lifecycle",
+          phase: "command_finished",
+          recordedAt: now - 2000,
+          serverVersion: "test",
+          commandId: "first-terminal-wins-1",
+          commandType: "list_sessions",
+          laneKey: "server",
+          laneSequence: 2,
+          fingerprint,
+          explicitId: true,
+          success: false,
+          error: "later terminal must not replace the first",
+          response: {
+            id: "first-terminal-wins-1",
+            type: "response",
+            command: "list_sessions",
+            success: false,
+            error: "later terminal must not replace the first",
+          },
+        },
+        {
+          schemaVersion: 1,
+          kind: "command_lifecycle",
+          phase: "command_started",
+          recordedAt: now - 1000,
+          serverVersion: "test",
+          commandId: "first-terminal-wins-1",
+          commandType: "list_sessions",
+          laneKey: "server",
+          laneSequence: 3,
+          fingerprint,
+          explicitId: true,
+        },
+      ];
+      writeFileSync(
+        journalPath,
+        `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+        "utf-8"
+      );
+
+      const localManager = new PiSessionManager(undefined, {
+        durableJournal: {
+          enabled: true,
+          dataDir: journalDir,
+          retention: { maxEntries: 100 },
+        },
+      });
+      await localManager.initialize();
+
+      const recovery = await localManager.executeCommand({ type: "get_startup_recovery" } as any);
+      assert.strictEqual(recovery.success, true);
+      assert.strictEqual((recovery as any).data.recoveredInFlightFailures, 0);
+
+      const replayed = await localManager.executeCommand({
+        id: "first-terminal-wins-1",
+        type: "list_sessions",
+      } as any);
+      assert.strictEqual(replayed.success, true);
+      assert.strictEqual(replayed.replayed, true);
+      assert.strictEqual((replayed as any).data.source, "first");
       localManager.disposeAllSessions();
     } finally {
       rmSync(journalDir, { recursive: true, force: true });

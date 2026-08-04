@@ -413,6 +413,53 @@ describe("command-replay-store", () => {
       }
     });
 
+    it("keeps idempotency scope tuples collision-free", () => {
+      const store = new CommandReplayStore();
+      const cachedCommand = makeCommand({
+        type: "get_state",
+        sessionId: "a:b",
+        idempotencyKey: "c",
+      });
+      const cachedFingerprint = store.getCommandFingerprint(cachedCommand);
+      store.cacheIdempotencyResult({
+        command: cachedCommand,
+        idempotencyKey: "c",
+        commandType: "get_state",
+        fingerprint: cachedFingerprint,
+        response: makeResponse({ command: "get_state", success: true }),
+      });
+
+      const delimiterCollision = makeCommand({
+        type: "get_state",
+        sessionId: "a",
+        idempotencyKey: "b:c",
+      });
+      assert.strictEqual(
+        store.checkReplay(delimiterCollision, store.getCommandFingerprint(delimiterCollision)).kind,
+        "proceed",
+        "Distinct session/key tuples must not share a cache entry"
+      );
+
+      const serverCommand = makeCommand({ type: "health_check", idempotencyKey: "shared" });
+      store.cacheIdempotencyResult({
+        command: serverCommand,
+        idempotencyKey: "shared",
+        commandType: "health_check",
+        fingerprint: store.getCommandFingerprint(serverCommand),
+        response: makeResponse({ command: "health_check", success: true }),
+      });
+      const sentinelSession = makeCommand({
+        type: "get_state",
+        sessionId: "_server_",
+        idempotencyKey: "shared",
+      });
+      assert.strictEqual(
+        store.checkReplay(sentinelSession, store.getCommandFingerprint(sentinelSession)).kind,
+        "proceed",
+        "A real session ID must not alias server scope"
+      );
+    });
+
     it("resolves explicit IDs before idempotency aliases across stored states", async () => {
       const scenarios = [
         { idState: "completed", keyState: "cached", winner: "key" },

@@ -12,6 +12,7 @@ import fsRegular from "fs";
 import fs from "fs/promises";
 import * as path from "path";
 import * as readline from "readline";
+import { isDeepStrictEqual } from "node:util";
 import type { CommandOutcomeRecord } from "./command-replay-store.js";
 import { SYNTHETIC_ID_PREFIX, normalizeReplayFingerprintValue } from "./command-replay-store.js";
 import type { RpcResponse } from "./types.js";
@@ -70,6 +71,32 @@ function isUnderUnsupportedJournalRoot(candidatePath: string): boolean {
 export type JournalLifecyclePhase = "command_accepted" | "command_started" | "command_finished";
 
 export type JournalAppendFailurePolicy = "best_effort" | "fail_closed";
+
+export type JournalWriteDisposition = "not_started" | "may_have_written";
+
+/** The configured persistence policy rejected or invalidated a journal entry. */
+export class JournalPersistencePolicyError extends Error {
+  readonly kind = "policy" as const;
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "JournalPersistencePolicyError";
+  }
+}
+
+/** Storage failed while appending an already policy-approved journal entry. */
+export class JournalStorageAppendError extends Error {
+  readonly kind = "storage" as const;
+
+  constructor(
+    message: string,
+    readonly writeDisposition: JournalWriteDisposition,
+    options?: ErrorOptions
+  ) {
+    super(message, options);
+    this.name = "JournalStorageAppendError";
+  }
+}
 
 export interface DurableJournalRedactionHooks {
   /**
@@ -314,6 +341,13 @@ interface IndexedJournalEntry {
   index: number;
 }
 
+/** Exact bytes approved by beforePersist, bound to their original sequence/timestamp. */
+interface PreparedJournalAppend {
+  entry: CommandJournalEntryV1;
+  bytes: Buffer;
+  laneSequence: number;
+}
+
 function toPositiveInteger(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return undefined;
@@ -421,6 +455,10 @@ export class DurableCommandJournal {
   private initialized = false;
   private lockAcquired = false;
   private laneSequences = new Map<string, number>();
+  private readonly approvedRetries = new WeakMap<
+    JournalStorageAppendError,
+    PreparedJournalAppend
+  >();
 
   private entriesWritten = 0;
   private writeErrors = 0;
@@ -786,6 +824,9 @@ export class DurableCommandJournal {
     if (entry.commandId.startsWith(SYNTHETIC_ID_PREFIX)) return undefined;
     if (entry.replayed) return undefined;
     if (!entry.response || !isResponse(entry.response)) return undefined;
+    if (entry.response.id !== entry.commandId) return undefined;
+    if (entry.response.command !== entry.commandType) return undefined;
+    if (entry.success !== entry.response.success) return undefined;
 
     return {
       commandId: entry.commandId,
@@ -871,13 +912,22 @@ export class DurableCommandJournal {
       return entry;
     }
 
-    const redacted = hook(cloneJsonValue(entry));
+    // Compare against the JSON-normalized representation that can actually be
+    // persisted, not the runtime object whose optional fields may be undefined.
+    const persistenceBaseline = cloneJsonValue(entry);
+    const redacted: unknown = hook(cloneJsonValue(persistenceBaseline));
+    if (isObject(redacted) && typeof redacted.then === "function") {
+      // The contract is synchronous. Observe a rejected Promise/thenable so an
+      // untyped caller cannot create an unhandled rejection after fail-closed.
+      void Promise.resolve(redacted).catch(() => undefined);
+      throw new Error("redaction.beforePersist must return synchronously");
+    }
 
     if (!isObject(redacted)) {
       throw new Error("redaction.beforePersist must return a journal entry object");
     }
 
-    const candidate = redacted as CommandJournalEntryV1;
+    const candidate = redacted as unknown as CommandJournalEntryV1;
 
     for (const field of PERSISTENCE_IMMUTABLE_FIELDS) {
       if (candidate[field] !== entry[field]) {
@@ -887,8 +937,8 @@ export class DurableCommandJournal {
       }
     }
 
-    if (entry.phase === "command_finished") {
-      if (candidate.success !== entry.success) {
+    if (persistenceBaseline.phase === "command_finished") {
+      if (candidate.success !== persistenceBaseline.success) {
         throw new Error(
           `redaction.beforePersist cannot modify terminal success for commandId=${entry.commandId}`
         );
@@ -907,7 +957,9 @@ export class DurableCommandJournal {
       }
 
       const isReplayCriticalTerminal =
-        entry.explicitId && !entry.commandId.startsWith(SYNTHETIC_ID_PREFIX) && !entry.replayed;
+        persistenceBaseline.explicitId &&
+        !persistenceBaseline.commandId.startsWith(SYNTHETIC_ID_PREFIX) &&
+        !persistenceBaseline.replayed;
 
       if (isReplayCriticalTerminal) {
         if (!candidate.response || !isResponse(candidate.response)) {
@@ -916,10 +968,18 @@ export class DurableCommandJournal {
           );
         }
 
-        if (candidate.response.id !== entry.commandId) {
+        if (!isDeepStrictEqual(candidate.response, persistenceBaseline.response)) {
           throw new Error(
-            `redaction.beforePersist cannot modify replay-critical response.id for commandId=${entry.commandId}`
+            `redaction.beforePersist cannot modify replay-critical response for commandId=${entry.commandId}`
           );
+        }
+
+        for (const field of ["error", "sessionVersion", "replayed", "timedOut"] as const) {
+          if (candidate[field] !== persistenceBaseline[field]) {
+            throw new Error(
+              `redaction.beforePersist cannot modify replay-critical field '${field}' (commandId=${entry.commandId})`
+            );
+          }
         }
       }
     }
@@ -1143,9 +1203,16 @@ export class DurableCommandJournal {
   ): IndexedJournalEntry[] {
     const inFlightByCommandId = new Map<string, IndexedJournalEntry>();
     const terminalOutcomeByCommandId = new Map<string, IndexedJournalEntry>();
+    const terminalOutcomeIds = new Set<string>();
 
     for (const indexed of entries) {
       const { entry } = indexed;
+
+      // Compaction must preserve the same first-valid-terminal authority as
+      // recovery. Later lifecycle records cannot overwrite or resurrect it.
+      if (terminalOutcomeIds.has(entry.commandId)) {
+        continue;
+      }
 
       if (entry.phase === "command_accepted") {
         inFlightByCommandId.set(entry.commandId, indexed);
@@ -1157,12 +1224,12 @@ export class DurableCommandJournal {
         continue;
       }
 
-      // command_finished
-      inFlightByCommandId.delete(entry.commandId);
-
+      // A malformed/replay-invalid terminal cannot erase in-flight quarantine.
       const outcome = this.makeOutcomeFromFinishedEntry(entry);
       if (outcome) {
+        inFlightByCommandId.delete(entry.commandId);
         terminalOutcomeByCommandId.set(entry.commandId, indexed);
+        terminalOutcomeIds.add(entry.commandId);
       }
     }
 
@@ -1177,11 +1244,6 @@ export class DurableCommandJournal {
         continue;
       }
       retainableInFlightByCommandId.set(commandId, indexed);
-    }
-
-    // In-flight state dominates old terminal outcomes for the same command ID.
-    for (const commandId of retainableInFlightByCommandId.keys()) {
-      terminalOutcomeByCommandId.delete(commandId);
     }
 
     let terminalEntries = [...terminalOutcomeByCommandId.values()].sort(
@@ -1302,27 +1364,67 @@ export class DurableCommandJournal {
     };
   }
 
-  private appendRecord(record: CommandJournalEntryV1): void {
-    const line = `${JSON.stringify(record)}\n`;
+  private prepareRecord(record: CommandJournalEntryV1): PreparedJournalAppend {
+    return {
+      entry: record,
+      bytes: Buffer.from(`${JSON.stringify(record)}\n`, "utf-8"),
+      laneSequence: record.laneSequence,
+    };
+  }
+
+  /** Append one already-approved byte sequence without rebuilding or re-redacting it. */
+  private appendPreparedRecord(prepared: PreparedJournalAppend): void {
+    let fd: number | undefined;
+    let writeStarted = false;
 
     try {
       fsRegular.mkdirSync(path.dirname(this.journalPath), { recursive: true });
       this.acquireProcessLock();
-      const fd = fsRegular.openSync(this.journalPath, "a");
-      try {
-        fsRegular.writeSync(fd, line, undefined, "utf-8");
-        if (this.fsyncOnWrite) {
-          fsRegular.fsyncSync(fd);
+      fd = fsRegular.openSync(this.journalPath, "a");
+
+      let offset = 0;
+      while (offset < prepared.bytes.length) {
+        writeStarted = true;
+        const written = fsRegular.writeSync(
+          fd,
+          prepared.bytes,
+          offset,
+          prepared.bytes.length - offset,
+          null
+        );
+        if (written <= 0) {
+          throw new Error("Journal append made no forward write progress");
         }
-      } finally {
-        fsRegular.closeSync(fd);
+        offset += written;
       }
 
+      if (this.fsyncOnWrite) {
+        fsRegular.fsyncSync(fd);
+      }
+      fsRegular.closeSync(fd);
+      fd = undefined;
       this.entriesWritten += 1;
     } catch (error) {
+      if (fd !== undefined) {
+        try {
+          fsRegular.closeSync(fd);
+        } catch {
+          // Preserve the first failure; close ambiguity is already may_have_written.
+        }
+      }
+
       this.writeErrors += 1;
-      throw error;
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new JournalStorageAppendError(
+        `Failed to append approved journal entry: ${detail}`,
+        writeStarted ? "may_have_written" : "not_started",
+        { cause: error }
+      );
     }
+  }
+
+  private appendRecord(record: CommandJournalEntryV1): void {
+    this.appendPreparedRecord(this.prepareRecord(record));
   }
 
   async initialize(signal?: AbortSignal): Promise<CommandJournalRecoverySummary> {
@@ -1378,6 +1480,7 @@ export class DurableCommandJournal {
 
       const inFlight = new Map<string, InFlightRecoveryState>();
       const recoveredOutcomeById = new Map<string, CommandOutcomeRecord>();
+      const terminalOutcomeIds = new Set<string>();
 
       const fileStream = fsRegular.createReadStream(this.journalPath, { encoding: "utf-8" });
       let rl: ReturnType<typeof readline.createInterface> | undefined;
@@ -1398,6 +1501,12 @@ export class DurableCommandJournal {
           if (!entry) continue;
 
           this.bumpLaneSequenceFromRecord(entry);
+
+          // The first valid durable terminal outcome is authoritative. Later
+          // duplicate lifecycle records cannot resurrect or overwrite its ID.
+          if (terminalOutcomeIds.has(entry.commandId)) {
+            continue;
+          }
 
           if (entry.phase === "command_accepted") {
             inFlight.set(entry.commandId, {
@@ -1436,12 +1545,12 @@ export class DurableCommandJournal {
             continue;
           }
 
-          // command_finished
-          inFlight.delete(entry.commandId);
-
+          // A replay-invalid terminal cannot erase in-flight quarantine.
           const outcome = this.makeOutcomeFromFinishedEntry(entry);
           if (outcome) {
+            inFlight.delete(entry.commandId);
             recoveredOutcomeById.set(outcome.commandId, outcome);
+            terminalOutcomeIds.add(outcome.commandId);
           }
         }
       } finally {
@@ -1462,7 +1571,7 @@ export class DurableCommandJournal {
         }
 
         const reason =
-          "Command did not finish before previous shutdown and was marked failed during recovery";
+          "Command did not finish before previous shutdown with a durable terminal outcome; it may have committed and was quarantined as failed during recovery to prevent re-execution";
         const response: RpcResponse = {
           id: state.commandId,
           type: "response",
@@ -1558,7 +1667,6 @@ export class DurableCommandJournal {
     }
 
     const laneSequence = this.nextLaneSequence(input.laneKey);
-
     const entry: CommandJournalEntryV1 = {
       schemaVersion: CURRENT_JOURNAL_SCHEMA_VERSION,
       kind: "command_lifecycle",
@@ -1589,58 +1697,58 @@ export class DurableCommandJournal {
       recoveryReason: input.recoveryReason,
     };
 
-    this.appendRecord(this.applyPersistenceRedaction(entry));
+    let prepared: PreparedJournalAppend;
+    try {
+      prepared = this.prepareRecord(this.applyPersistenceRedaction(entry));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new JournalPersistencePolicyError(
+        `Journal persistence policy rejected command '${input.commandId}': ${detail}`,
+        { cause: error }
+      );
+    }
+
+    try {
+      this.appendPreparedRecord(prepared);
+    } catch (error) {
+      const storageError =
+        error instanceof JournalStorageAppendError
+          ? error
+          : new JournalStorageAppendError(
+              `Failed to append approved journal entry: ${error instanceof Error ? error.message : String(error)}`,
+              "may_have_written",
+              { cause: error }
+            );
+      if (storageError.writeDisposition === "not_started") {
+        this.approvedRetries.set(storageError, prepared);
+      }
+      throw storageError;
+    }
+
     return laneSequence;
   }
 
   /**
-   * Append a terminal failure record without applying beforePersist redaction hooks.
-   *
-   * Used as a deterministic fallback when fail_closed mode rejects a command
-   * because the normal command_finished append path failed after a user-visible
-   * terminal response was already computed.
+   * Retry one exact, previously policy-approved record after a proven pre-write
+   * storage failure. Caller-supplied entries and ambiguous writes are rejected.
    */
-  appendFailClosedTerminalFailure(input: Omit<CommandJournalAppendInput, "phase">): number | null {
+  retryApprovedAppend(failure: JournalStorageAppendError): number | null {
     if (!this.enabled) return null;
 
     if (!this.initialized) {
-      throw new Error(
-        "DurableCommandJournal.appendFailClosedTerminalFailure called before initialize()"
-      );
+      throw new Error("DurableCommandJournal.retryApprovedAppend called before initialize()");
+    }
+    if (failure.writeDisposition !== "not_started") {
+      throw new Error("Approved journal append retry is unsafe after a write may have started");
     }
 
-    const laneSequence = this.nextLaneSequence(input.laneKey);
-    const entry: CommandJournalEntryV1 = {
-      schemaVersion: CURRENT_JOURNAL_SCHEMA_VERSION,
-      kind: "command_lifecycle",
-      phase: "command_finished",
-      recordedAt: Date.now(),
-      serverVersion: this.serverVersion,
+    const prepared = this.approvedRetries.get(failure);
+    if (!prepared) {
+      throw new Error("Approved journal append retry token is unavailable or already consumed");
+    }
 
-      commandId: input.commandId,
-      commandType: input.commandType,
-      laneKey: input.laneKey,
-      laneSequence,
-      fingerprint: input.fingerprint,
-      explicitId: input.explicitId,
-
-      sessionId: input.sessionId,
-      dependsOn: input.dependsOn,
-      ifSessionVersion: input.ifSessionVersion,
-      idempotencyKey: input.idempotencyKey,
-
-      success: input.success,
-      error: input.error,
-      sessionVersion: input.sessionVersion,
-      replayed: input.replayed,
-      timedOut: input.timedOut,
-      response: input.response,
-
-      recovered: input.recovered,
-      recoveryReason: input.recoveryReason,
-    };
-
-    this.appendRecord(entry);
-    return laneSequence;
+    this.approvedRetries.delete(failure);
+    this.appendPreparedRecord(prepared);
+    return prepared.laneSequence;
   }
 }

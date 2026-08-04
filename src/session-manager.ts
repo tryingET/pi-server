@@ -75,10 +75,13 @@ import { CircuitBreakerManager, type CircuitBreakerConfig } from "./circuit-brea
 import { BashCircuitBreaker, type BashCircuitBreakerConfig } from "./bash-circuit-breaker.js";
 import {
   DurableCommandJournal,
+  JournalPersistencePolicyError,
+  JournalStorageAppendError,
   MAX_COMMAND_HISTORY_LIMIT,
   type CommandHistoryQuery,
   type CommandJournalRecoverySummary,
   type DurableCommandJournalOptions,
+  type JournalWriteDisposition,
 } from "./command-journal.js";
 
 /** Default timeout for session commands (5 minutes for LLM operations) */
@@ -525,51 +528,9 @@ export class PiSessionManager implements SessionResolver {
   }
 
   /**
-   * Persist a terminal fail-closed outcome without applying normal redaction hooks.
-   * This preserves explicit-ID determinism when command_finished append fails.
-   */
-  private appendFailClosedTerminalFailureToJournal(input: {
-    commandId: string;
-    commandType: string;
-    laneKey: string;
-    fingerprint: string;
-    explicitId: boolean;
-    sessionId?: string;
-    dependsOn?: string[];
-    ifSessionVersion?: number;
-    idempotencyKey?: string;
-    success: boolean;
-    error?: string;
-    sessionVersion?: number;
-    replayed?: boolean;
-    timedOut?: boolean;
-    response: RpcResponse;
-  }): { ok: boolean; error?: string } {
-    if (!this.commandJournal.isEnabled() || !this.commandJournal.getStats().initialized) {
-      return { ok: false, error: "Durable journal fallback unavailable" };
-    }
-
-    try {
-      this.commandJournal.appendFailClosedTerminalFailure(input);
-      return { ok: true };
-    } catch (error) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : `Unknown fallback append failure: ${String(error)}`;
-      console.error(
-        "[SessionManager] Failed to append fail-closed fallback terminal outcome:",
-        error
-      );
-      return { ok: false, error: message };
-    }
-  }
-
-  /**
-   * Append command lifecycle transition to the durable journal.
-   *
-   * - best_effort: append errors are logged and command flow continues
-   * - fail_closed: append errors transition durable state to failed and caller can fail command
+   * Append command lifecycle state while preserving persistence-policy authority.
+   * A proven pre-write storage failure gets one retry of the exact approved bytes;
+   * policy rejection and ambiguous writes are never bypassed or blindly retried.
    */
   private appendCommandLifecycleToJournal(input: {
     phase: "command_accepted" | "command_started" | "command_finished";
@@ -588,7 +549,13 @@ export class PiSessionManager implements SessionResolver {
     replayed?: boolean;
     timedOut?: boolean;
     response?: RpcResponse;
-  }): { ok: boolean; failClosed: boolean; error?: string } {
+  }): {
+    ok: boolean;
+    failClosed: boolean;
+    error?: string;
+    failureKind?: "policy" | "storage" | "unknown";
+    writeDisposition?: JournalWriteDisposition;
+  } {
     if (!this.commandJournal.isEnabled()) {
       return { ok: true, failClosed: false };
     }
@@ -601,26 +568,57 @@ export class PiSessionManager implements SessionResolver {
     }
 
     const failClosed = this.commandJournal.getAppendFailurePolicy() === "fail_closed";
+    let finalError: unknown;
+    let retryAttempted = false;
 
     try {
       this.commandJournal.appendLifecycle(input);
       return { ok: true, failClosed: false };
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      const message = `Durable journal append failed during ${input.phase} for command '${input.commandId}': ${errorMessage}`;
+      finalError = error;
 
-      console.error(`[SessionManager] ${message}`, error);
-
-      if (failClosed) {
-        this.markDurableJournalRuntimeFailure(message);
+      if (error instanceof JournalStorageAppendError && error.writeDisposition === "not_started") {
+        retryAttempted = true;
+        try {
+          this.commandJournal.retryApprovedAppend(error);
+          return { ok: true, failClosed: false };
+        } catch (retryError) {
+          finalError = retryError;
+        }
       }
-
-      return {
-        ok: false,
-        failClosed,
-        error: message,
-      };
     }
+
+    const failureKind =
+      finalError instanceof JournalPersistencePolicyError
+        ? "policy"
+        : finalError instanceof JournalStorageAppendError
+          ? "storage"
+          : "unknown";
+    const writeDisposition =
+      finalError instanceof JournalStorageAppendError ? finalError.writeDisposition : undefined;
+    const errorMessage = finalError instanceof Error ? finalError.message : String(finalError);
+    const classification = [
+      failureKind,
+      writeDisposition,
+      retryAttempted ? "approved-byte retry failed" : undefined,
+    ]
+      .filter(Boolean)
+      .join(", ");
+    const message = `Durable journal append failed during ${input.phase} for command '${input.commandId}' (${classification}): ${errorMessage}`;
+
+    console.error(`[SessionManager] ${message}`, finalError);
+
+    if (failClosed) {
+      this.markDurableJournalRuntimeFailure(message);
+    }
+
+    return {
+      ok: false,
+      failClosed,
+      error: message,
+      failureKind,
+      writeDisposition,
+    };
   }
 
   private buildStoredSessionInfoFromMetadata(
@@ -2228,7 +2226,10 @@ export class PiSessionManager implements SessionResolver {
     const idempotencyKey = getCommandIdempotencyKey(command);
     const laneKey = this.executionEngine.getLaneKey(command);
     const fingerprint = this.replayStore.getCommandFingerprint(command);
-    const isExplicitId = typeof id === "string" && !id.startsWith(SYNTHETIC_ID_PREFIX);
+    const validationErrors = validateCommand(command);
+    const hasIdValidationError = validationErrors.some((error) => error.field === "id");
+    const isExplicitId =
+      typeof id === "string" && !hasIdValidationError && !id.startsWith(SYNTHETIC_ID_PREFIX);
 
     const finalizeTerminalResponse = (
       response: RpcResponse,
@@ -2237,6 +2238,7 @@ export class PiSessionManager implements SessionResolver {
         storeOutcome?: boolean;
         cacheIdempotency?: boolean;
         emitLifecycle?: boolean;
+        claimReplayIdentity?: boolean;
       } = {}
     ): RpcResponse => {
       const {
@@ -2244,9 +2246,11 @@ export class PiSessionManager implements SessionResolver {
         storeOutcome = isExplicitId,
         cacheIdempotency = false,
         emitLifecycle = true,
+        claimReplayIdentity = false,
       } = terminalOptions;
 
-      let finalizedResponse = response;
+      const finalizedResponse = response;
+      const journalReplayed = claimReplayIdentity ? undefined : response.replayed;
       const allowStateMutation = !this.runtimeDisposed;
       if (appendToJournal && allowStateMutation) {
         const finishedAppend = this.appendCommandLifecycleToJournal({
@@ -2263,44 +2267,19 @@ export class PiSessionManager implements SessionResolver {
           success: response.success,
           error: response.success ? undefined : response.error,
           sessionVersion: response.sessionVersion,
-          replayed: response.replayed,
+          replayed: journalReplayed,
           timedOut: response.timedOut,
           response,
         });
 
         if (!finishedAppend.ok && finishedAppend.failClosed && !isDurableObservabilityCommand) {
-          finalizedResponse = {
-            id: response.id ?? id,
-            type: "response",
-            command: response.command,
-            success: false,
-            error: finishedAppend.error ?? "Durable journal append failed during command_finished",
-          };
-
-          const fallbackAppend = this.appendFailClosedTerminalFailureToJournal({
-            commandId,
-            commandType,
-            laneKey,
-            fingerprint,
-            explicitId: isExplicitId,
-            sessionId,
-            dependsOn,
-            ifSessionVersion,
-            idempotencyKey,
-            success: finalizedResponse.success,
-            error: finalizedResponse.error,
-            sessionVersion: finalizedResponse.sessionVersion,
-            replayed: finalizedResponse.replayed,
-            timedOut: finalizedResponse.timedOut,
-            response: finalizedResponse,
-          });
-
-          if (!fallbackAppend.ok && fallbackAppend.error) {
-            finalizedResponse = {
-              ...finalizedResponse,
-              error: `${finalizedResponse.error ?? "Durable journal append failed during command_finished"} (fallback persistence also failed: ${fallbackAppend.error})`,
-            };
-          }
+          // Execution has already selected its business truth. Never rewrite a
+          // committed success or bypass beforePersist. Same-process replay keeps
+          // this response; restart recovery quarantines an unpersisted outcome.
+          console.error(
+            `[executeCommand] Terminal outcome for ${commandId} was not durably persisted; preserving the runtime response`,
+            finishedAppend.error
+          );
         }
       }
 
@@ -2363,16 +2342,79 @@ export class PiSessionManager implements SessionResolver {
         return null;
       }
 
+      // Existing command IDs remain authoritative before validation, but an
+      // unclaimed idempotency alias must not bypass structural validation.
+      if (replayCheck.fromIdempotencyKey && validationErrors.length > 0) {
+        return null;
+      }
+
+      const claimExplicitReplayIdentity = replayCheck.claimExplicitId === true && isExplicitId;
       const finalizeReplay = (replayResponse: RpcResponse): RpcResponse =>
         finalizeTerminalResponse(replayResponse, {
-          appendToJournal: false,
-          storeOutcome: false,
+          appendToJournal: claimExplicitReplayIdentity,
+          storeOutcome: claimExplicitReplayIdentity,
           cacheIdempotency: false,
+          claimReplayIdentity: claimExplicitReplayIdentity,
         });
 
-      return replayCheck.kind === "replay_inflight"
-        ? replayCheck.promise.then(finalizeReplay)
-        : finalizeReplay(replayCheck.response);
+      if (replayCheck.kind !== "replay_inflight") {
+        return finalizeReplay(replayCheck.response);
+      }
+
+      if (!claimExplicitReplayIdentity || !id) {
+        return replayCheck.promise.then(finalizeReplay);
+      }
+
+      // An in-flight key replay must claim its new explicit ID before yielding
+      // to the event loop. Otherwise another command can execute under that ID
+      // while the aliased operation is still resolving.
+      const claimedReplay = createDeferred<RpcResponse>();
+      const claimedReplayRecord: InFlightCommandRecord = {
+        commandType,
+        laneKey,
+        fingerprint,
+        promise: claimedReplay.promise,
+      };
+      if (!this.replayStore.registerInFlight(id, claimedReplayRecord)) {
+        return finalizeTerminalResponse(
+          {
+            id,
+            type: "response",
+            command: commandType,
+            success: false,
+            error: "Server busy - too many concurrent commands. Please retry.",
+          },
+          { cacheIdempotency: false }
+        );
+      }
+
+      void replayCheck.promise
+        .then(
+          (replayResponse) => claimedReplay.resolve(finalizeReplay(replayResponse)),
+          (error) =>
+            claimedReplay.resolve(
+              finalizeTerminalResponse(
+                {
+                  id,
+                  type: "response",
+                  command: commandType,
+                  success: false,
+                  error: `In-flight replay failed: ${error instanceof Error ? error.message : String(error)}`,
+                },
+                {
+                  appendToJournal: true,
+                  storeOutcome: true,
+                  cacheIdempotency: false,
+                  claimReplayIdentity: true,
+                }
+              )
+            )
+        )
+        .finally(() => {
+          this.replayStore.unregisterInFlight(id, claimedReplayRecord);
+        });
+
+      return claimedReplay.promise;
     };
 
     // Protect an already-terminal identity before any pre-admission rejection
@@ -2446,7 +2488,6 @@ export class PiSessionManager implements SessionResolver {
       );
     }
 
-    const validationErrors = validateCommand(command);
     if (validationErrors.length > 0) {
       return finalizeTerminalResponse(
         {
