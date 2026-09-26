@@ -10,6 +10,22 @@ Policy:
 
 See `docs/release-policy.md` for the canonical commit, changelog, and release-note policy.
 
+## [2.3.0](https://github.com/tryingET/pi-server/compare/v2.2.1...v2.3.0) (2026-08-22)
+
+
+### Features
+
+* **server:** add epoch-backed session control plane ([196d02a](https://github.com/tryingET/pi-server/commit/196d02a395189b19254bf3832245d1662f911f19))
+
+
+### Bug Fixes
+
+* **replay:** harden terminal identity persistence ([93a8227](https://github.com/tryingET/pi-server/commit/93a82275ad0c6b719d9bc13d164c5326486ebf93))
+* **replay:** prioritize explicit command IDs ([42810b8](https://github.com/tryingET/pi-server/commit/42810b87d2f4c6847441b358feb17e3c5c00bbbc))
+* **server:** harden replay and session metadata contracts ([c801292](https://github.com/tryingET/pi-server/commit/c80129277da0eb21def6cf56c778d7486bc46103))
+* **server:** harden scheduling and bound response payloads ([da99487](https://github.com/tryingET/pi-server/commit/da9948733cc6555526c0b9a54cee292daa55c865))
+* **server:** reconcile terminal outcome safety ([a14111a](https://github.com/tryingET/pi-server/commit/a14111a1dbfb7de282e8aa9eca3af0e58b38825a))
+
 ## [2.2.1](https://github.com/tryingET/pi-server/compare/v2.2.0...v2.2.1) (2026-03-13)
 
 
