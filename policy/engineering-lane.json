@@ -1,11 +1,11 @@
 {
   "engineering_core": {
     "tool": "engineering-core",
-    "repository": "https://github.com/lightningralf/engineering-core",
-    "ref": "v0.7.0",
-    "catalog_command": "uv tool -n run --from 'git+file:///home/tryinget/ai-society/core/engineering-core@99290024b78eb6f1665adda6d75d06045b6a9cc2' engineering-core catalog --pretty",
-    "list_disciplines_command": "uv tool -n run --from 'git+file:///home/tryinget/ai-society/core/engineering-core@99290024b78eb6f1665adda6d75d06045b6a9cc2' engineering-core list-disciplines",
-    "list_templates_command": "uv tool -n run --from 'git+file:///home/tryinget/ai-society/core/engineering-core@99290024b78eb6f1665adda6d75d06045b6a9cc2' engineering-core list-templates",
+    "repository": "https://github.com/tryingET/core_engineering-core",
+    "ref": "v0.12.1",
+    "catalog_command": "uv tool -n run --from 'git+https://github.com/tryingET/core_engineering-core.git@5be0f0a294014f2f7aee1ca5adcb6f3c76553e11' engineering-core catalog --pretty",
+    "list_disciplines_command": "uv tool -n run --from 'git+https://github.com/tryingET/core_engineering-core.git@5be0f0a294014f2f7aee1ca5adcb6f3c76553e11' engineering-core list-disciplines",
+    "list_templates_command": "uv tool -n run --from 'git+https://github.com/tryingET/core_engineering-core.git@5be0f0a294014f2f7aee1ca5adcb6f3c76553e11' engineering-core list-templates",
     "disciplines": [
       "validation",
       "testing",
@@ -17,7 +17,7 @@
       "engineering-reasoning"
     ],
     "lane": "ts",
-    "command": "uv tool -n run --from 'git+file:///home/tryinget/ai-society/core/engineering-core@99290024b78eb6f1665adda6d75d06045b6a9cc2' engineering-core show ts",
+    "command": "uv tool -n run --from 'git+https://github.com/tryingET/core_engineering-core.git@5be0f0a294014f2f7aee1ca5adcb6f3c76553e11' engineering-core show ts",
     "loop_validation": {
       "version": "repo-loop-validation-v1",
       "contract_doc": "docs/engineering.local.md#repo-loop-validation",
@@ -46,9 +46,9 @@
     },
     "release_pin": {
       "kind": "git-commit",
-      "ref": "v0.7.0",
-      "resolved_commit": "99290024b78eb6f1665adda6d75d06045b6a9cc2",
-      "source": "git+file:///home/tryinget/ai-society/core/engineering-core@99290024b78eb6f1665adda6d75d06045b6a9cc2"
+      "ref": "v0.12.1",
+      "resolved_commit": "5be0f0a294014f2f7aee1ca5adcb6f3c76553e11",
+      "source": "git+https://github.com/tryingET/core_engineering-core.git@5be0f0a294014f2f7aee1ca5adcb6f3c76553e11"
     }
   }
 }

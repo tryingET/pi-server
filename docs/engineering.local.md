@@ -15,6 +15,8 @@ This file records the repo-local selected subset for pi-server, a Pi app/server 
 
 Machine-readable selection lives in `policy/engineering-lane.json`.
 
+Release pin: engineering-core v0.12.1 (`5be0f0a294014f2f7aee1ca5adcb6f3c76553e11`).
+
 ## Selected lanes
 
 - `ts`
@@ -48,6 +50,7 @@ uv tool -n run --from ~/ai-society/core/engineering-core engineering-core list-t
 - Keep package/app-local validation and release behavior in the owning package or app surface.
 - Treat this file as a selector and override note, not a replacement for `AGENTS.md` or runtime task/evidence authority.
 - When local practice intentionally diverges from engineering-core guidance, record the reason here or in the owning project/decision document.
+- TypeScript 7.0.2 is pinned exactly; `tsc --noEmit` is the sole typecheck command. Biome is already on 2.x. No intentional lane deviation for this upgrade.
 
 ## Canonical local commands
 
