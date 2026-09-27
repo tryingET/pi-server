@@ -1,3 +1,11 @@
+---
+summary: "pi-server documentation for docs: Documentation Index."
+read_when:
+  - "You are working in pi-server/docs."
+  - "You need the package, app, governance, diary, or ontology guidance documented here."
+type: "reference"
+---
+
 # Documentation Index
 
 This directory holds focused documentation for different audiences.

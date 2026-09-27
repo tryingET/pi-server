@@ -1,3 +1,10 @@
+---
+summary: "pi-server: Upstream Proposal: Accept AbortSignal in prompt() and compact()."
+read_when:
+  - "You are working on pi-server behavior documented by upstream-proposal-abortcontroller.md."
+type: "reference"
+---
+
 # Upstream Proposal: Accept AbortSignal in prompt() and compact()
 
 ---

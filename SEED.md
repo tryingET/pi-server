@@ -1,3 +1,10 @@
+---
+summary: "pi-server: pi-app-server: The Seed."
+read_when:
+  - "You are working on pi-server behavior documented by SEED.md."
+type: "reference"
+---
+
 # pi-app-server: The Seed
 
 ```

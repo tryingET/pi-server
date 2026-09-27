@@ -1,3 +1,11 @@
+---
+summary: "pi-server documentation: pi-server Quickstart."
+read_when:
+  - "You are working on the pi-server area documented here."
+  - "You need the local architecture, workflow, operation, or validation context."
+type: "reference"
+---
+
 # pi-server Quickstart
 
 A minimal operator guide to get `pi-server` running and verified in minutes.

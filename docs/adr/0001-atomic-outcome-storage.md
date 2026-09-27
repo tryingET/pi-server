@@ -1,3 +1,11 @@
+---
+summary: "pi-server decision record: ADR-0001: Atomic Outcome Storage for Idempotent Replay."
+read_when:
+  - "You are changing behavior covered by this pi-server decision record."
+  - "You need the rationale, status, or consequences of the decision."
+type: "decision"
+---
+
 # ADR-0001: Atomic Outcome Storage for Idempotent Replay
 
 ## Status

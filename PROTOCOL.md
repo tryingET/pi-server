@@ -1,3 +1,10 @@
+---
+summary: "pi-server: pi-server Protocol Specification."
+read_when:
+  - "You are working on pi-server behavior documented by PROTOCOL.md."
+type: "reference"
+---
+
 # pi-server Protocol Specification
 
 **Version:** `1.0.0`  
@@ -858,7 +865,8 @@ Sessions can be persisted to disk and loaded later.
 ```
 
 > **Security:** `sessionPath` must be an absolute path to an **existing session file** under an allowed session directory:
-> - `~/.pi/agent/sessions/` (default session storage)
+> - the configured Pi agent directory's `sessions/` root (including `PI_CODING_AGENT_DIR` overrides)
+> - `~/.pi/agent/sessions/` (historical default session storage, retained for compatibility)
 > - the current server working directory's `.pi/sessions/` ancestry roots (project-local)
 >
 > The file must already exist, must end with `.jsonl` or `.json`, and must look like a real session file header.

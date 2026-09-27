@@ -1,3 +1,11 @@
+---
+summary: "pi-server decision record: ADR-0010: Circuit Breaker for LLM Calls."
+read_when:
+  - "You are changing behavior covered by this pi-server decision record."
+  - "You need the rationale, status, or consequences of the decision."
+type: "decision"
+---
+
 # ADR-0010: Circuit Breaker for LLM Calls
 
 ## Status

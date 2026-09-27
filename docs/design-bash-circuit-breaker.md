@@ -1,3 +1,11 @@
+---
+summary: "pi-server documentation: Design: Circuit Breaker for Bash Commands."
+read_when:
+  - "You are working on the pi-server area documented here."
+  - "You need the local architecture, workflow, operation, or validation context."
+type: "reference"
+---
+
 # Design: Circuit Breaker for Bash Commands
 
 **Status:** Draft

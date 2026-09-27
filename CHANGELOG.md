@@ -1,3 +1,10 @@
+---
+summary: "pi-server release history and notable changes."
+read_when:
+  - "You are reviewing pi-server release history or preparing changelog notes."
+type: "reference"
+---
+
 # Changelog
 
 This file is the generated release-note record for released versions of this project.

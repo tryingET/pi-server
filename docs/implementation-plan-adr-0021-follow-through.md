@@ -1,3 +1,10 @@
+---
+summary: "pi-server planning document: Implementation Plan — ADR-0021 Follow-Through."
+read_when:
+  - "You are planning or sequencing pi-server follow-up work."
+type: "planning"
+---
+
 # Implementation Plan — ADR-0021 Follow-Through
 
 ## Purpose

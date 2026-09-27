@@ -1,3 +1,11 @@
+---
+summary: "Handoff prompt for continuing recent pi-server work."
+read_when:
+  - "You are resuming pi-server without a more specific AK task or operator handoff."
+  - "You need the latest session continuation context."
+type: "handoff"
+---
+
 # pi-server: Next Session Prompt
 
 **Operating mode:** Reliability-first, architecture-follow-through  

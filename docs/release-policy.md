@@ -1,3 +1,11 @@
+---
+summary: "pi-server documentation: Release and Changelog Policy."
+read_when:
+  - "You are working on the pi-server area documented here."
+  - "You need the local architecture, workflow, operation, or validation context."
+type: "reference"
+---
+
 # Release and Changelog Policy
 
 This repository uses **release-please** for versioning and release-note generation, and **SemVer** for version numbers.

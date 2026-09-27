@@ -1,3 +1,11 @@
+---
+summary: "pi-server overview, project purpose, structure, and local commands."
+read_when:
+  - "You are onboarding to pi-server."
+  - "You need the repo purpose, capabilities, package layout, or quickstart commands."
+type: "reference"
+---
+
 # pi-server
 
 Session multiplexer for [pi-coding-agent](https://www.npmjs.com/package/@mariozechner/pi-coding-agent). Exposes N independent `AgentSession` instances through WebSocket and stdio transports.

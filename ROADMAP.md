@@ -1,3 +1,10 @@
+---
+summary: "pi-server: pi-server Roadmap."
+read_when:
+  - "You are working on pi-server behavior documented by ROADMAP.md."
+type: "reference"
+---
+
 # pi-server Roadmap
 
 This roadmap is an execution document, not an idea backlog.

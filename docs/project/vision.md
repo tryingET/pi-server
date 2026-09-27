@@ -1,3 +1,11 @@
+---
+summary: "pi-server project documentation: pi-server Vision."
+read_when:
+  - "You are changing or planning the pi-server project area described here."
+  - "You need product, architecture, validation, or implementation context."
+type: "reference"
+---
+
 # pi-server Vision
 
 **Status:** Draft (2026-03-02)  

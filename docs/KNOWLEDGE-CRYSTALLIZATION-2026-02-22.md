@@ -1,3 +1,11 @@
+---
+summary: "pi-server documentation: Knowledge Crystallization — 2026-02-22 Session."
+read_when:
+  - "You are working on the pi-server area documented here."
+  - "You need the local architecture, workflow, operation, or validation context."
+type: "reference"
+---
+
 # Knowledge Crystallization — 2026-02-22 Session
 
 > What did we LEARN that we didn't know before?

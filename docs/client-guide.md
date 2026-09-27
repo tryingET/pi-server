@@ -1,3 +1,11 @@
+---
+summary: "pi-server documentation: pi-server Client Integration Guide."
+read_when:
+  - "You are working on the pi-server area documented here."
+  - "You need the local architecture, workflow, operation, or validation context."
+type: "reference"
+---
+
 # pi-server Client Integration Guide
 
 Practical guidance for building robust clients on top of the `pi-server` protocol.

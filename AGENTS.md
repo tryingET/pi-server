@@ -1,3 +1,11 @@
+---
+summary: "Repo operating contract for pi-server."
+read_when:
+  - "You are starting work in pi-server."
+  - "You need repo-specific guardrails, validation commands, read order, or authority boundaries."
+type: "reference"
+---
+
 # AGENTS.md — Crystallized Learnings for pi-server
 
 This document captures patterns, anti-patterns, and gotchas discovered during development. Read this before working on pi-server.
